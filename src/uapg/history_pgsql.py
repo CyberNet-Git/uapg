@@ -88,7 +88,9 @@ class HistoryPgSQL(HistoryStorageInterface):
         _datachanges_period (dict): Словарь периодов хранения данных по узлам
         _conn_params (dict): Параметры подключения к базе данных
         _event_fields (dict): Словарь полей событий по источникам
-        _db (asyncpg.Connection): Соединение с базой данных
+        _pool (asyncpg.Pool): Пул соединений с базой данных
+        _min_size (int): Минимальное количество соединений в пуле
+        _max_size (int): Максимальное количество соединений в пуле
     """
 
     def __init__(
@@ -97,23 +99,88 @@ class HistoryPgSQL(HistoryStorageInterface):
         password: str = 'postmaster', 
         database: str = 'opcua', 
         host: str = '127.0.0.1', 
+        port: int = 5432,
+        min_size: int = 5,
+        max_size: int = 20,
         max_history_data_response_size: int = 10000
     ) -> None:
         self.max_history_data_response_size = max_history_data_response_size
         self.logger = logging.getLogger(__name__)
         self._datachanges_period = {}
-        self._conn_params = dict(user=user, password=password, database=database, host=host)
+        self._conn_params = dict(
+            user=user, 
+            password=password, 
+            database=database, 
+            host=host,
+            port=port
+        )
         self._event_fields = {}
-        self._db: asyncpg.Connection = None
+        self._pool: asyncpg.Pool = None
+        self._min_size = min_size
+        self._max_size = max_size
 
     async def init(self) -> None:
-        """Инициализация соединения с базой данных."""
-        self._db = await asyncpg.connect(**self._conn_params)
+        """Инициализация пула соединений с базой данных."""
+        try:
+            self._pool = await asyncpg.create_pool(
+                **self._conn_params,
+                min_size=self._min_size,
+                max_size=self._max_size,
+                command_timeout=60,
+                statement_cache_size=0
+            )
+            self.logger.info(f"Historizing PgSQL pool initialized with {self._min_size}-{self._max_size} connections")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize connection pool: {e}")
+            raise
 
     async def stop(self) -> None:
-        """Закрытие соединения с базой данных."""
-        await self._db.close()
-        self.logger.info("Historizing PgSQL connection closed")
+        """Закрытие пула соединений с базой данных."""
+        if self._pool:
+            await self._pool.close()
+            self.logger.info("Historizing PgSQL connection pool closed")
+
+    async def _execute(self, query: str, *args) -> Any:
+        """
+        Выполнение SQL запроса с использованием соединения из пула.
+        
+        Args:
+            query: SQL запрос
+            *args: Аргументы для запроса
+            
+        Returns:
+            Результат выполнения запроса
+        """
+        async with self._pool.acquire() as conn:
+            return await conn.execute(query, *args)
+
+    async def _fetch(self, query: str, *args) -> List[asyncpg.Record]:
+        """
+        Выполнение SQL запроса с выборкой данных.
+        
+        Args:
+            query: SQL запрос
+            *args: Аргументы для запроса
+            
+        Returns:
+            Список записей
+        """
+        async with self._pool.acquire() as conn:
+            return await conn.fetch(query, *args)
+
+    async def _fetchval(self, query: str, *args) -> Any:
+        """
+        Выполнение SQL запроса с возвратом одного значения.
+        
+        Args:
+            query: SQL запрос
+            *args: Аргументы для запроса
+            
+        Returns:
+            Значение из запроса
+        """
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(query, *args)
 
     async def new_historized_node(
         self, 
@@ -129,11 +196,11 @@ class HistoryPgSQL(HistoryStorageInterface):
             period: Период хранения данных (None для бесконечного хранения)
             count: Максимальное количество записей (0 для неограниченного)
         """
-        table = self._get_table_name(node_id)
+        table = self._get_table_name(node_id, "var")
         self._datachanges_period[node_id] = period, count
         try:
             validate_table_name(table)
-            await self._db.execute(
+            await self._execute(
                 f'''
                 CREATE TABLE IF NOT EXISTS "{table}" (
                     _id SERIAL PRIMARY KEY,
@@ -147,11 +214,11 @@ class HistoryPgSQL(HistoryStorageInterface):
                 '''
             )
             # Преобразуем таблицу в hypertable TimescaleDB
-            await self._db.execute(
+            await self._execute(
                 f'SELECT create_hypertable(\'{table}\', \'sourcetimestamp\', if_not_exists => TRUE);'
             )
             # Индекс по времени для ускорения запросов
-            await self._db.execute(
+            await self._execute(
                 f'CREATE INDEX IF NOT EXISTS "{table}_source_ts_idx" ON "{table}" ("sourcetimestamp");'
             )
         except Exception as e:
@@ -175,7 +242,7 @@ class HistoryPgSQL(HistoryStorageInterface):
         """
         try:
             validate_table_name(table)
-            await self._db.execute(f'DELETE FROM "{table}" WHERE {condition}', *args)
+            await self._execute(f'DELETE FROM "{table}" WHERE {condition}', *args)
         except Exception as e:
             self.logger.error("Historizing PgSQL Delete Old Data Error for %s: %s", node_id, e)
 
@@ -187,10 +254,10 @@ class HistoryPgSQL(HistoryStorageInterface):
             node_id: Идентификатор узла OPC UA
             datavalue: Значение данных для сохранения
         """
-        table = self._get_table_name(node_id)
+        table = self._get_table_name(node_id, "var")
         try:
             validate_table_name(table)
-            await self._db.execute(
+            await self._execute(
                 f'INSERT INTO "{table}" (servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) VALUES ($1, $2, $3, $4, $5, $6)',
                 datavalue.ServerTimestamp,
                 datavalue.SourceTimestamp,
@@ -234,13 +301,13 @@ class HistoryPgSQL(HistoryStorageInterface):
         Returns:
             Кортеж (список значений данных, время продолжения)
         """
-        table = self._get_table_name(node_id)
+        table = self._get_table_name(node_id, "var")
         start_time, end_time, order, limit = self._get_bounds(start, end, nb_values)
         cont = None
         results = []
         try:
             validate_table_name(table)
-            rows = await self._db.fetch(
+            rows = await self._fetch(
                 f'SELECT * FROM "{table}" WHERE "sourcetimestamp" BETWEEN $1 AND $2 ORDER BY "_id" {order} LIMIT $3',
                 start_time, end_time, limit
             )
@@ -278,11 +345,11 @@ class HistoryPgSQL(HistoryStorageInterface):
         ev_fields = await self._get_event_fields(evtypes)
         self._datachanges_period[source_id] = period
         self._event_fields[source_id] = ev_fields
-        table = self._get_table_name(source_id)
+        table = self._get_table_name(source_id, "evt")
         columns = self._get_event_columns(ev_fields)
         try:
             validate_table_name(table)
-            await self._db.execute(
+            await self._execute(
                 f'''
                 CREATE TABLE IF NOT EXISTS "{table}" (
                     _id SERIAL PRIMARY KEY,
@@ -293,10 +360,10 @@ class HistoryPgSQL(HistoryStorageInterface):
                 '''
             )
             # Преобразуем таблицу событий в hypertable TimescaleDB
-            await self._db.execute(
+            await self._execute(
                 f'SELECT create_hypertable(\'{table}\', \'_Timestamp\', if_not_exists => TRUE);'
             )
-            await self._db.execute(
+            await self._execute(
                 f'CREATE INDEX IF NOT EXISTS "{table}_timestamp_idx" ON "{table}" ("_Timestamp");'
             )
         except Exception as e:
@@ -309,12 +376,12 @@ class HistoryPgSQL(HistoryStorageInterface):
         Args:
             event: Событие OPC UA для сохранения
         """
-        table = self._get_table_name(event.SourceNode)
+        table = self._get_table_name(event.SourceNode, "evt")
         columns, placeholders, evtup = self._format_event(event)
         event_type = event.EventType
         try:
             validate_table_name(table)
-            await self._db.execute(
+            await self._execute(
                 f'INSERT INTO "{table}" (_Timestamp, _EventTypeName, {columns}) VALUES ($1, $2, {placeholders})',
                 event.Time, str(event_type), *evtup
             )
@@ -325,7 +392,7 @@ class HistoryPgSQL(HistoryStorageInterface):
             date_limit = datetime.now(timezone.utc) - period
             try:
                 validate_table_name(table)
-                await self._db.execute(f'DELETE FROM "{table}" WHERE _Timestamp < $1', date_limit)
+                await self._execute(f'DELETE FROM "{table}" WHERE _Timestamp < $1', date_limit)
             except Exception as e:
                 self.logger.error("Historizing PgSQL Delete Old Data Error for events from %s: %s", event.SourceNode, e)
 
@@ -350,7 +417,7 @@ class HistoryPgSQL(HistoryStorageInterface):
         Returns:
             Кортеж (список событий, время продолжения)
         """
-        table = self._get_table_name(source_id)
+        table = self._get_table_name(source_id, "evt")
         start_time, end_time, order, limit = self._get_bounds(start, end, nb_values)
         clauses, clauses_str = self._get_select_clauses(source_id, evfilter)
         cont = None
@@ -358,7 +425,7 @@ class HistoryPgSQL(HistoryStorageInterface):
         results = []
         try:
             validate_table_name(table)
-            rows = await self._db.fetch(
+            rows = await self._fetch(
                 f'SELECT "_Timestamp", {clauses_str} FROM "{table}" WHERE "_Timestamp" BETWEEN $1 AND $2 ORDER BY "_id" {order} LIMIT $3',
                 start_time, end_time, limit
             )
@@ -379,17 +446,18 @@ class HistoryPgSQL(HistoryStorageInterface):
         results = results[: self.max_history_data_response_size]
         return results, cont
 
-    def _get_table_name(self, node_id: ua.NodeId) -> str:
+    def _get_table_name(self, node_id: ua.NodeId, table_type: str = "var") -> str:
         """
         Генерация имени таблицы для узла.
         
         Args:
             node_id: Идентификатор узла OPC UA
+            table_type: Тип таблицы ("var" для переменных, "evt" для событий)
             
         Returns:
-            Имя таблицы в формате "NamespaceIndex_Identifier"
+            Имя таблицы в формате "Type_NamespaceIndex_Identifier"
         """
-        return f"{node_id.NamespaceIndex}_{node_id.Identifier}"
+        return f"{table_type}_{node_id.NamespaceIndex}_{node_id.Identifier}"
 
     async def _get_event_fields(self, evtypes: List[ua.NodeId]) -> List[str]:
         """

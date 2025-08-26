@@ -11,4 +11,4 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-uapg = { git = "https://github.com/CyberNet-Git/uapg" }
+uapg = { path = ".." }

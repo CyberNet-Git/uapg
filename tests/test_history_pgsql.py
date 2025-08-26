@@ -49,9 +49,13 @@ class TestHistoryPgSQL:
     
     def test_get_table_name(self, history):
         """Тест генерации имени таблицы."""
-        node_id = ua.NodeId(1, "TestVariable")
+        node_id = ua.NodeId("TestVariable", 1)
+        # Тест для переменных (по умолчанию)
         table_name = history._get_table_name(node_id)
-        assert table_name == "1_TestVariable"
+        assert table_name == "var_1_TestVariable"
+        # Тест для событий
+        event_table_name = history._get_table_name(node_id, "evt")
+        assert event_table_name == "evt_1_TestVariable"
     
     def test_validate_table_name_valid(self):
         """Тест валидации корректного имени таблицы."""
