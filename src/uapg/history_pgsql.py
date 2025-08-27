@@ -197,25 +197,40 @@ class HistoryPgSQL(HistoryStorageInterface):
             count: Максимальное количество записей (0 для неограниченного)
         """
         table = self._get_table_name(node_id, "var")
+        self.logger.debug(
+            "new_historized_node: table=%s node_id=%s period=%s count=%s",
+            table, node_id, period, count,
+        )
         self._datachanges_period[node_id] = period, count
         try:
             validate_table_name(table)
             await self._execute(
                 f'''
                 CREATE TABLE IF NOT EXISTS "{table}" (
-                    _id SERIAL PRIMARY KEY,
+                    _id SERIAL,
                     servertimestamp TIMESTAMPTZ NOT NULL,
                     sourcetimestamp TIMESTAMPTZ NOT NULL,
                     statuscode INTEGER,
                     value TEXT,
                     varianttype TEXT,
-                    variantbinary BYTEA
+                    variantbinary BYTEA,
+                    PRIMARY KEY (_id, sourcetimestamp)
                 );
                 '''
             )
+            
+            # Проверяем и исправляем структуру таблицы, если она уже существовала
+            await self._ensure_variable_table_structure(table)
+            # Удаляем конфликтующие уникальные индексы, не включающие колонку партиционирования
+            await self._drop_conflicting_unique_indexes(table, 'sourcetimestamp')
+            
             # Преобразуем таблицу в hypertable TimescaleDB
             await self._execute(
                 f'SELECT create_hypertable(\'{table}\', \'sourcetimestamp\', if_not_exists => TRUE);'
+            )
+            # Индекс по _id (неуникальный) — уникальный недопустим без колонки партиционирования
+            await self._execute(
+                f'CREATE INDEX IF NOT EXISTS "{table}_id_idx" ON "{table}" ("_id");'
             )
             # Индекс по времени для ускорения запросов
             await self._execute(
@@ -255,6 +270,10 @@ class HistoryPgSQL(HistoryStorageInterface):
             datavalue: Значение данных для сохранения
         """
         table = self._get_table_name(node_id, "var")
+        self.logger.debug(
+            "save_node_value: table=%s node_id=%s source_ts=%s server_ts=%s status=%s",
+            table, node_id, getattr(datavalue, 'SourceTimestamp', None), getattr(datavalue, 'ServerTimestamp', None), getattr(datavalue, 'StatusCode', None),
+        )
         try:
             validate_table_name(table)
             await self._execute(
@@ -305,12 +324,46 @@ class HistoryPgSQL(HistoryStorageInterface):
         start_time, end_time, order, limit = self._get_bounds(start, end, nb_values)
         cont = None
         results = []
+        
+        self.logger.debug(
+            "read_node_history: table=%s node_id=%s start=%s end=%s order=%s limit=%s",
+            table, node_id, start_time, end_time, order, limit
+        )
+        
         try:
             validate_table_name(table)
+            
+            # Проверяем, существует ли таблица
+            table_exists = await self._fetchval(
+                f'''
+                SELECT COUNT(*) FROM information_schema.tables 
+                WHERE table_name = $1
+                ''',
+                table
+            )
+            
+            if table_exists == 0:
+                self.logger.warning(f"Table {table} does not exist for node {node_id}")
+                return [], None
+            
+            # Проверяем количество записей в таблице
+            total_rows = await self._fetchval(f'SELECT COUNT(*) FROM "{table}"')
+            self.logger.debug(f"Table {table} contains {total_rows} total rows")
+            
+            # Проверяем количество записей в заданном временном диапазоне
+            range_rows = await self._fetchval(
+                f'SELECT COUNT(*) FROM "{table}" WHERE "sourcetimestamp" BETWEEN $1 AND $2',
+                start_time, end_time
+            )
+            self.logger.debug(f"Table {table} contains {range_rows} rows in time range {start_time} to {end_time}")
+            
             rows = await self._fetch(
                 f'SELECT * FROM "{table}" WHERE "sourcetimestamp" BETWEEN $1 AND $2 ORDER BY "_id" {order} LIMIT $3',
                 start_time, end_time, limit
             )
+            
+            self.logger.debug(f"Retrieved {len(rows)} rows from {table}")
+            
             for row in rows:
                 dv = ua.DataValue(
                     variant_from_binary(Buffer(row['variantbinary'])),
@@ -319,11 +372,15 @@ class HistoryPgSQL(HistoryStorageInterface):
                     StatusCode_=ua.StatusCode(row['statuscode']),
                 )
                 results.append(dv)
+                
         except Exception as e:
             self.logger.error("Historizing PgSQL Read Error for %s: %s", node_id, e)
+            
         if len(results) > self.max_history_data_response_size:
             cont = results[self.max_history_data_response_size].SourceTimestamp
         results = results[: self.max_history_data_response_size]
+        
+        self.logger.debug(f"read_node_history: returning {len(results)} results for node {node_id}")
         return results, cont
 
     async def new_historized_event(
@@ -346,25 +403,50 @@ class HistoryPgSQL(HistoryStorageInterface):
         self._datachanges_period[source_id] = period
         self._event_fields[source_id] = ev_fields
         table = self._get_table_name(source_id, "evt")
+        self.logger.debug(
+            "new_historized_event: table=%s source_id=%s evtypes=%s period=%s count=%s",
+            table, source_id, evtypes, period, count,
+        )
         columns = self._get_event_columns(ev_fields)
         try:
             validate_table_name(table)
-            await self._execute(
-                f'''
+            # Формируем SQL для создания таблицы с учетом возможного отсутствия полей событий
+            if columns.strip():
+                create_table_sql = f'''
                 CREATE TABLE IF NOT EXISTS "{table}" (
-                    _id SERIAL PRIMARY KEY,
-                    _Timestamp TIMESTAMPTZ NOT NULL,
-                    _EventTypeName TEXT,
-                    {columns}
+                    _id SERIAL,
+                    _timestamp TIMESTAMPTZ NOT NULL,
+                    _eventtypename TEXT,
+                    {columns},
+                    PRIMARY KEY (_id, _timestamp)
                 );
                 '''
-            )
+            else:
+                create_table_sql = f'''
+                CREATE TABLE IF NOT EXISTS "{table}" (
+                    _id SERIAL,
+                    _timestamp TIMESTAMPTZ NOT NULL,
+                    _eventtypename TEXT,
+                    PRIMARY KEY (_id, _timestamp)
+                );
+                '''
+            await self._execute(create_table_sql)
+            
+            # Проверяем и исправляем структуру таблицы, если она уже существовала
+            await self._ensure_event_table_structure(table)
+            # Удаляем конфликтующие уникальные индексы, не включающие колонку партиционирования
+            await self._drop_conflicting_unique_indexes(table, '_timestamp')
+            
             # Преобразуем таблицу событий в hypertable TimescaleDB
             await self._execute(
-                f'SELECT create_hypertable(\'{table}\', \'_Timestamp\', if_not_exists => TRUE);'
+                f'SELECT create_hypertable(\'{table}\', \'_timestamp\', if_not_exists => TRUE);'
+            )
+            # Индекс по _id (неуникальный) — уникальный недопустим без колонки партиционирования
+            await self._execute(
+                f'CREATE INDEX IF NOT EXISTS "{table}_id_idx" ON "{table}" (_id);'
             )
             await self._execute(
-                f'CREATE INDEX IF NOT EXISTS "{table}_timestamp_idx" ON "{table}" ("_Timestamp");'
+                f'CREATE INDEX IF NOT EXISTS "{table}_timestamp_idx" ON "{table}" (_timestamp);'
             )
         except Exception as e:
             self.logger.info("Historizing PgSQL Table Creation Error for events from %s: %s", source_id, e)
@@ -376,23 +458,101 @@ class HistoryPgSQL(HistoryStorageInterface):
         Args:
             event: Событие OPC UA для сохранения
         """
+        # Проверяем, что событие не None
+        if event is None:
+            self.logger.error("save_event: event is None")
+            return
+        
+        # Проверяем, что у события есть SourceNode
+        if not hasattr(event, 'SourceNode') or event.SourceNode is None:
+            self.logger.error("save_event: event.SourceNode is None or missing")
+            return
+        
         table = self._get_table_name(event.SourceNode, "evt")
-        columns, placeholders, evtup = self._format_event(event)
+        columns, placeholders, evtup, field_names = self._format_event(event)
+        
+        # Проверяем, что у события есть EventType
+        if not hasattr(event, 'EventType') or event.EventType is None:
+            self.logger.error("save_event: event.EventType is None or missing")
+            return
+        
         event_type = event.EventType
+        # Получаем время события из различных возможных атрибутов
+        raw_time = None
+        if hasattr(event, 'Time') and event.Time is not None:
+            raw_time = event.Time
+        elif hasattr(event, 'time') and event.time is not None:
+            raw_time = event.time
+        elif hasattr(event, '_Time') and event._Time is not None:
+            raw_time = event._Time
+        
+        # Логируем все доступные атрибуты события для отладки
+        event_attrs = [attr for attr in dir(event) if not attr.startswith('_') and not callable(getattr(event, attr))]
+        self.logger.debug("save_event: available event attributes: %s", event_attrs)
+        
+        if raw_time is None:
+            self.logger.warning("save_event: event.Time is None; substituting current UTC time")
+            insert_time = datetime.now(timezone.utc)
+        else:
+            insert_time = raw_time
+            self.logger.debug("save_event: using event time: %s", insert_time)
+        self.logger.debug(
+            "save_event: table=%s source=%s type=%s raw_time=%s insert_time=%s fields=%s cols_str='%s' placeholders='%s' values_count=%d",
+            table, getattr(event, 'SourceNode', None), event_type, raw_time, insert_time, field_names, columns, placeholders, len(evtup),
+        )
         try:
             validate_table_name(table)
-            await self._execute(
-                f'INSERT INTO "{table}" (_Timestamp, _EventTypeName, {columns}) VALUES ($1, $2, {placeholders})',
-                event.Time, str(event_type), *evtup
+            
+            # Проверяем, что время события не None
+            if insert_time is None:
+                self.logger.error("save_event: insert_time is None, cannot insert event")
+                return
+            
+            # Дополнительная проверка и логирование времени
+            self.logger.debug("save_event: final insert_time check - value: %s, type: %s", insert_time, type(insert_time))
+            if insert_time is None:
+                self.logger.error("save_event: insert_time is still None after all checks!")
+                return
+            
+            # Гарантируем, что все требуемые колонки существуют
+            if field_names:
+                await self._ensure_event_dynamic_columns(table, field_names)
+            
+            # Проверяем, что колонка _timestamp существует и имеет правильное имя
+            timestamp_col_exists = await self._fetchval(
+                f'''
+                SELECT COUNT(*) FROM information_schema.columns 
+                WHERE table_name = $1 AND column_name = '_timestamp'
+                ''',
+                table
             )
+            
+            if timestamp_col_exists == 0:
+                self.logger.error(f"Column '_timestamp' does not exist in table {table}")
+                return
+            
+            # Формируем SQL для вставки с учетом возможного отсутствия полей событий
+            if columns.strip():
+                insert_sql = f'INSERT INTO "{table}" (_timestamp, _eventtypename, {columns}) VALUES ($1, $2, {placeholders})'
+            else:
+                insert_sql = f'INSERT INTO "{table}" (_timestamp, _eventtypename) VALUES ($1, $2)'
+            
+            # Финальная проверка перед выполнением SQL
+            self.logger.debug("save_event: executing SQL: %s with params: time=%s, type=%s, values=%s", 
+                            insert_sql, insert_time, str(event_type), evtup)
+            
+            await self._execute(insert_sql, insert_time, str(event_type), *evtup)
         except Exception as e:
-            self.logger.error("Historizing PgSQL Insert Error for events from %s: %s", event.SourceNode, e)
+            self.logger.error(
+                "Historizing PgSQL Insert Error for events from %s: %s | table=%s time=%s type=%s fields=%s",
+                getattr(event, 'SourceNode', None), e, table, insert_time, event_type, field_names,
+            )
         period = self._datachanges_period.get(event.emitting_node)
         if period:
             date_limit = datetime.now(timezone.utc) - period
             try:
                 validate_table_name(table)
-                await self._execute(f'DELETE FROM "{table}" WHERE _Timestamp < $1', date_limit)
+                await self._execute(f'DELETE FROM "{table}" WHERE _timestamp < $1', date_limit)
             except Exception as e:
                 self.logger.error("Historizing PgSQL Delete Old Data Error for events from %s: %s", event.SourceNode, e)
 
@@ -419,31 +579,74 @@ class HistoryPgSQL(HistoryStorageInterface):
         """
         table = self._get_table_name(source_id, "evt")
         start_time, end_time, order, limit = self._get_bounds(start, end, nb_values)
-        clauses, clauses_str = self._get_select_clauses(source_id, evfilter)
+        clauses, clauses_str = await self._get_select_clauses(source_id, evfilter)
         cont = None
         cont_timestamps = []
         results = []
+        
+        self.logger.debug(
+            "read_event_history: table=%s source_id=%s start=%s end=%s order=%s limit=%s clauses=%s",
+            table, source_id, start_time, end_time, order, limit, clauses
+        )
+        
         try:
             validate_table_name(table)
-            rows = await self._fetch(
-                f'SELECT "_Timestamp", {clauses_str} FROM "{table}" WHERE "_Timestamp" BETWEEN $1 AND $2 ORDER BY "_id" {order} LIMIT $3',
-                start_time, end_time, limit
+            
+            # Проверяем, существует ли таблица
+            table_exists = await self._fetchval(
+                f'''
+                SELECT COUNT(*) FROM information_schema.tables 
+                WHERE table_name = $1
+                ''',
+                table
             )
+            
+            if table_exists == 0:
+                self.logger.warning(f"Table {table} does not exist for source {source_id}")
+                return [], None
+            
+            # Проверяем количество записей в таблице
+            total_rows = await self._fetchval(f'SELECT COUNT(*) FROM "{table}"')
+            self.logger.debug(f"Table {table} contains {total_rows} total rows")
+            
+            # Проверяем количество записей в заданном временном диапазоне
+            range_rows = await self._fetchval(
+                f'SELECT COUNT(*) FROM "{table}" WHERE _timestamp BETWEEN $1 AND $2',
+                start_time, end_time
+            )
+            self.logger.debug(f"Table {table} contains {range_rows} rows in time range {start_time} to {end_time}")
+            
+            # Формируем SQL для выборки с учетом возможного отсутствия полей событий
+            if clauses_str.strip():
+                select_sql = f'SELECT _timestamp, {clauses_str} FROM "{table}" WHERE _timestamp BETWEEN $1 AND $2 ORDER BY "_id" {order} LIMIT $3'
+            else:
+                select_sql = f'SELECT _timestamp FROM "{table}" WHERE _timestamp BETWEEN $1 AND $2 ORDER BY "_id" {order} LIMIT $3'
+            
+            self.logger.debug(f"Executing SQL: {select_sql}")
+            
+            rows = await self._fetch(select_sql, start_time, end_time, limit)
+            
+            self.logger.debug(f"Retrieved {len(rows)} rows from {table}")
+            
             for row in rows:
                 fdict = {}
                 cont_timestamps.append(row['_timestamp'])
                 for i, field in enumerate(clauses):
                     val = row[field.lower()]
                     if val is not None:
-                        fdict[clauses[i]] = variant_from_binary(Buffer(val))
+                        fdict[clauses[i]] = variant_from_binary(Buffer(row[field.lower()]))
                     else:
                         fdict[clauses[i]] = ua.Variant(None)
                 results.append(Event.from_field_dict(fdict))
+                
         except Exception as e:
             self.logger.error("Historizing PgSQL Read Error events for node %s: %s", source_id, e)
+            
         if len(results) > self.max_history_data_response_size:
             cont = cont_timestamps[self.max_history_data_response_size]
         results = results[: self.max_history_data_response_size]
+        
+        self.logger.debug(f"read_event_history: returning {len(results)} results for source {source_id}")
         return results, cont
 
     def _get_table_name(self, node_id: ua.NodeId, table_type: str = "var") -> str:
@@ -508,9 +711,18 @@ class HistoryPgSQL(HistoryStorageInterface):
             start_time = end
             end_time = start
         limit = nb_values if nb_values else 10000
+        
+        # Логируем границы для отладки
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug(
+            "_get_bounds: start=%s end=%s nb_values=%s -> start_time=%s end_time=%s order=%s limit=%s",
+            start, end, nb_values, start_time, end_time, order, limit
+        )
+        
         return start_time, end_time, order, limit
 
-    def _format_event(self, event: Any) -> Tuple[str, str, Tuple[Any, ...]]:
+    def _format_event(self, event: Any) -> Tuple[str, str, Tuple[Any, ...], List[str]]:
         """
         Форматирование события для вставки в базу данных.
         
@@ -518,17 +730,25 @@ class HistoryPgSQL(HistoryStorageInterface):
             event: Событие OPC UA
             
         Returns:
-            Кортеж (строки колонок, плейсхолдеры, значения)
+            Кортеж (строки колонок, плейсхолдеры, значения, список имён полей)
         """
         placeholders = []
         ev_variant_binaries = []
         ev_variant_dict = event.get_event_props_as_fields_dict()
         names = list(ev_variant_dict.keys())
         names.sort()
-        for name in names:
-            placeholders.append(f"${{len(placeholders)+3}}")  # $1, $2 for time/type, $3... for fields
+        
+        # Если нет полей событий, возвращаем пустые строки
+        if not names:
+            return "", "", (), []
+        
+        # Начинаем с $3, так как $1 и $2 уже используются для времени и типа события
+        placeholder_start = 3
+        for i, name in enumerate(names):
+            placeholders.append(f"${placeholder_start + i}")
             ev_variant_binaries.append(variant_to_binary(ev_variant_dict[name]))
-        return self._list_to_sql_str(names), ", ".join(placeholders), tuple(ev_variant_binaries)
+        
+        return self._list_to_sql_str(names), ", ".join(placeholders), tuple(ev_variant_binaries), names
 
     def _get_event_columns(self, ev_fields: List[str]) -> str:
         """
@@ -540,12 +760,35 @@ class HistoryPgSQL(HistoryStorageInterface):
         Returns:
             SQL строка с определением колонок
         """
+        if not ev_fields:
+            return ""
         fields = []
         for field in ev_fields:
             fields.append(f'"{field}" BYTEA')
         return ", ".join(fields)
 
-    def _get_select_clauses(self, source_id: ua.NodeId, evfilter: Any) -> Tuple[List[str], str]:
+    async def _ensure_event_dynamic_columns(self, table: str, fields: List[str]) -> None:
+        """
+        Обеспечивает наличие всех колонок событий (BYTEA) в таблице для динамического набора полей.
+        """
+        try:
+            for field in fields:
+                col_exists = await self._fetchval(
+                    f'''
+                    SELECT COUNT(*) FROM information_schema.columns 
+                    WHERE table_name = $1 AND column_name = $2
+                    ''',
+                    table, field
+                )
+                if col_exists == 0:
+                    self.logger.info(f"Adding missing event column '{field}' to table {table}")
+                    await self._execute(
+                        f'ALTER TABLE "{table}" ADD COLUMN "{field}" BYTEA'
+                    )
+        except Exception as e:
+            self.logger.warning(f"Failed to ensure dynamic event columns for {table}: {e}")
+
+    async def _get_select_clauses(self, source_id: ua.NodeId, evfilter: Any) -> Tuple[List[str], str]:
         """
         Получение SQL предложений для выборки событий.
         
@@ -568,8 +811,87 @@ class HistoryPgSQL(HistoryStorageInterface):
                 self.logger.warning(
                     "Historizing PgSQL OPC UA Select Clause Warning for node %s, Clause: %s:", source_id, select_clause
                 )
-        clauses = [x for x in s_clauses if x in self._event_fields[source_id]]
+        
+        self.logger.debug(
+            "_get_select_clauses: source_id=%s s_clauses=%s _event_fields=%s",
+            source_id, s_clauses, self._event_fields.get(source_id, [])
+        )
+        
+        # Проверяем, что source_id существует в _event_fields
+        if source_id not in self._event_fields:
+            self.logger.warning(
+                "_get_select_clauses: source_id=%s not found in _event_fields, available keys=%s",
+                source_id, list(self._event_fields.keys())
+            )
+            # Попробуем автоматически зарегистрировать узел с базовыми полями событий
+            try:
+                await self._auto_register_event_node(source_id)
+            except Exception as e:
+                self.logger.warning(
+                    "Failed to auto-register event node %s: %s",
+                    source_id, e
+                )
+            
+            # Проверяем еще раз после попытки регистрации
+            if source_id not in self._event_fields:
+                # Возвращаем пустой список, но не вызываем ошибку
+                return [], ""
+        
+        # Получаем доступные поля для данного source_id
+        available_fields = self._event_fields[source_id]
+        if not available_fields:
+            self.logger.warning(
+                "_get_select_clauses: no fields available for source_id=%s, using fallback fields",
+                source_id
+            )
+            # Используем базовые поля OPC UA событий как fallback
+            available_fields = [
+                "EventId", "EventType", "SourceName", "Time", "Message", 
+                "Severity", "ConditionName", "BranchId", "Retain"
+            ]
+            # Обновляем _event_fields для будущих запросов
+            self._event_fields[source_id] = available_fields
+        
+        clauses = [x for x in s_clauses if x in available_fields]
+        
+        if not clauses:
+            self.logger.warning(
+                "_get_select_clauses: no matching clauses found for source_id=%s, available_fields=%s",
+                source_id, self._event_fields.get(source_id, [])
+            )
+            return [], ""
+        
+        self.logger.debug(
+            "_get_select_clauses: returning clauses=%s for source_id=%s",
+            clauses, source_id
+        )
+        
         return clauses, ", ".join([f'"{x}"' for x in clauses])
+
+    async def _auto_register_event_node(self, source_id: ua.NodeId) -> None:
+        """
+        Автоматическая регистрация узла событий с базовыми полями.
+        
+        Args:
+            source_id: Идентификатор узла для регистрации
+        """
+        try:
+            # Регистрируем узел с базовыми полями событий OPC UA
+            basic_fields = [
+                "EventId", "EventType", "SourceName", "Time", "Message", 
+                "Severity", "ConditionName", "BranchId", "Retain"
+            ]
+            
+            self._event_fields[source_id] = basic_fields
+            self.logger.info(
+                "Auto-registered event node %s with basic fields: %s",
+                source_id, basic_fields
+            )
+        except Exception as e:
+            self.logger.warning(
+                "Failed to auto-register event node %s: %s",
+                source_id, e
+            )
 
     @staticmethod
     def _list_to_sql_str(ls: List[str]) -> str:
@@ -583,3 +905,306 @@ class HistoryPgSQL(HistoryStorageInterface):
             SQL строка с элементами в кавычках
         """
         return ", ".join([f'"{item}"' for item in ls])
+
+    async def _drop_conflicting_unique_indexes(self, table: str, partition_col: str) -> None:
+        """
+        Удаляет уникальные индексы, которые не включают колонку партиционирования TimescaleDB.
+        Это требуется, т.к. TimescaleDB запрещает уникальные индексы без включения партиционирующей колонки.
+        """
+        try:
+            # Сначала исправляем дублирующиеся колонки
+            await self._fix_duplicate_columns(table, partition_col)
+            
+            # Просто удаляем все уникальные индексы, которые не содержат partition_col
+            # TimescaleDB автоматически создаст нужные индексы
+            idx_rows = await self._fetch(
+                f'''
+                SELECT i.relname as index_name
+                FROM pg_class t
+                JOIN pg_index ix ON t.oid = ix.indrelid
+                JOIN pg_class i ON i.oid = ix.indexrelid
+                WHERE t.relname = $1 AND ix.indisunique = true
+                ''',
+                table
+            )
+            
+            for row in idx_rows:
+                index_name = row['index_name']
+                self.logger.info(f"Dropping unique index {index_name} on {table}")
+                try:
+                    await self._execute(f'DROP INDEX IF EXISTS "{index_name}"')
+                except Exception as drop_error:
+                    self.logger.info(f"Index {index_name} was already dropped or doesn't exist")
+                    
+        except Exception as e:
+            self.logger.warning(f"Failed to drop conflicting unique indexes for {table}: {e}")
+
+    async def _fix_duplicate_columns(self, table: str, partition_col: str) -> None:
+        """
+        Исправляет дублирующиеся колонки с разным регистром в названии.
+        Все колонки приводятся к нижнему регистру.
+        """
+        try:
+            # Получаем все колонки таблицы
+            columns = await self._fetch(
+                f'''
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = $1
+                ''',
+                table
+            )
+            
+            column_names = [row['column_name'] for row in columns]
+            
+            # Просто переименовываем все колонки в нижний регистр, кроме partition_col
+            for col in column_names:
+                if col == partition_col:
+                    continue
+                
+                standard_name = col.lower()
+                if col != standard_name:
+                    try:
+                        self.logger.info(f"Renaming column '{col}' to '{standard_name}' in table {table}")
+                        await self._execute(f'ALTER TABLE "{table}" RENAME COLUMN "{col}" TO "{standard_name}"')
+                    except Exception as rename_error:
+                        # Если не удалось переименовать (например, колонка уже существует в chunk'е),
+                        # просто логируем и продолжаем
+                        self.logger.info(f"Column '{col}' already exists as '{standard_name}' in chunks, skipping rename")
+                        
+        except Exception as e:
+            self.logger.warning(f"Failed to fix duplicate columns for {table}: {e}")
+
+    async def _ensure_variable_table_structure(self, table: str) -> None:
+        """
+        Проверяет и исправляет структуру таблицы переменных.
+        
+        Args:
+            table: Имя таблицы
+        """
+        try:
+            # Проверяем существование колонки _id
+            id_exists = await self._fetchval(
+                f'''
+                SELECT COUNT(*) FROM information_schema.columns 
+                WHERE table_name = $1 AND column_name = '_id'
+                ''',
+                table
+            )
+            
+            if id_exists == 0:
+                # Колонка _id отсутствует, добавляем её
+                self.logger.info(f"Adding missing column '_id' to table {table}")
+                await self._execute(
+                    f'ALTER TABLE "{table}" ADD COLUMN _id SERIAL'
+                )
+            
+            # Проверяем существование колонки sourcetimestamp
+            result = await self._fetchval(
+                f'''
+                SELECT COUNT(*) FROM information_schema.columns 
+                WHERE table_name = $1 AND column_name = 'sourcetimestamp'
+                ''',
+                table
+            )
+            
+            if result == 0:
+                # Колонка sourcetimestamp отсутствует, добавляем её
+                self.logger.info(f"Adding missing column 'sourcetimestamp' to table {table}")
+                await self._execute(
+                    f'ALTER TABLE "{table}" ADD COLUMN sourcetimestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()'
+                )
+                
+                # Обновляем существующие записи, устанавливая sourcetimestamp = servertimestamp
+                await self._execute(
+                    f'UPDATE "{table}" SET sourcetimestamp = servertimestamp WHERE sourcetimestamp IS NULL'
+                )
+                
+                # Убираем значение по умолчанию
+                await self._execute(
+                    f'ALTER TABLE "{table}" ALTER COLUMN sourcetimestamp DROP DEFAULT'
+                )
+                
+            # Проверяем существование других базовых колонок
+            for col_name, col_type in [
+                ('servertimestamp', 'TIMESTAMPTZ'),
+                ('statuscode', 'INTEGER'),
+                ('value', 'TEXT'),
+                ('varianttype', 'TEXT'),
+                ('variantbinary', 'BYTEA')
+            ]:
+                col_exists = await self._fetchval(
+                    f'''
+                    SELECT COUNT(*) FROM information_schema.columns 
+                    WHERE table_name = $1 AND column_name = $2
+                    ''',
+                    table, col_name
+                )
+                
+                if col_exists == 0:
+                    # Колонка отсутствует, добавляем её
+                    self.logger.info(f"Adding missing column '{col_name}' to table {table}")
+                    await self._execute(
+                        f'ALTER TABLE "{table}" ADD COLUMN {col_name} {col_type}'
+                    )
+            
+            # Проверяем и обновляем первичный ключ после всех изменений структуры
+            await self._ensure_variable_table_primary_key(table)
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to ensure variable table structure for {table}: {e}")
+
+    async def _ensure_event_table_structure(self, table: str) -> None:
+        """
+        Проверяет и исправляет структуру таблицы событий.
+        Все колонки создаются в нижнем регистре.
+        
+        Args:
+            table: Имя таблицы
+        """
+        try:
+            # Проверяем существование колонки _id
+            id_exists = await self._fetchval(
+                f'''
+                SELECT COUNT(*) FROM information_schema.columns 
+                WHERE table_name = $1 AND column_name = '_id'
+                ''',
+                table
+            )
+            
+            if id_exists == 0:
+                # Колонка _id отсутствует, добавляем её
+                self.logger.info(f"Adding missing column '_id' to table {table}")
+                await self._execute(
+                    f'ALTER TABLE "{table}" ADD COLUMN _id SERIAL'
+                )
+            
+            # Проверяем существование колонки _timestamp (всегда в нижнем регистре)
+            timestamp_exists = await self._fetchval(
+                f'''
+                SELECT COUNT(*) FROM information_schema.columns 
+                WHERE table_name = $1 AND column_name = '_timestamp'
+                ''',
+                table
+            )
+            
+            if timestamp_exists == 0:
+                # Колонка _timestamp отсутствует, добавляем её
+                self.logger.info(f"Adding missing column '_timestamp' to table {table}")
+                await self._execute(
+                    f'ALTER TABLE "{table}" ADD COLUMN _timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()'
+                )
+                
+                # Обновляем существующие записи, устанавливая _timestamp = NOW()
+                await self._execute(
+                    f'UPDATE "{table}" SET _timestamp = NOW() WHERE _timestamp IS NULL'
+                )
+                
+                # Убираем значение по умолчанию
+                await self._execute(
+                    f'ALTER TABLE "{table}" ALTER COLUMN _timestamp DROP DEFAULT'
+                )
+                
+            # Проверяем существование колонки _eventtypename (всегда в нижнем регистре)
+            event_type_exists = await self._fetchval(
+                f'''
+                SELECT COUNT(*) FROM information_schema.columns 
+                WHERE table_name = $1 AND column_name = '_eventtypename'
+                ''',
+                table
+            )
+            
+            if event_type_exists == 0:
+                # Колонка _eventtypename отсутствует, добавляем её
+                self.logger.info(f"Adding missing column '_eventtypename' to table {table}")
+                await self._execute(
+                    f'ALTER TABLE "{table}" ADD COLUMN _eventtypename TEXT'
+                )
+            
+            # Проверяем и обновляем первичный ключ после всех изменений структуры
+            await self._ensure_event_table_primary_key(table)
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to ensure event table structure for {table}: {e}")
+
+    async def _ensure_variable_table_primary_key(self, table: str) -> None:
+        """
+        Проверяет и обновляет первичный ключ таблицы переменных.
+        
+        Args:
+            table: Имя таблицы
+        """
+        try:
+            # Просто удаляем существующий первичный ключ, если он есть
+            pk_exists = await self._fetchval(
+                f'''
+                SELECT COUNT(*) FROM information_schema.table_constraints 
+                WHERE table_name = $1 AND constraint_type = 'PRIMARY KEY'
+                ''',
+                table
+            )
+            
+            if pk_exists > 0:
+                # Получаем имя существующего первичного ключа
+                old_pk_name = await self._fetchval(
+                    f'''
+                    SELECT constraint_name 
+                    FROM information_schema.table_constraints 
+                    WHERE table_name = $1 AND constraint_type = 'PRIMARY KEY'
+                    ''',
+                    table
+                )
+                
+                if old_pk_name:
+                    self.logger.info(f"Dropping old primary key {old_pk_name} from table {table}")
+                    await self._execute(f'ALTER TABLE "{table}" DROP CONSTRAINT "{old_pk_name}"')
+            
+            # Создаем новый первичный ключ с sourcetimestamp
+            self.logger.info(f"Adding primary key to table {table}")
+            await self._execute(
+                f'ALTER TABLE "{table}" ADD CONSTRAINT "{table}_pk" PRIMARY KEY (_id, sourcetimestamp)'
+            )
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to ensure variable table primary key for {table}: {e}")
+
+    async def _ensure_event_table_primary_key(self, table: str) -> None:
+        """
+        Проверяет и обновляет первичный ключ таблицы событий.
+        
+        Args:
+            table: Имя таблицы
+        """
+        try:
+            # Просто удаляем существующий первичный ключ, если он есть
+            pk_exists = await self._fetchval(
+                f'''
+                SELECT COUNT(*) FROM information_schema.table_constraints 
+                WHERE table_name = $1 AND constraint_type = 'PRIMARY KEY'
+                ''',
+                table
+            )
+            
+            if pk_exists > 0:
+                # Получаем имя существующего первичного ключа
+                old_pk_name = await self._fetchval(
+                    f'''
+                    SELECT constraint_name 
+                    FROM information_schema.table_constraints 
+                    WHERE table_name = $1 AND constraint_type = 'PRIMARY KEY'
+                    ''',
+                    table
+                )
+                
+                if old_pk_name:
+                    self.logger.info(f"Dropping old primary key {old_pk_name} from table {table}")
+                    await self._execute(f'ALTER TABLE "{table}" DROP CONSTRAINT "{old_pk_name}"')
+            
+            # Создаем новый первичный ключ с _timestamp
+            self.logger.info(f"Adding primary key to table {table}")
+            await self._execute(
+                f'ALTER TABLE "{table}" ADD CONSTRAINT "{table}_pk" PRIMARY KEY (_id, _timestamp)'
+            )
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to ensure event table primary key for {table}: {e}")
