@@ -1,12 +1,15 @@
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple, Union
 
 import asyncpg
 from asyncua import ua
 from asyncua.server.history import HistoryStorageInterface
 from asyncua.ua.ua_binary import variant_from_binary, variant_to_binary
+
+# Импорт для работы с зашифрованной конфигурацией
+from .db_manager import DatabaseManager
 
 # Правильный буфер для побайтного чтения в variant_from_binary
 class Buffer:
@@ -84,7 +87,10 @@ class HistoryPgSQL(HistoryStorageInterface):
         host: str = 'localhost', 
         port: int = 5432,
         min_size: int = 1,
-        max_size: int = 10
+        max_size: int = 10,
+        config_file: Optional[str] = None,
+        encrypted_config: Optional[str] = None,
+        master_password: Optional[str] = None
     ) -> None:
         """
         Инициализация HistoryPgSQL.
@@ -97,22 +103,210 @@ class HistoryPgSQL(HistoryStorageInterface):
             port: Порт базы данных
             min_size: Минимальное количество соединений в пуле
             max_size: Максимальное количество соединений в пуле
+            config_file: Путь к файлу зашифрованной конфигурации
+            encrypted_config: Зашифрованная конфигурация в виде строки
+            master_password: Главный пароль для расшифровки конфигурации
         """
         self.max_history_data_response_size = 1000
         self.logger = logging.getLogger(__name__)
         self._datachanges_period = {}
-        self._conn_params = {
+        self._event_fields = {}
+        self._pool = None
+        self._min_size = min_size
+        self._max_size = max_size
+        self._initialized = False
+        
+        # Инициализация параметров подключения
+        self._conn_params = self._init_connection_params(
+            user, password, database, host, port,
+            config_file, encrypted_config, master_password
+        )
+    
+    def _init_connection_params(
+        self,
+        user: str,
+        password: str,
+        database: str,
+        host: str,
+        port: int,
+        config_file: Optional[str] = None,
+        encrypted_config: Optional[str] = None,
+        master_password: Optional[str] = None
+    ) -> dict:
+        """
+        Инициализация параметров подключения с поддержкой зашифрованной конфигурации.
+        
+        Args:
+            user: Имя пользователя базы данных
+            password: Пароль пользователя
+            database: Имя базы данных
+            host: Хост базы данных
+            port: Порт базы данных
+            config_file: Путь к файлу зашифрованной конфигурации
+            encrypted_config: Зашифрованная конфигурация в виде строки
+            master_password: Главный пароль для расшифровки конфигурации
+            
+        Returns:
+            Словарь с параметрами подключения
+        """
+        # Приоритет: зашифрованная конфигурация > файл конфигурации > прямые параметры
+        if encrypted_config and master_password:
+            try:
+                # Создаем временный DatabaseManager для расшифровки
+                temp_manager = DatabaseManager(master_password)
+                # Расшифровываем конфигурацию из строки
+                decrypted_config = temp_manager._decrypt_config(encrypted_config.encode())
+                self.logger.info("Using encrypted configuration from string")
+                return {
+                    'user': decrypted_config.get('user', user),
+                    'password': decrypted_config.get('password', password),
+                    'database': decrypted_config.get('database', database),
+                    'host': decrypted_config.get('host', host),
+                    'port': decrypted_config.get('port', port)
+                }
+            except Exception as e:
+                self.logger.warning(f"Failed to decrypt configuration string: {e}, using direct parameters")
+        
+        elif config_file and master_password:
+            try:
+                # Создаем DatabaseManager для загрузки конфигурации из файла
+                temp_manager = DatabaseManager(master_password, config_file)
+                if temp_manager.config:
+                    self.logger.info(f"Using configuration from file: {config_file}")
+                    return {
+                        'user': temp_manager.config.get('user', user),
+                        'password': temp_manager.config.get('password', password),
+                        'database': temp_manager.config.get('database', database),
+                        'host': temp_manager.config.get('host', host),
+                        'port': temp_manager.config.get('port', port)
+                    }
+                else:
+                    self.logger.warning(f"Configuration file {config_file} is empty or invalid, using direct parameters")
+            except Exception as e:
+                self.logger.warning(f"Failed to load configuration from file {config_file}: {e}, using direct parameters")
+        
+        # Используем прямые параметры как fallback
+        self.logger.info("Using direct connection parameters")
+        return {
             'user': user,
             'password': password,
             'database': database,
             'host': host,
             'port': port
         }
-        self._event_fields = {}
-        self._pool = None
-        self._min_size = min_size
-        self._max_size = max_size
-        self._initialized = False
+
+    def get_connection_info(self) -> dict:
+        """
+        Получение информации о текущих параметрах подключения.
+        
+        Returns:
+            Словарь с информацией о подключении
+        """
+        return {
+            'user': self._conn_params['user'],
+            'host': self._conn_params['host'],
+            'port': self._conn_params['port'],
+            'database': self._conn_params['database'],
+            'min_size': self._min_size,
+            'max_size': self._max_size,
+            'initialized': self._initialized
+        }
+
+    @classmethod
+    def from_config_file(
+        cls,
+        config_file: str,
+        master_password: str,
+        min_size: int = 1,
+        max_size: int = 10
+    ) -> 'HistoryPgSQL':
+        """
+        Создание экземпляра из файла зашифрованной конфигурации.
+        
+        Args:
+            config_file: Путь к файлу зашифрованной конфигурации
+            master_password: Главный пароль для расшифровки
+            min_size: Минимальное количество соединений в пуле
+            max_size: Максимальное количество соединений в пуле
+            
+        Returns:
+            Экземпляр HistoryPgSQL с загруженной конфигурацией
+        """
+        return cls(
+            config_file=config_file,
+            master_password=master_password,
+            min_size=min_size,
+            max_size=max_size
+        )
+    
+    @classmethod
+    def from_encrypted_config(
+        cls,
+        encrypted_config: str,
+        master_password: str,
+        min_size: int = 1,
+        max_size: int = 10
+    ) -> 'HistoryPgSQL':
+        """
+        Создание экземпляра из зашифрованной конфигурации в виде строки.
+        
+        Args:
+            encrypted_config: Зашифрованная конфигурация в виде строки
+            master_password: Главный пароль для расшифровки
+            min_size: Минимальное количество соединений в пуле
+            max_size: Максимальное количество соединений в пуле
+            
+        Returns:
+            Экземпляр HistoryPgSQL с расшифрованной конфигурацией
+        """
+        return cls(
+            encrypted_config=encrypted_config,
+            master_password=master_password,
+            min_size=min_size,
+            max_size=max_size
+        )
+
+    def update_config(
+        self,
+        config_file: Optional[str] = None,
+        encrypted_config: Optional[str] = None,
+        master_password: Optional[str] = None
+    ) -> bool:
+        """
+        Обновление конфигурации подключения.
+        
+        Args:
+            config_file: Путь к файлу зашифрованной конфигурации
+            encrypted_config: Зашифрованная конфигурация в виде строки
+            master_password: Главный пароль для расшифровки конфигурации
+            
+        Returns:
+            True если конфигурация обновлена успешно
+        """
+        if self._pool:
+            self.logger.warning("Cannot update config while pool is active. Call stop() first.")
+            return False
+        
+        try:
+            # Сбрасываем флаг инициализации
+            self._initialized = False
+            
+            # Обновляем параметры подключения
+            self._conn_params = self._init_connection_params(
+                self._conn_params.get('user', 'postgres'),
+                self._conn_params.get('password', 'postmaster'),
+                self._conn_params.get('database', 'opcua'),
+                self._conn_params.get('host', 'localhost'),
+                self._conn_params.get('port', 5432),
+                config_file, encrypted_config, master_password
+            )
+            
+            self.logger.info("Configuration updated successfully")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to update configuration: {e}")
+            return False
 
     async def init(self) -> None:
         """Инициализация подключения к базе данных и создание таблиц метаданных."""

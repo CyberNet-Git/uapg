@@ -1,0 +1,10 @@
+# Зависимости для модуля DatabaseManager
+# Основные зависимости для работы с PostgreSQL
+asyncpg>=0.28.0
+psycopg2-binary>=2.9.0
+
+# Зависимости для шифрования
+cryptography>=41.0.0
+
+# Дополнительные утилиты
+pathlib2>=2.3.0; python_version < "3.4"
