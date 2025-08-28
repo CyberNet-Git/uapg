@@ -90,7 +90,8 @@ class HistoryPgSQL(HistoryStorageInterface):
         max_size: int = 10,
         config_file: Optional[str] = None,
         encrypted_config: Optional[str] = None,
-        master_password: Optional[str] = None
+        master_password: Optional[str] = None,
+        **kwargs
     ) -> None:
         """
         Инициализация HistoryPgSQL.
@@ -119,7 +120,7 @@ class HistoryPgSQL(HistoryStorageInterface):
         # Инициализация параметров подключения
         self._conn_params = self._init_connection_params(
             user, password, database, host, port,
-            config_file, encrypted_config, master_password
+            config_file, encrypted_config, master_password, **kwargs
         )
     
     def _init_connection_params(
@@ -131,7 +132,8 @@ class HistoryPgSQL(HistoryStorageInterface):
         port: int,
         config_file: Optional[str] = None,
         encrypted_config: Optional[str] = None,
-        master_password: Optional[str] = None
+        master_password: Optional[str] = None,
+        **kwargs
     ) -> dict:
         """
         Инициализация параметров подключения с поддержкой зашифрованной конфигурации.
@@ -157,13 +159,16 @@ class HistoryPgSQL(HistoryStorageInterface):
                 # Расшифровываем конфигурацию из строки
                 decrypted_config = temp_manager._decrypt_config(encrypted_config.encode())
                 self.logger.info("Using encrypted configuration from string")
-                return {
+                config_params = {
                     'user': decrypted_config.get('user', user),
                     'password': decrypted_config.get('password', password),
                     'database': decrypted_config.get('database', database),
                     'host': decrypted_config.get('host', host),
                     'port': decrypted_config.get('port', port)
                 }
+                # Добавляем дополнительные параметры из kwargs
+                config_params.update(kwargs)
+                return config_params
             except Exception as e:
                 self.logger.warning(f"Failed to decrypt configuration string: {e}, using direct parameters")
         
@@ -173,13 +178,16 @@ class HistoryPgSQL(HistoryStorageInterface):
                 temp_manager = DatabaseManager(master_password, config_file)
                 if temp_manager.config:
                     self.logger.info(f"Using configuration from file: {config_file}")
-                    return {
+                    config_params = {
                         'user': temp_manager.config.get('user', user),
                         'password': temp_manager.config.get('password', password),
                         'database': temp_manager.config.get('database', database),
                         'host': temp_manager.config.get('host', host),
                         'port': temp_manager.config.get('port', port)
                     }
+                    # Добавляем дополнительные параметры из kwargs
+                    config_params.update(kwargs)
+                    return config_params
                 else:
                     self.logger.warning(f"Configuration file {config_file} is empty or invalid, using direct parameters")
             except Exception as e:
@@ -187,13 +195,16 @@ class HistoryPgSQL(HistoryStorageInterface):
         
         # Используем прямые параметры как fallback
         self.logger.info("Using direct connection parameters")
-        return {
+        base_params = {
             'user': user,
             'password': password,
             'database': database,
             'host': host,
             'port': port
         }
+        # Добавляем дополнительные параметры из kwargs
+        base_params.update(kwargs)
+        return base_params
 
     def get_connection_info(self) -> dict:
         """
@@ -311,12 +322,30 @@ class HistoryPgSQL(HistoryStorageInterface):
     async def init(self) -> None:
         """Инициализация подключения к базе данных и создание таблиц метаданных."""
         try:
-            # Создаем пул соединений
-            self._pool = await asyncpg.create_pool(
-                **self._conn_params,
-                min_size=self._min_size,
-                max_size=self._max_size
-            )
+            # Создаем пул соединений, отделяя основные параметры от дополнительных
+            pool_params = {
+                'user': self._conn_params['user'],
+                'password': self._conn_params['password'],
+                'database': self._conn_params['database'],
+                'host': self._conn_params['host'],
+                'port': self._conn_params['port'],
+                'min_size': self._min_size,
+                'max_size': self._max_size
+            }
+            
+            # Добавляем дополнительные параметры, исключая те, что не поддерживаются asyncpg
+            exclude_params = {'user', 'password', 'database', 'host', 'port', 'min_size', 'max_size', 'sslmode'}
+            for key, value in self._conn_params.items():
+                if key not in exclude_params:
+                    pool_params[key] = value
+            
+            # Обрабатываем SSL параметры отдельно
+            if self._conn_params.get('sslmode') == 'disable':
+                pool_params['ssl'] = False
+            elif self._conn_params.get('sslmode') in ('require', 'verify-ca', 'verify-full'):
+                pool_params['ssl'] = True
+            
+            self._pool = await asyncpg.create_pool(**pool_params)
             
             # Создаем таблицы метаданных только один раз
             if not self._initialized:
