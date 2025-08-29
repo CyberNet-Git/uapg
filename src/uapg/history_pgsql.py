@@ -494,9 +494,20 @@ class HistoryPgSQL(HistoryStorageInterface):
             table: Имя таблицы
             partition_column: Колонка для партиционирования
         """
-        await self._execute(
-            f'SELECT create_hypertable(\'{table}\', \'{partition_column}\', if_not_exists => TRUE)'
-        )
+        try:
+            # Проверяем, доступно ли расширение TimescaleDB
+            extension_check = await self._fetchval("SELECT COUNT(*) FROM pg_extension WHERE extname = 'timescaledb'")
+            if extension_check == 0:
+                self.logger.warning("TimescaleDB extension not found. Creating regular table without hypertable.")
+                return
+            
+            await self._execute(
+                f'SELECT create_hypertable(\'{table}\', \'{partition_column}\', if_not_exists => TRUE)'
+            )
+            self.logger.info(f"TimescaleDB hypertable created for table {table}")
+        except Exception as e:
+            self.logger.warning(f"Failed to create TimescaleDB hypertable for table {table}: {e}")
+            self.logger.info("Continuing with regular table (without TimescaleDB optimization)")
 
     async def _create_variable_indexes(self, table: str) -> None:
         """
