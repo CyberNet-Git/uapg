@@ -10,5 +10,13 @@ __author__ = "RTS IoT"
 __email__ = "panfilov@rts-iot.ru"
 
 from .history_pgsql import HistoryPgSQL
+from .history_timescale import HistoryTimescale
+from .db_manager import DatabaseManager, create_database_standalone, backup_database_standalone
 
-__all__ = ["HistoryPgSQL"]
+__all__ = [
+    "HistoryPgSQL",
+    "HistoryTimescale",
+    "DatabaseManager", 
+    "create_database_standalone", 
+    "backup_database_standalone"
+]
