@@ -68,14 +68,17 @@ class HistoryTimescale(HistoryStorageInterface):
     Новая архитектура использует единые таблицы:
     - variables_history: для всех переменных
     - events_history: для всех событий
-    - metadata_tables: для метаданных
+    - variable_metadata: метаданные переменных
+    - event_sources: источники событий (с периодом хранения)
+    - event_types: типы событий (с расширенными полями)
     
     Особенности:
-    - Единая таблица для всех переменных с полем node_id
-    - Единая таблица для всех событий с полем source_id
+    - Единая таблица для всех переменных с полем variable_id
+    - Единая таблица для всех событий с полями source_id и event_type_id
     - Настраиваемая схема (по умолчанию 'public')
     - TimescaleDB hypertables для оптимизации временных рядов
-    - Эффективное партиционирование по времени
+    - Дополнительное партиционирование по source_id (TimescaleDB 2+)
+    - Период хранения и max_records устанавливается для источника событий
     
     Attributes:
         max_history_data_response_size (int): Максимальный размер ответа с историческими данными
@@ -95,22 +98,58 @@ class HistoryTimescale(HistoryStorageInterface):
         Формирует стандартное имя узла OPC UA в формате ns=X;t=Y.
         
         Args:
-            node_id: OPC UA NodeId
+            node_id: OPC UA NodeId или совместимый объект (Node, Variant)
             
         Returns:
             str: Строка в формате "ns=X;t=Y"
         """
-        # OPC UA использует сокращенные обозначения: i=, s=, g=, b=
-        node_id_type_map = {
-            ua.NodeIdType.TwoByte: 'i',
-            ua.NodeIdType.FourByte: 'i', 
-            ua.NodeIdType.Numeric: 'i',
-            ua.NodeIdType.String: 's',
-            ua.NodeIdType.Guid: 'g',
-            ua.NodeIdType.ByteString: 'b'
-        }
-        node_id_type_char = node_id_type_map.get(node_id.NodeIdType, 'x')
-        return f"ns={node_id.NamespaceIndex};{node_id_type_char}={node_id.Identifier}"
+        # Приведение к ua.NodeId при необходимости
+        try:
+            # Случай: asyncua Node
+            if hasattr(node_id, 'nodeid'):
+                node_id = node_id.nodeid
+            # Случай: Variant с Value=NodeId
+            if hasattr(node_id, 'Value') and isinstance(node_id.Value, ua.NodeId):
+                node_id = node_id.Value
+        except Exception:
+            pass
+        
+        # Если после приведения это строка вида ns=..;t=.. — вернуть как есть
+        if isinstance(node_id, str) and node_id.startswith('ns=') and ';' in node_id:
+            return node_id
+        
+        # Если это уже ua.NodeId — собрать каноническую строку
+        try:
+            node_id_type_map = {
+                ua.NodeIdType.TwoByte: 'i',
+                ua.NodeIdType.FourByte: 'i', 
+                ua.NodeIdType.Numeric: 'i',
+                ua.NodeIdType.String: 's',
+                ua.NodeIdType.Guid: 'g',
+                ua.NodeIdType.ByteString: 'b'
+            }
+            type_key = getattr(node_id, 'NodeIdType', None)
+            ns = getattr(node_id, 'NamespaceIndex', None)
+            ident = getattr(node_id, 'Identifier', None)
+            if type_key is not None and ns is not None and ident is not None:
+                tchar = node_id_type_map.get(type_key, 'x')
+                return f"ns={ns};{tchar}={ident}"
+        except Exception:
+            pass
+        
+        # Фоллбэк: строковое представление
+        return str(node_id)
+
+    def _normalize_event_type_name(self, name: str) -> str:
+        """
+        Нормализует имя типа события: убирает префикс вида 'ns=..;s=' если он присутствует.
+        """
+        if name.startswith('ns=') and ';s=' in name:
+            try:
+                return name.split(';s=', 1)[1]
+            except Exception:
+                return name
+        return name
 
     def _get_node_data_type(self, node_id: ua.NodeId, datavalue: Optional[ua.DataValue] = None) -> str:
         """
@@ -570,18 +609,29 @@ class HistoryTimescale(HistoryStorageInterface):
                 )
             ''')
 
-            # Таблица метаданных типов событий
+            # Таблица источников событий
             await self._execute(f'''
-                CREATE TABLE IF NOT EXISTS "{self._schema}".event_type_metadata (
+                CREATE TABLE IF NOT EXISTS "{self._schema}".event_sources (
                     id BIGSERIAL PRIMARY KEY,
-                    event_type_id BIGINT GENERATED ALWAYS AS (id) STORED,
-                    event_type_name TEXT,
-                    source_id BIGINT,
-                    fields JSONB NOT NULL,
+                    source_id BIGINT GENERATED ALWAYS AS (id) STORED,
+                    source_node_id TEXT NOT NULL,
                     retention_period INTERVAL,
                     max_records INTEGER,
                     created_at TIMESTAMPTZ DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(source_id)
+                )
+            ''')
+
+            # Таблица типов событий
+            await self._execute(f'''
+                CREATE TABLE IF NOT EXISTS "{self._schema}".event_types (
+                    id BIGSERIAL PRIMARY KEY,
+                    event_type_id BIGINT GENERATED ALWAYS AS (id) STORED,
+                    event_type_name TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(event_type_id)
                 )
             ''')
             
@@ -590,24 +640,26 @@ class HistoryTimescale(HistoryStorageInterface):
             await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variables_variable_id ON "{self._schema}".variables_history(variable_id)')
             await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variables_timestamp ON "{self._schema}".variables_history(sourcetimestamp)')
             await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variables_server_timestamp ON "{self._schema}".variables_history(servertimestamp)')
-            # Уникальный индекс для обеспечения целостности данных
-            await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS idx_variables_id_timestamp ON "{self._schema}".variables_history(id, sourcetimestamp)')
+            # Уникальный индекс должен включать столбцы партиционирования TimescaleDB
+            await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS idx_variables_varid_sourcets ON "{self._schema}".variables_history(variable_id, sourcetimestamp)')
 
             await self._execute(f'CREATE INDEX IF NOT EXISTS idx_events_source_id ON "{self._schema}".events_history(source_id)')
             await self._execute(f'CREATE INDEX IF NOT EXISTS idx_events_event_type_id ON "{self._schema}".events_history(event_type_id)')
             await self._execute(f'CREATE INDEX IF NOT EXISTS idx_events_timestamp ON "{self._schema}".events_history(event_timestamp)')
             await self._execute(f'CREATE INDEX IF NOT EXISTS idx_events_data_gin ON "{self._schema}".events_history USING GIN (event_data)')
-            # Уникальный индекс для обеспечения целостности данных
-            await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS idx_events_id_timestamp ON "{self._schema}".events_history(id, event_timestamp)')
+            # Уникальный индекс должен включать столбцы партиционирования TimescaleDB
+            await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS idx_events_sourceid_eventts ON "{self._schema}".events_history(source_id, event_timestamp)')
 
             # Индексы для таблиц метаданных (bigint поля)
             await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variable_metadata_variable_id ON "{self._schema}".variable_metadata(variable_id)')
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_event_type_metadata_event_type_id ON "{self._schema}".event_type_metadata(event_type_id)')
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_event_type_metadata_source_id ON "{self._schema}".event_type_metadata(source_id)')
+            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_event_sources_source_id ON "{self._schema}".event_sources(source_id)')
+            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_event_types_event_type_id ON "{self._schema}".event_types(event_type_id)')
             
-            # Уникальные индексы для event_type_metadata
-            await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS idx_event_type_metadata_name_null ON "{self._schema}".event_type_metadata(event_type_name) WHERE source_id IS NULL')
-            await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS idx_event_type_metadata_name_source ON "{self._schema}".event_type_metadata(event_type_name, source_id)')
+            # Уникальные индексы для event_sources
+            await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS idx_event_sources_node_id ON "{self._schema}".event_sources(source_node_id)')
+            
+            # Уникальный индекс для event_types по имени типа события
+            await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS idx_event_types_name ON "{self._schema}".event_types(event_type_name)')
             
             # Уникальный индекс для variable_metadata по node_id
             await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS idx_variable_metadata_node_id ON "{self._schema}".variable_metadata(node_id)')
@@ -622,24 +674,27 @@ class HistoryTimescale(HistoryStorageInterface):
 
             # Индексы для каскадных операций удаления
             await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variable_metadata_created ON "{self._schema}".variable_metadata(created_at)')
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_event_type_metadata_created ON "{self._schema}".event_type_metadata(created_at)')
+            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_event_sources_created ON "{self._schema}".event_sources(created_at)')
+            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_event_types_created ON "{self._schema}".event_types(created_at)')
             
             self.logger.info(f"Unified history tables created successfully in schema '{self._schema}'")
             
             # Настраиваем TimescaleDB hypertables после создания всех индексов
-            await self._setup_timescale_hypertable(f'{self._schema}.variables_history', 'sourcetimestamp')
-            await self._setup_timescale_hypertable(f'{self._schema}.events_history', 'event_timestamp')
+            await self._setup_timescale_hypertable(f'{self._schema}.variables_history', 'sourcetimestamp', 'variable_id', 128)
+            await self._setup_timescale_hypertable(f'{self._schema}.events_history', 'event_timestamp', 'source_id', 64)
         except Exception as e:
             self.logger.error(f"Failed to create unified history tables: {e}")
             raise
 
-    async def _setup_timescale_hypertable(self, table: str, partition_column: str) -> None:
+    async def _setup_timescale_hypertable(self, table: str, partition_column: str, space_partition_column: Optional[str] = None, space_partitions: Optional[int] = None) -> None:
         """
-        Настройка TimescaleDB hypertable.
+        Настройка TimescaleDB hypertable с возможностью дополнительного партиционирования.
         
         Args:
             table: Имя таблицы
-            partition_column: Колонка для партиционирования
+            partition_column: Колонка для временного партиционирования
+            space_partition_column: Дополнительная колонка для пространственного партиционирования (TimescaleDB 2+)
+            space_partitions: Количество партиций для space-измерения (1..32767)
         """
         try:
             # Проверяем, доступно ли расширение TimescaleDB
@@ -648,10 +703,29 @@ class HistoryTimescale(HistoryStorageInterface):
                 self.logger.warning("TimescaleDB extension not found. Creating regular table without hypertable.")
                 return
             
-            await self._execute(
-                f'SELECT create_hypertable(\'{table}\', \'{partition_column}\', if_not_exists => TRUE)'
-            )
-            self.logger.info(f"TimescaleDB hypertable created for table {table}")
+            # Проверяем версию TimescaleDB
+            timescale_version = await self._fetchval("SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'")
+            if timescale_version:
+                major_version = int(timescale_version.split('.')[0])
+                if major_version >= 2 and space_partition_column:
+                    # Устанавливаем дефолт для количества партиций, если не задано
+                    partitions = space_partitions if (space_partitions and 1 <= space_partitions <= 32767) else 32
+                    await self._execute(
+                        f"SELECT create_hypertable('{table}', '{partition_column}', partitioning_column => '{space_partition_column}', number_partitions => {partitions}, if_not_exists => TRUE)"
+                    )
+                    self.logger.info(f"TimescaleDB hypertable created for table {table} with space partitioning on {space_partition_column} (number_partitions={partitions})")
+                else:
+                    # Стандартное партиционирование только по времени
+                    await self._execute(
+                        f"SELECT create_hypertable('{table}', '{partition_column}', if_not_exists => TRUE)"
+                    )
+                    self.logger.info(f"TimescaleDB hypertable created for table {table}")
+            else:
+                # Fallback для старых версий
+                await self._execute(
+                    f"SELECT create_hypertable('{table}', '{partition_column}', if_not_exists => TRUE)"
+                )
+                self.logger.info(f"TimescaleDB hypertable created for table {table}")
         except Exception as e:
             self.logger.warning(f"Failed to create TimescaleDB hypertable for table {table}: {e}")
             self.logger.info("Continuing with regular table (without TimescaleDB optimization)")
@@ -697,6 +771,40 @@ class HistoryTimescale(HistoryStorageInterface):
 
         return result
 
+    async def _save_event_source(self, source_id: ua.NodeId, period: Optional[timedelta], count: int) -> int:
+        """
+        Сохранение источника событий.
+
+        Args:
+            source_id: Идентификатор источника событий
+            period: Период хранения
+            count: Максимальное количество записей
+
+        Returns:
+            int: source_id для использования в таблице истории
+        """
+        source_node_id_str = self._format_node_id(source_id)
+        
+        result = await self._fetchval(f'''
+            INSERT INTO "{self._schema}".event_sources (source_node_id, retention_period, max_records)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (source_node_id) DO UPDATE SET
+                retention_period = EXCLUDED.retention_period,
+                max_records = EXCLUDED.max_records,
+                updated_at = NOW()
+            RETURNING source_id
+        ''', source_node_id_str, period, count)
+
+        if result is None:
+            # Если не удалось вставить, получаем существующий ID
+            result = await self._fetchval(f'''
+                SELECT source_id FROM "{self._schema}".event_sources
+                WHERE source_node_id = $1
+                LIMIT 1
+            ''', source_node_id_str)
+
+        return result
+
     async def _save_event_metadata(self, event_type: ua.NodeId, source_id: ua.NodeId, fields: List[str], period: Optional[timedelta], count: int) -> Tuple[int, int]:
         """
         Сохранение метаданных события.
@@ -704,39 +812,34 @@ class HistoryTimescale(HistoryStorageInterface):
         Args:
             event_type: Тип события
             source_id: Идентификатор источника
-            fields: Список полей
+            fields: Список расширенных полей события
             period: Период хранения
             count: Максимальное количество записей
 
         Returns:
             Tuple[int, int]: (source_id, event_type_id) для использования в таблице истории
         """
-        source_node_id_str = str(getattr(source_id, 'Identifier', str(source_id)))
-        event_type_name = str(getattr(event_type, 'Identifier', str(event_type)))
+        # Сначала создаем или получаем источник событий
+        source_db_id = await self._save_event_source(source_id, period, count)
         
-        # Сначала создаем или получаем запись для источника
-        source_db_id = await self._fetchval(f'''
-            INSERT INTO "{self._schema}".event_type_metadata (event_type_name, fields, retention_period, max_records)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (event_type_name) WHERE source_id IS NULL DO UPDATE SET
-                fields = EXCLUDED.fields,
-                retention_period = EXCLUDED.retention_period,
-                max_records = EXCLUDED.max_records,
-                updated_at = NOW()
-            RETURNING id
-        ''', source_node_id_str, json.dumps(fields), period, count)
+        # Теперь создаем запись для типа события
+        event_type_name = self._format_node_id(event_type)
         
-        # Теперь создаем запись для типа события с привязкой к источнику
         event_db_id = await self._fetchval(f'''
-            INSERT INTO "{self._schema}".event_type_metadata (event_type_name, source_id, fields, retention_period, max_records)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (event_type_name, source_id) DO UPDATE SET
-                fields = EXCLUDED.fields,
-                retention_period = EXCLUDED.retention_period,
-                max_records = EXCLUDED.max_records,
+            INSERT INTO "{self._schema}".event_types (event_type_name)
+            VALUES ($1)
+            ON CONFLICT (event_type_name) DO UPDATE SET
                 updated_at = NOW()
-            RETURNING id
-        ''', event_type_name, source_db_id, json.dumps(fields), period, count)
+            RETURNING event_type_id
+        ''', event_type_name)
+
+        if event_db_id is None:
+            # Если не удалось вставить, получаем существующий ID
+            event_db_id = await self._fetchval(f'''
+                SELECT event_type_id FROM "{self._schema}".event_types
+                WHERE event_type_name = $1
+                LIMIT 1
+            ''', event_type_name)
 
         return source_db_id, event_db_id
 
@@ -1088,53 +1191,28 @@ class HistoryTimescale(HistoryStorageInterface):
 
             if source_db_id is None or event_db_id is None:
                 # Если mapping не найден, получаем IDs из базы данных
-                source_node_id = str(getattr(event.SourceNode, 'Identifier', str(event.SourceNode)))
-                event_type_node_id = str(getattr(event_type, 'Identifier', str(event_type)))
-
-                # Получаем source_id - ищем существующие записи
-                source_node_id_str = str(getattr(event.SourceNode, 'Identifier', str(event.SourceNode)))
+                # Сначала получаем source_id из event_sources
+                source_node_id_str = self._format_node_id(event.SourceNode)
                 source_db_id = await self._fetchval(f'''
-                    SELECT id FROM "{self._schema}".event_type_metadata 
-                    WHERE event_type_name = $1
+                    SELECT source_id FROM "{self._schema}".event_sources 
+                    WHERE source_node_id = $1
                     LIMIT 1
                 ''', source_node_id_str)
                 
                 if source_db_id is None:
-                    # Если записи не найдены, создаем новую запись для источника
-                    source_db_id = await self._fetchval(f'''
-                        INSERT INTO "{self._schema}".event_type_metadata (event_type_name, fields, retention_period, max_records)
-                        VALUES ($1, $2, $3, $4)
-                        ON CONFLICT (event_type_name) WHERE source_id IS NULL DO UPDATE SET
-                            fields = EXCLUDED.fields,
-                            retention_period = EXCLUDED.retention_period,
-                            max_records = EXCLUDED.max_records,
-                            updated_at = NOW()
-                        RETURNING id
-                    ''', source_node_id_str, json.dumps([]), None, 0)
+                    # Если источник не найден, создаем его
+                    source_db_id = await self._save_event_source(event.SourceNode, None, 0)
 
-                # Получаем event_type_id - ищем существующие записи
-                event_type_node_id_str = str(getattr(event_type, 'Identifier', str(event_type)))
+                # Теперь получаем event_type_id из event_types
+                event_type_name = self._format_node_id(event_type)
                 event_db_id = await self._fetchval(f'''
-                    SELECT id FROM "{self._schema}".event_type_metadata 
-                    WHERE event_type_name = $1 AND source_id = $2
+                    SELECT event_type_id FROM "{self._schema}".event_types 
+                    WHERE event_type_name = $1
                     LIMIT 1
-                ''', event_type_node_id_str, source_db_id)
+                ''', event_type_name)
                 
                 if event_db_id is None:
-                    # Если записи не найдены, создаем новую запись для типа события
-                    event_db_id = await self._fetchval(f'''
-                        INSERT INTO "{self._schema}".event_type_metadata (event_type_name, source_id, fields, retention_period, max_records)
-                        VALUES ($1, $2, $3, $4, $5)
-                        ON CONFLICT (event_type_name, source_id) DO UPDATE SET
-                            fields = EXCLUDED.fields,
-                            retention_period = EXCLUDED.retention_period,
-                            max_records = EXCLUDED.max_records,
-                            updated_at = NOW()
-                        RETURNING id
-                    ''', event_type_node_id_str, source_db_id, json.dumps([]), None, 0)
-
-                if source_db_id is None or event_db_id is None:
-                    # Если метаданные не найдены, создаем их
+                    # Если тип события не найден, создаем его
                     ev_fields = self._event_fields.get(event.SourceNode, [])
                     source_db_id, event_db_id = await self._save_event_metadata(event_type, event.SourceNode, ev_fields, None, 0)
                     if event.SourceNode not in self._datachanges_period:
@@ -1157,19 +1235,29 @@ class HistoryTimescale(HistoryStorageInterface):
             )
 
             # Очистка старых данных по периоду хранения
-            if period:
-                date_limit = datetime.now(timezone.utc) - period
-                await self._execute(f'DELETE FROM "{self._schema}".events_history WHERE source_id = $1 AND event_timestamp < $2', source_db_id, date_limit)
-            elif count > 0:
-                # Удаляем лишние записи по количеству для конкретного источника
-                await self._execute(f'''
-                    DELETE FROM "{self._schema}".events_history
-                    WHERE source_id = $1 AND id NOT IN (
-                        SELECT id FROM "{self._schema}".events_history
-                        WHERE source_id = $1
-                        ORDER BY event_timestamp DESC LIMIT $2
-                    )
-                ''', source_db_id, count)
+            # Получаем параметры хранения из event_sources
+            retention_rows = await self._fetch(f'''
+                SELECT retention_period, max_records FROM "{self._schema}".event_sources 
+                WHERE source_id = $1
+                LIMIT 1
+            ''', source_db_id)
+            
+            if retention_rows:
+                retention_period = retention_rows[0]['retention_period']
+                max_records = retention_rows[0]['max_records']
+                if retention_period:
+                    date_limit = datetime.now(timezone.utc) - retention_period
+                    await self._execute(f'DELETE FROM "{self._schema}".events_history WHERE source_id = $1 AND event_timestamp < $2', source_db_id, date_limit)
+                elif max_records and max_records > 0:
+                    # Удаляем лишние записи по количеству для конкретного источника
+                    await self._execute(f'''
+                        DELETE FROM "{self._schema}".events_history
+                        WHERE source_id = $1 AND id NOT IN (
+                            SELECT id FROM "{self._schema}".events_history
+                            WHERE source_id = $1
+                            ORDER BY event_timestamp DESC LIMIT $2
+                        )
+                    ''', source_db_id, max_records)
 
         except Exception as e:
             self.logger.error(f"Failed to save event for {event.SourceNode}: {e}")
@@ -1292,42 +1380,12 @@ class HistoryTimescale(HistoryStorageInterface):
             source_data = self._datachanges_period.get(source_id)
             if source_data is None:
                 # Если mapping не найден, получаем source_db_id из базы данных
-                # Ищем существующие записи в events_history для этого source_id
-                source_node_id_str = str(getattr(source_id, 'Identifier', str(source_id)))
-                #self.logger.debug(f"read_event_history: searching for existing source_id in events_history for {source_id} (node_id: {source_node_id_str})")
-                
-                # Сначала ищем в event_type_metadata по event_type_name
-                existing_source_id = await self._fetchval(f'''
-                    SELECT id FROM "{self._schema}".event_type_metadata 
-                    WHERE event_type_name = $1
+                source_node_id_str = self._format_node_id(source_id)
+                source_db_id = await self._fetchval(f'''
+                    SELECT source_id FROM "{self._schema}".event_sources 
+                    WHERE source_node_id = $1
                     LIMIT 1
                 ''', source_node_id_str)
-                
-                #self.logger.debug(f"read_event_history: existing_source_id from metadata: {existing_source_id}")
-                
-                if existing_source_id is None:
-                    # Если записи не найдены, создаем новую запись для источника
-                    #self.logger.debug(f"read_event_history: creating new source metadata for {source_id}")
-                    source_db_id = await self._fetchval(f'''
-                        INSERT INTO "{self._schema}".event_type_metadata (event_type_name, fields, retention_period, max_records)
-                        VALUES ($1, $2, $3, $4)
-                        ON CONFLICT (event_type_name) WHERE source_id IS NULL DO UPDATE SET
-                            fields = EXCLUDED.fields,
-                            retention_period = EXCLUDED.retention_period,
-                            max_records = EXCLUDED.max_records,
-                            updated_at = NOW()
-                        RETURNING id
-                    ''', source_node_id_str, json.dumps([]), None, 0)
-                else:
-                    source_db_id = existing_source_id
-                    #self.logger.debug(f"read_event_history: found existing source_db_id: {source_db_id}")
-                    
-                # Проверяем, есть ли записи в events_history с этим source_db_id
-                events_count = await self._fetchval(f'''
-                    SELECT COUNT(*) FROM "{self._schema}".events_history
-                    WHERE source_id = $1
-                ''', source_db_id)
-                #self.logger.debug(f"read_event_history: events count for source_db_id {source_db_id}: {events_count}")
                 
                 if source_db_id is None:
                     self.logger.warning(f"No metadata found for source {source_id}")
@@ -1338,13 +1396,6 @@ class HistoryTimescale(HistoryStorageInterface):
                     #self.logger.debug(f"read_event_history: source_data: {source_data}")
                     period, count, source_db_id, event_ids = source_data
                     #self.logger.debug(f"read_event_history: using cached source_db_id: {source_db_id}")
-                    
-                    # Проверяем, есть ли записи в events_history с этим source_db_id
-                    events_count = await self._fetchval(f'''
-                        SELECT COUNT(*) FROM "{self._schema}".events_history
-                        WHERE source_id = $1
-                    ''', source_db_id)
-                    #self.logger.debug(f"read_event_history: cached events count for source_db_id {source_db_id}: {events_count}")
                     
                 elif len(source_data) == 3:
                     # Старый формат для переменных: (period, count, variable_id)
