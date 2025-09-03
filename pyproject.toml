@@ -1,10 +1,10 @@
 [project]
 name = "uapg"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 description = "OPC UA PostgreSQL History Storage Backend"
 readme = "README.md"
 authors = [
-    { name = "Cyber.Net-Git", email = "v.v.panfilov@gmail.com" }
+    { name = "CyberNet-Git", email = "v.v.panfilov@gmail.com" }
 ]
 license = "MIT"
 requires-python = ">=3.12"
@@ -32,10 +32,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Cyber.Net-Git/uapg"
-Repository = "https://github.com/Cyber.Net-Git/uapg"
-Documentation = "https://github.com/Cyber.Net-Git/uapg#readme"
-Issues = "https://github.com/Cyber.Net-Git/uapg/issues"
+Homepage = "https://github.com/CyberNet-Git/uapg"
+Repository = "https://github.com/CyberNet-Git/uapg"
+Documentation = "https://github.com/CyberNet-Git/uapg#readme"
+Issues = "https://github.com/CyberNet-Git/uapg/issues"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
