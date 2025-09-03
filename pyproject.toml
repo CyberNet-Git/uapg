@@ -1,10 +1,10 @@
 [project]
 name = "uapg"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 description = "OPC UA PostgreSQL History Storage Backend"
 readme = "README.md"
 authors = [
-    { name = "RTS IoT", email = "panfilov@rts-iot.ru" }
+    { name = "Cyber.Net-Git", email = "v.v.panfilov@gmail.com" }
 ]
 license = "MIT"
 requires-python = ">=3.12"
@@ -32,10 +32,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/rts-iot/uapg"
-Repository = "https://github.com/rts-iot/uapg"
-Documentation = "https://github.com/rts-iot/uapg#readme"
-Issues = "https://github.com/rts-iot/uapg/issues"
+Homepage = "https://github.com/Cyber.Net-Git/uapg"
+Repository = "https://github.com/Cyber.Net-Git/uapg"
+Documentation = "https://github.com/Cyber.Net-Git/uapg#readme"
+Issues = "https://github.com/Cyber.Net-Git/uapg/issues"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
