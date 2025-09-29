@@ -1100,7 +1100,7 @@ class HistoryTimescale(HistoryStorageInterface):
 
             # Вставка в единую таблицу переменных
             await self._execute(
-                f'INSERT INTO "{self._schema}".variables_history (variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+                f'INSERT INTO "{self._schema}".variables_history (variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
                 variable_id,
                 datavalue.ServerTimestamp,
                 datavalue.SourceTimestamp,
@@ -1224,7 +1224,7 @@ class HistoryTimescale(HistoryStorageInterface):
 
             # Вставка в единую таблицу событий
             await self._execute(
-                f'INSERT INTO "{self._schema}".events_history (source_id, event_type_id, event_timestamp, event_data) VALUES ($1, $2, $3, $4)',
+                f'INSERT INTO "{self._schema}".events_history (source_id, event_type_id, event_timestamp, event_data) VALUES ($1, $2, $3, $4) ON CONFLICT (source_id, event_timestamp) DO NOTHING',
                 source_db_id,
                 event_db_id,
                 event_time,
