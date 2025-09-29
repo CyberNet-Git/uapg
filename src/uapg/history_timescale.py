@@ -999,10 +999,7 @@ class HistoryTimescale(HistoryStorageInterface):
             period: Период хранения данных (None для бесконечного хранения)
             count: Максимальное количество записей (0 для неограниченного)
         """
-        self.logger.debug(
-            "new_historized_node: node_id=%s period=%s count=%s",
-            node_id, period, count,
-        )
+        #self.logger.debug("new_historized_node: node_id=%s period=%s count=%s",node_id, period, count,)
 
         try:
             # Сохраняем метаданные переменной и получаем variable_id
@@ -1011,7 +1008,7 @@ class HistoryTimescale(HistoryStorageInterface):
             # Сохраняем mapping node_id -> variable_id для быстрого доступа
             self._datachanges_period[node_id] = (period, count, variable_id)
 
-            self.logger.info(f"Variable node {node_id} registered for historization in unified table (variable_id: {variable_id})")
+            #self.logger.info(f"Variable node {node_id} registered for historization in unified table (variable_id: {variable_id})")
         except Exception as e:
             self.logger.error(f"Failed to register variable node {node_id}: {e}")
             raise
@@ -1147,7 +1144,7 @@ class HistoryTimescale(HistoryStorageInterface):
                 ''', variable_id, count)
 
         except Exception as e:
-            self.logger.error(f"Failed to save node value for {node_id}: {e}")
+            self.logger.error(f"Failed to save node value for {node_id}: {e} \n {datavalue}")
     
     async def save_event(self, event: Any) -> None:
         """
