@@ -262,6 +262,10 @@ class HistoryTimescale(HistoryStorageInterface):
         self._reconnect_min_delay = 1.0
         self._reconnect_max_delay = 30.0
         self._was_healthy = True
+        self._db_unavailable_since = None
+        self._last_throttled_log_at = None
+        self._failed_value_saves_counter = 0
+        self._failed_event_saves_counter = 0
         
         # Инициализация параметров подключения
         self._conn_params = self._init_connection_params(
@@ -551,6 +555,7 @@ class HistoryTimescale(HistoryStorageInterface):
                 if not self._was_healthy:
                     self.logger.info("Database connection restored")
                     self._was_healthy = True
+                    self._reset_outage_stats()
                 delay = self._reconnect_min_delay
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=5.0)
@@ -578,6 +583,48 @@ class HistoryTimescale(HistoryStorageInterface):
                 jitter = random.uniform(0, 0.3 * delay)
                 await asyncio.sleep(delay + jitter)
                 delay = min(delay * 2, self._reconnect_max_delay)
+
+    def _reset_outage_stats(self) -> None:
+        if self._failed_value_saves_counter or self._failed_event_saves_counter:
+            self.logger.info(
+                f"During outage suppressed failures: values={self._failed_value_saves_counter}, events={self._failed_event_saves_counter}"
+            )
+        self._db_unavailable_since = None
+        self._last_throttled_log_at = None
+        self._failed_value_saves_counter = 0
+        self._failed_event_saves_counter = 0
+
+    def _log_save_failure_throttled(self, kind: str, node_repr: str, error: Exception, datavalue_repr: str = None) -> None:
+        now = datetime.now(timezone.utc)
+        if self._db_unavailable_since is None:
+            self._db_unavailable_since = now
+        if kind == 'value':
+            self._failed_value_saves_counter += 1
+            count = self._failed_value_saves_counter
+        else:
+            self._failed_event_saves_counter += 1
+            count = self._failed_event_saves_counter
+
+        elapsed = now - self._db_unavailable_since
+        if elapsed < timedelta(minutes=10):
+            # Полная детализация в первые 10 минут
+            if datavalue_repr is not None:
+                self.logger.error(f"Failed to save {kind} for {node_repr}: {error} \n {datavalue_repr}")
+            else:
+                self.logger.error(f"Failed to save {kind} for {node_repr}: {error}")
+            return
+
+        # После 10 минут — не чаще 1 раза в 10 секунд, с агрегацией
+        if self._last_throttled_log_at is None or (now - self._last_throttled_log_at) >= timedelta(seconds=10):
+            self._last_throttled_log_at = now
+            self.logger.error(
+                f"Database still unavailable. Aggregated {kind} save failures: {count}. Latest error: {error}"
+            )
+            # Сбрасываем только соответствующий счётчик, чтобы считать новый интервал
+            if kind == 'value':
+                self._failed_value_saves_counter = 0
+            else:
+                self._failed_event_saves_counter = 0
 
     async def stop(self) -> None:
         """Остановка и закрытие пула соединений."""
@@ -1255,7 +1302,8 @@ class HistoryTimescale(HistoryStorageInterface):
                 ''', variable_id, count)
 
         except Exception as e:
-            self.logger.error(f"Failed to save node value for {node_id}: {e} \n {datavalue}")
+            # Антиспам логирование при длительной недоступности БД
+            self._log_save_failure_throttled('value', str(node_id), e, str(datavalue))
     
     async def save_event(self, event: Any) -> None:
         """
@@ -1368,7 +1416,9 @@ class HistoryTimescale(HistoryStorageInterface):
                     ''', source_db_id, max_records)
 
         except Exception as e:
-            self.logger.error(f"Failed to save event for {event.SourceNode}: {e}")
+            # Антиспам логирование при длительной недоступности БД
+            src = getattr(event, 'SourceNode', 'unknown')
+            self._log_save_failure_throttled('event', str(src), e)
 
     async def read_node_history(
         self,
