@@ -7,6 +7,8 @@
 """
 
 import json
+import asyncio
+import random
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, List, Optional, Tuple, Union
@@ -254,6 +256,12 @@ class HistoryTimescale(HistoryStorageInterface):
         self._max_size = max_size
         self._initialized = False
         self._schema = schema
+        self._pool_lock = asyncio.Lock()
+        self._stop_event = asyncio.Event()
+        self._reconnect_task = None
+        self._reconnect_min_delay = 1.0
+        self._reconnect_max_delay = 30.0
+        self._was_healthy = True
         
         # Инициализация параметров подключения
         self._conn_params = self._init_connection_params(
@@ -477,47 +485,115 @@ class HistoryTimescale(HistoryStorageInterface):
     async def init(self) -> None:
         """Инициализация подключения к базе данных и создание таблиц метаданных."""
         try:
-            # Создаем пул соединений, отделяя основные параметры от дополнительных
-            pool_params = {
-                'user': self._conn_params['user'],
-                'password': self._conn_params['password'],
-                'database': self._conn_params['database'],
-                'host': self._conn_params['host'],
-                'port': self._conn_params['port'],
-                'min_size': self._min_size,
-                'max_size': self._max_size
-            }
-            
-            # Добавляем дополнительные параметры, исключая те, что не поддерживаются asyncpg
-            exclude_params = {'user', 'password', 'database', 'host', 'port', 'min_size', 'max_size', 'sslmode', 'schema'}
-            for key, value in self._conn_params.items():
-                if key not in exclude_params:
-                    pool_params[key] = value
-            
-            # Обрабатываем SSL параметры отдельно
-            if self._conn_params.get('sslmode') == 'disable':
-                pool_params['ssl'] = False
-            elif self._conn_params.get('sslmode') in ('require', 'verify-ca', 'verify-full'):
-                pool_params['ssl'] = True
-            
-            self._pool = await asyncpg.create_pool(**pool_params)
-            
-            # Создаем таблицы метаданных только один раз
+            await self._ensure_pool()
+
             if not self._initialized:
                 await self._create_metadata_tables()
                 self._initialized = True
-                
+
+            if self._reconnect_task is None or self._reconnect_task.done():
+                self._stop_event.clear()
+                self._reconnect_task = asyncio.create_task(self._reconnect_monitor())
+                self.logger.info("Reconnect monitor started")
+
             self.logger.info("HistoryTimescale initialized successfully")
         except Exception as e:
             self.logger.error(f"Failed to initialize HistoryTimescale: {e}")
             raise
 
+    def _build_pool_params(self) -> dict:
+        pool_params = {
+            'user': self._conn_params['user'],
+            'password': self._conn_params['password'],
+            'database': self._conn_params['database'],
+            'host': self._conn_params['host'],
+            'port': self._conn_params['port'],
+            'min_size': self._min_size,
+            'max_size': self._max_size
+        }
+
+        exclude_params = {'user', 'password', 'database', 'host', 'port', 'min_size', 'max_size', 'sslmode', 'schema'}
+        for key, value in self._conn_params.items():
+            if key not in exclude_params:
+                pool_params[key] = value
+
+        if self._conn_params.get('sslmode') == 'disable':
+            pool_params['ssl'] = False
+        elif self._conn_params.get('sslmode') in ('require', 'verify-ca', 'verify-full'):
+            pool_params['ssl'] = True
+
+        return pool_params
+
+    async def _ensure_pool(self) -> None:
+        if self._pool and not self._pool._closed:
+            return
+        async with self._pool_lock:
+            if self._pool and not self._pool._closed:
+                return
+            pool_params = self._build_pool_params()
+            self._pool = await asyncpg.create_pool(**pool_params)
+            self.logger.info("Connection pool created")
+
+    async def _is_pool_healthy(self) -> bool:
+        try:
+            await self._ensure_pool()
+            async with self._pool.acquire() as conn:
+                val = await conn.fetchval('SELECT 1')
+                return val == 1
+        except Exception:
+            return False
+
+    async def _reconnect_monitor(self) -> None:
+        delay = self._reconnect_min_delay
+        while not self._stop_event.is_set():
+            healthy = await self._is_pool_healthy()
+            if healthy:
+                if not self._was_healthy:
+                    self.logger.info("Database connection restored")
+                    self._was_healthy = True
+                delay = self._reconnect_min_delay
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            if self._was_healthy:
+                self.logger.error("Database connection lost. The database became unreachable.")
+            else:
+                self.logger.warning("Database connection unhealthy. Attempting to reconnect...")
+            self._was_healthy = False
+            try:
+                if self._pool:
+                    try:
+                        await self._pool.close()
+                    except Exception:
+                        pass
+                    self._pool = None
+                await self._ensure_pool()
+                self.logger.info("Reconnected to database successfully")
+                delay = self._reconnect_min_delay
+            except Exception as e:
+                self.logger.error(f"Reconnect attempt failed: {e}")
+                jitter = random.uniform(0, 0.3 * delay)
+                await asyncio.sleep(delay + jitter)
+                delay = min(delay * 2, self._reconnect_max_delay)
+
     async def stop(self) -> None:
         """Остановка и закрытие пула соединений."""
+        self._stop_event.set()
+        if self._reconnect_task and not self._reconnect_task.done():
+            try:
+                await self._reconnect_task
+            except Exception:
+                pass
+        self._reconnect_task = None
         if self._pool:
-            await self._pool.close()
-            self._pool = None
-            self.logger.info("HistoryTimescale stopped")
+            try:
+                await self._pool.close()
+            finally:
+                self._pool = None
+        self.logger.info("HistoryTimescale stopped")
 
     async def _execute(self, query: str, *args) -> Any:
         """
@@ -530,8 +606,15 @@ class HistoryTimescale(HistoryStorageInterface):
         Returns:
             Результат выполнения запроса
         """
-        async with self._pool.acquire() as conn:
-            return await conn.execute(query, *args)
+        await self._ensure_pool()
+        try:
+            async with self._pool.acquire() as conn:
+                return await conn.execute(query, *args)
+        except Exception as e:
+            self.logger.warning(f"Execute failed, will try to reconnect and retry: {e}")
+            await self._force_reconnect()
+            async with self._pool.acquire() as conn:
+                return await conn.execute(query, *args)
 
     async def _fetch(self, query: str, *args) -> List[asyncpg.Record]:
         """
@@ -544,8 +627,15 @@ class HistoryTimescale(HistoryStorageInterface):
         Returns:
             Список записей
         """
-        async with self._pool.acquire() as conn:
-            return await conn.fetch(query, *args)
+        await self._ensure_pool()
+        try:
+            async with self._pool.acquire() as conn:
+                return await conn.fetch(query, *args)
+        except Exception as e:
+            self.logger.warning(f"Fetch failed, will try to reconnect and retry: {e}")
+            await self._force_reconnect()
+            async with self._pool.acquire() as conn:
+                return await conn.fetch(query, *args)
 
     async def _fetchval(self, query: str, *args) -> Any:
         """
@@ -558,8 +648,29 @@ class HistoryTimescale(HistoryStorageInterface):
         Returns:
             Значение
         """
-        async with self._pool.acquire() as conn:
-            return await conn.fetchval(query, *args)
+        await self._ensure_pool()
+        try:
+            async with self._pool.acquire() as conn:
+                return await conn.fetchval(query, *args)
+        except Exception as e:
+            self.logger.warning(f"Fetchval failed, will try to reconnect and retry: {e}")
+            await self._force_reconnect()
+            async with self._pool.acquire() as conn:
+                return await conn.fetchval(query, *args)
+
+    async def _force_reconnect(self) -> None:
+        async with self._pool_lock:
+            try:
+                if self._pool:
+                    try:
+                        await self._pool.close()
+                    except Exception:
+                        pass
+                self._pool = None
+                await self._ensure_pool()
+            except Exception as e:
+                self.logger.error(f"Force reconnect failed: {e}")
+                raise
 
     async def _create_metadata_tables(self) -> None:
         """Создание единых таблиц для историзации в указанной схеме."""
