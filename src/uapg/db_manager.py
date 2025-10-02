@@ -59,7 +59,7 @@ class DatabaseManager:
         self.config_file = Path(config_file)
         self.key_file = Path(key_file)
         self.encrypted_config = encrypted_config
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger('uapg.db_manager')
         
         # Инициализация шифрования
         if master_password:

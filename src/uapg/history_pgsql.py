@@ -194,7 +194,7 @@ class HistoryPgSQL(HistoryStorageInterface):
             master_password: Главный пароль для расшифровки конфигурации
         """
         self.max_history_data_response_size = 1000
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger('uapg.history_pgsql')
         self._datachanges_period = {}
         self._event_fields = {}
         self._pool = None
