@@ -24,8 +24,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
 import asyncpg
-import psycopg2
-from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+import psycopg
+from psycopg.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 
 class DatabaseManager:
@@ -206,7 +206,7 @@ class DatabaseManager:
                 }
             
             # Создание пользователя и базы данных
-            conn = psycopg2.connect(**conn_params)
+            conn = psycopg.connect(**conn_params)
             conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
             cursor = conn.cursor()
             
@@ -214,14 +214,14 @@ class DatabaseManager:
             try:
                 cursor.execute(f"CREATE USER {user} WITH PASSWORD '{password}'")
                 self.logger.info(f"User {user} created successfully")
-            except psycopg2.errors.DuplicateObject:
+            except psycopg.errors.DuplicateObject:
                 self.logger.info(f"User {user} already exists")
             
             # Создание базы данных
             try:
                 cursor.execute(f"CREATE DATABASE {database} OWNER {user}")
                 self.logger.info(f"Database {database} created successfully")
-            except psycopg2.errors.DuplicateDatabase:
+            except psycopg.errors.DuplicateDatabase:
                 self.logger.info(f"Database {database} already exists")
             
             cursor.close()
