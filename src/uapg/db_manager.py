@@ -25,7 +25,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
 import asyncpg
 import psycopg
-from psycopg.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+#from psycopg.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 
 class DatabaseManager:
@@ -207,7 +207,7 @@ class DatabaseManager:
             
             # Создание пользователя и базы данных
             conn = psycopg.connect(**conn_params)
-            conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+            conn.set_isolation_level(psycopg.ISOLATION_LEVEL_AUTOCOMMIT)
             cursor = conn.cursor()
             
             # Создание пользователя
