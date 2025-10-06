@@ -633,6 +633,27 @@ class HistoryPgSQL(HistoryStorageInterface):
             async with self._pool.acquire() as conn:
                 return await conn.fetchval(query, *args)
 
+    async def _fetchrow(self, query: str, *args) -> Optional[asyncpg.Record]:
+        """
+        Выполнение SQL запроса с возвратом одной строки.
+        
+        Args:
+            query: SQL запрос
+            *args: Аргументы для запроса
+            
+        Returns:
+            Одна строка из результата запроса или None
+        """
+        await self._ensure_pool()
+        try:
+            async with self._pool.acquire() as conn:
+                return await conn.fetchrow(query, *args)
+        except Exception as e:
+            self.logger.warning(f"Fetchrow failed, will try to reconnect and retry: {e}")
+            await self._force_reconnect()
+            async with self._pool.acquire() as conn:
+                return await conn.fetchrow(query, *args)
+
     async def _force_reconnect(self) -> None:
         async with self._pool_lock:
             try:
