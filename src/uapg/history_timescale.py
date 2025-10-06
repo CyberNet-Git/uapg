@@ -793,6 +793,19 @@ class HistoryTimescale(HistoryStorageInterface):
                 )
             ''')
             
+            # Таблица кэша последних значений переменных
+            await self._execute(f'''
+                CREATE TABLE IF NOT EXISTS "{self._schema}".variables_last_value (
+                    variable_id BIGINT PRIMARY KEY,
+                    sourcetimestamp TIMESTAMPTZ NOT NULL,
+                    servertimestamp TIMESTAMPTZ NOT NULL,
+                    statuscode INTEGER NOT NULL,
+                    varianttype INTEGER NOT NULL,
+                    variantbinary BYTEA NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            ''')
+            
             # Создаем индексы для производительности и связей
             # Индексы для таблиц истории (bigint поля для оптимизации)
             await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variables_variable_id ON "{self._schema}".variables_history(variable_id)')
@@ -834,6 +847,12 @@ class HistoryTimescale(HistoryStorageInterface):
             await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variable_metadata_created ON "{self._schema}".variable_metadata(created_at)')
             await self._execute(f'CREATE INDEX IF NOT EXISTS idx_event_sources_created ON "{self._schema}".event_sources(created_at)')
             await self._execute(f'CREATE INDEX IF NOT EXISTS idx_event_types_created ON "{self._schema}".event_types(created_at)')
+            
+            # Индекс для кэш-таблицы последних значений
+            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variables_last_value_updated ON "{self._schema}".variables_last_value(updated_at)')
+            
+            # Покрывающий индекс для fallback-запросов последнего значения
+            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variables_history_vid_ts_desc_covering ON "{self._schema}".variables_history (variable_id, sourcetimestamp DESC) INCLUDE (statuscode, varianttype, variantbinary, servertimestamp)')
             
             self.logger.info(f"Unified history tables created successfully in schema '{self._schema}'")
             
@@ -1268,6 +1287,22 @@ class HistoryTimescale(HistoryStorageInterface):
                 variant_to_binary(datavalue.Value)
             )
 
+            # Обновляем кэш последних значений
+            await self._execute(f'''
+                INSERT INTO "{self._schema}".variables_last_value 
+                (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (variable_id) DO UPDATE
+                    SET sourcetimestamp = EXCLUDED.sourcetimestamp,
+                        servertimestamp = EXCLUDED.servertimestamp,
+                        statuscode = EXCLUDED.statuscode,
+                        varianttype = EXCLUDED.varianttype,
+                        variantbinary = EXCLUDED.variantbinary,
+                        updated_at = NOW()
+                    WHERE "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
+            ''', variable_id, datavalue.SourceTimestamp, datavalue.ServerTimestamp, 
+                datavalue.StatusCode.value, int(datavalue.Value.VariantType), variant_to_binary(datavalue.Value))
+
             # Обновляем тип данных в метаданных на основе реального DataValue только при изменении
             if datavalue and hasattr(datavalue, 'Value') and datavalue.Value is not None:
                 actual_data_type = self._get_node_data_type(node_id, datavalue)
@@ -1666,6 +1701,185 @@ class HistoryTimescale(HistoryStorageInterface):
             await self._execute(f'DELETE FROM {full_table} WHERE {condition}', *args)
         except Exception as e:
             self.logger.error(f"Failed to delete data for {node_id}: {e}")
+
+    async def read_last_value(self, node_id: ua.NodeId) -> Optional[ua.DataValue]:
+        """
+        Быстрое получение последнего сохраненного значения переменной.
+        
+        Args:
+            node_id: Идентификатор узла OPC UA
+            
+        Returns:
+            Последнее значение или None если не найдено
+        """
+        try:
+            # Получаем variable_id
+            node_data = self._datachanges_period.get(node_id)
+            if node_data is None:
+                # Если mapping не найден, получаем variable_id из базы данных
+                node_id_str = self._format_node_id(node_id)
+                variable_id = await self._fetchval(f'''
+                    SELECT variable_id FROM "{self._schema}".variable_metadata
+                    WHERE node_id = $1
+                    LIMIT 1
+                ''', node_id_str)
+            else:
+                # Проверяем формат данных
+                if len(node_data) == 3:
+                    period, count, variable_id = node_data
+                elif len(node_data) == 4:
+                    # Формат для событий: (period, count, source_db_id, event_ids)
+                    self.logger.warning(f"Node {node_id} is registered as event source, not variable")
+                    return None
+                else:
+                    self.logger.warning(f"Unexpected data format for node {node_id}: {node_data}")
+                    return None
+            
+            if variable_id is None:
+                return None
+            
+            # Сначала пытаемся получить из кэша
+            row = await self._fetchrow(f'''
+                SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                FROM "{self._schema}".variables_last_value
+                WHERE variable_id = $1
+            ''', variable_id)
+            
+            if row is not None:
+                # Преобразуем в DataValue
+                return ua.DataValue(
+                    Value=variant_from_binary(Buffer(row['variantbinary'])),
+                    StatusCode_=ua.StatusCode(row['statuscode']),
+                    SourceTimestamp=row['sourcetimestamp'],
+                    ServerTimestamp=row['servertimestamp']
+                )
+            
+            # Fallback: получаем из основной таблицы через покрывающий индекс
+            row = await self._fetchrow(f'''
+                SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                FROM "{self._schema}".variables_history
+                WHERE variable_id = $1
+                ORDER BY sourcetimestamp DESC
+                LIMIT 1
+            ''', variable_id)
+            
+            if row is not None:
+                # Преобразуем в DataValue
+                return ua.DataValue(
+                    Value=variant_from_binary(Buffer(row['variantbinary'])),
+                    StatusCode_=ua.StatusCode(row['statuscode']),
+                    SourceTimestamp=row['sourcetimestamp'],
+                    ServerTimestamp=row['servertimestamp']
+                )
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Failed to read last value for {node_id}: {e}")
+            return None
+
+    async def read_last_values(self, node_ids: List[ua.NodeId]) -> dict:
+        """
+        Быстрое получение последних сохраненных значений для списка переменных.
+        
+        Args:
+            node_ids: Список идентификаторов узлов OPC UA
+            
+        Returns:
+            Словарь {node_id: DataValue} или {node_id: None} для отсутствующих
+        """
+        result = {}
+        
+        try:
+            # Получаем variable_id для всех узлов
+            variable_ids = []
+            node_to_variable = {}
+            
+            for node_id in node_ids:
+                node_data = self._datachanges_period.get(node_id)
+                if node_data is None:
+                    # Если mapping не найден, получаем variable_id из базы данных
+                    node_id_str = self._format_node_id(node_id)
+                    variable_id = await self._fetchval(f'''
+                        SELECT variable_id FROM "{self._schema}".variable_metadata
+                        WHERE node_id = $1
+                        LIMIT 1
+                    ''', node_id_str)
+                else:
+                    # Проверяем формат данных
+                    if len(node_data) == 3:
+                        period, count, variable_id = node_data
+                    elif len(node_data) == 4:
+                        # Формат для событий: (period, count, source_db_id, event_ids)
+                        result[node_id] = None
+                        continue
+                    else:
+                        self.logger.warning(f"Unexpected data format for node {node_id}: {node_data}")
+                        result[node_id] = None
+                        continue
+                
+                if variable_id is not None:
+                    variable_ids.append(variable_id)
+                    node_to_variable[variable_id] = node_id
+                else:
+                    result[node_id] = None
+            
+            if not variable_ids:
+                return result
+            
+            # Получаем из кэша батчем
+            rows = await self._fetch(f'''
+                SELECT variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                FROM "{self._schema}".variables_last_value
+                WHERE variable_id = ANY($1)
+            ''', variable_ids)
+            
+            # Обрабатываем результаты из кэша
+            cached_variable_ids = set()
+            for row in rows:
+                variable_id = row['variable_id']
+                node_id = node_to_variable[variable_id]
+                cached_variable_ids.add(variable_id)
+                
+                result[node_id] = ua.DataValue(
+                    Value=variant_from_binary(Buffer(row['variantbinary'])),
+                    StatusCode_=ua.StatusCode(row['statuscode']),
+                    SourceTimestamp=row['sourcetimestamp'],
+                    ServerTimestamp=row['servertimestamp']
+                )
+            
+            # Fallback для узлов, которых нет в кэше
+            missing_variable_ids = [vid for vid in variable_ids if vid not in cached_variable_ids]
+            if missing_variable_ids:
+                fallback_rows = await self._fetch(f'''
+                    SELECT DISTINCT ON (variable_id) variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                    FROM "{self._schema}".variables_history
+                    WHERE variable_id = ANY($1)
+                    ORDER BY variable_id, sourcetimestamp DESC
+                ''', missing_variable_ids)
+                
+                for row in fallback_rows:
+                    variable_id = row['variable_id']
+                    node_id = node_to_variable[variable_id]
+                    
+                    result[node_id] = ua.DataValue(
+                        Value=variant_from_binary(Buffer(row['variantbinary'])),
+                        StatusCode_=ua.StatusCode(row['statuscode']),
+                        SourceTimestamp=row['sourcetimestamp'],
+                        ServerTimestamp=row['servertimestamp']
+                    )
+            
+            # Заполняем None для узлов, которых вообще нет в истории
+            for node_id in node_ids:
+                if node_id not in result:
+                    result[node_id] = None
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Failed to read last values: {e}")
+            # Возвращаем None для всех узлов при ошибке
+            return {node_id: None for node_id in node_ids}
 
     async def close(self) -> None:
         """Закрытие модуля историзации"""

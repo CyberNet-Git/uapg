@@ -683,6 +683,19 @@ class HistoryPgSQL(HistoryStorageInterface):
                 )
             ''')
             
+            # Центральная таблица кэша последних значений переменных
+            await self._execute('''
+                CREATE TABLE IF NOT EXISTS variable_last_value (
+                    node_id TEXT PRIMARY KEY,
+                    sourcetimestamp TIMESTAMPTZ NOT NULL,
+                    servertimestamp TIMESTAMPTZ NOT NULL,
+                    statuscode INTEGER NOT NULL,
+                    varianttype INTEGER NOT NULL,
+                    variantbinary BYTEA NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            ''')
+            
             # Создаем индексы для метаданных и связей
             # Индексы для bigint полей (оптимизация)
             await self._execute('CREATE INDEX IF NOT EXISTS idx_variable_metadata_variable_id ON variable_metadata(variable_id)')
@@ -705,6 +718,9 @@ class HistoryPgSQL(HistoryStorageInterface):
             
             # Уникальный индекс для variable_metadata по node_id
             await self._execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_variable_metadata_node_id ON variable_metadata(node_id)')
+            
+            # Индекс для кэш-таблицы последних значений
+            await self._execute('CREATE INDEX IF NOT EXISTS idx_variable_last_value_updated ON variable_last_value(updated_at)')
 
             self.logger.info("Metadata tables created successfully")
         except Exception as e:
@@ -789,6 +805,9 @@ class HistoryPgSQL(HistoryStorageInterface):
         # Индексы для bigint полей (оптимизация)
         await self._execute(f'CREATE INDEX IF NOT EXISTS "{table}_variable_id_idx" ON "{table}" (variable_id)')
         await self._execute(f'CREATE INDEX IF NOT EXISTS "{table}_variable_id_timestamp_idx" ON "{table}" (variable_id, sourcetimestamp)')
+        
+        # Покрывающий индекс для fallback-запросов последнего значения
+        await self._execute(f'CREATE INDEX IF NOT EXISTS "{table}_ts_desc_covering" ON "{table}" (sourcetimestamp DESC) INCLUDE (statuscode, varianttype, variantbinary, servertimestamp)')
 
     async def _create_event_indexes(self, table: str) -> None:
         """
@@ -1173,6 +1192,23 @@ class HistoryPgSQL(HistoryStorageInterface):
                 variant_to_binary(datavalue.Value)
             )
             
+            # Обновляем кэш последних значений
+            node_id_str = self._format_node_id(node_id)
+            await self._execute('''
+                INSERT INTO variable_last_value 
+                (node_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (node_id) DO UPDATE
+                    SET sourcetimestamp = EXCLUDED.sourcetimestamp,
+                        servertimestamp = EXCLUDED.servertimestamp,
+                        statuscode = EXCLUDED.statuscode,
+                        varianttype = EXCLUDED.varianttype,
+                        variantbinary = EXCLUDED.variantbinary,
+                        updated_at = NOW()
+                    WHERE variable_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
+            ''', node_id_str, datavalue.SourceTimestamp, datavalue.ServerTimestamp, 
+                datavalue.StatusCode.value, int(datavalue.Value.VariantType), variant_to_binary(datavalue.Value))
+            
             # Обновляем тип данных в метаданных на основе реального DataValue только при изменении
             if datavalue and hasattr(datavalue, 'Value') and datavalue.Value is not None:
                 actual_data_type = self._get_node_data_type(node_id, datavalue)
@@ -1445,3 +1481,137 @@ class HistoryPgSQL(HistoryStorageInterface):
             await self._execute(f'DELETE FROM "{table}" WHERE {condition}', *args)
         except Exception as e:
             self.logger.error(f"Failed to delete data for {node_id}: {e}")
+
+    async def read_last_value(self, node_id: ua.NodeId) -> Optional[ua.DataValue]:
+        """
+        Быстрое получение последнего сохраненного значения переменной.
+        
+        Args:
+            node_id: Идентификатор узла OPC UA
+            
+        Returns:
+            Последнее значение или None если не найдено
+        """
+        try:
+            node_id_str = self._format_node_id(node_id)
+            
+            # Сначала пытаемся получить из кэша
+            row = await self._fetchrow('''
+                SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                FROM variable_last_value
+                WHERE node_id = $1
+            ''', node_id_str)
+            
+            if row is not None:
+                # Преобразуем в DataValue
+                return ua.DataValue(
+                    Value=variant_from_binary(Buffer(row['variantbinary'])),
+                    StatusCode_=ua.StatusCode(row['statuscode']),
+                    SourceTimestamp=row['sourcetimestamp'],
+                    ServerTimestamp=row['servertimestamp']
+                )
+            
+            # Fallback: получаем из таблицы переменных через покрывающий индекс
+            table = self._get_table_name(node_id, "var")
+            validate_table_name(table)
+            
+            row = await self._fetchrow(f'''
+                SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                FROM "{table}"
+                ORDER BY sourcetimestamp DESC
+                LIMIT 1
+            ''')
+            
+            if row is not None:
+                # Преобразуем в DataValue
+                return ua.DataValue(
+                    Value=variant_from_binary(Buffer(row['variantbinary'])),
+                    StatusCode_=ua.StatusCode(row['statuscode']),
+                    SourceTimestamp=row['sourcetimestamp'],
+                    ServerTimestamp=row['servertimestamp']
+                )
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Failed to read last value for {node_id}: {e}")
+            return None
+
+    async def read_last_values(self, node_ids: List[ua.NodeId]) -> dict:
+        """
+        Быстрое получение последних сохраненных значений для списка переменных.
+        
+        Args:
+            node_ids: Список идентификаторов узлов OPC UA
+            
+        Returns:
+            Словарь {node_id: DataValue} или {node_id: None} для отсутствующих
+        """
+        result = {}
+        
+        try:
+            # Получаем из кэша батчем
+            node_id_strs = [self._format_node_id(node_id) for node_id in node_ids]
+            
+            rows = await self._fetch('''
+                SELECT node_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                FROM variable_last_value
+                WHERE node_id = ANY($1)
+            ''', node_id_strs)
+            
+            # Обрабатываем результаты из кэша
+            cached_node_ids = set()
+            for row in rows:
+                node_id_str = row['node_id']
+                # Находим соответствующий node_id
+                for node_id in node_ids:
+                    if self._format_node_id(node_id) == node_id_str:
+                        cached_node_ids.add(node_id)
+                        result[node_id] = ua.DataValue(
+                            Value=variant_from_binary(Buffer(row['variantbinary'])),
+                            StatusCode_=ua.StatusCode(row['statuscode']),
+                            SourceTimestamp=row['sourcetimestamp'],
+                            ServerTimestamp=row['servertimestamp']
+                        )
+                        break
+            
+            # Fallback для узлов, которых нет в кэше
+            missing_node_ids = [node_id for node_id in node_ids if node_id not in cached_node_ids]
+            
+            for node_id in missing_node_ids:
+                try:
+                    table = self._get_table_name(node_id, "var")
+                    validate_table_name(table)
+                    
+                    row = await self._fetchrow(f'''
+                        SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                        FROM "{table}"
+                        ORDER BY sourcetimestamp DESC
+                        LIMIT 1
+                    ''')
+                    
+                    if row is not None:
+                        result[node_id] = ua.DataValue(
+                            Value=variant_from_binary(Buffer(row['variantbinary'])),
+                            StatusCode_=ua.StatusCode(row['statuscode']),
+                            SourceTimestamp=row['sourcetimestamp'],
+                            ServerTimestamp=row['servertimestamp']
+                        )
+                    else:
+                        result[node_id] = None
+                        
+                except Exception as e:
+                    self.logger.warning(f"Failed to read last value for {node_id} from table: {e}")
+                    result[node_id] = None
+            
+            # Заполняем None для узлов, которых вообще нет в истории
+            for node_id in node_ids:
+                if node_id not in result:
+                    result[node_id] = None
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Failed to read last values: {e}")
+            # Возвращаем None для всех узлов при ошибке
+            return {node_id: None for node_id in node_ids}
