@@ -806,8 +806,8 @@ class HistoryPgSQL(HistoryStorageInterface):
         await self._execute(f'CREATE INDEX IF NOT EXISTS "{table}_variable_id_idx" ON "{table}" (variable_id)')
         await self._execute(f'CREATE INDEX IF NOT EXISTS "{table}_variable_id_timestamp_idx" ON "{table}" (variable_id, sourcetimestamp)')
         
-        # Покрывающий индекс для fallback-запросов последнего значения
-        await self._execute(f'CREATE INDEX IF NOT EXISTS "{table}_ts_desc_covering" ON "{table}" (sourcetimestamp DESC) INCLUDE (statuscode, varianttype, variantbinary, servertimestamp)')
+        # Покрывающий индекс для fallback-запросов последнего значения (без variantbinary из-за размера)
+        await self._execute(f'CREATE INDEX IF NOT EXISTS "{table}_ts_desc_covering" ON "{table}" (sourcetimestamp DESC) INCLUDE (statuscode, varianttype, servertimestamp)')
 
     async def _create_event_indexes(self, table: str) -> None:
         """
@@ -1516,20 +1516,29 @@ class HistoryPgSQL(HistoryStorageInterface):
             validate_table_name(table)
             
             row = await self._fetchrow(f'''
-                SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                SELECT sourcetimestamp, servertimestamp, statuscode, varianttype
                 FROM "{table}"
                 ORDER BY sourcetimestamp DESC
                 LIMIT 1
             ''')
             
             if row is not None:
-                # Преобразуем в DataValue
-                return ua.DataValue(
-                    Value=variant_from_binary(Buffer(row['variantbinary'])),
-                    StatusCode_=ua.StatusCode(row['statuscode']),
-                    SourceTimestamp=row['sourcetimestamp'],
-                    ServerTimestamp=row['servertimestamp']
-                )
+                # Получаем variantbinary отдельным запросом
+                variantbinary_row = await self._fetchrow(f'''
+                    SELECT variantbinary
+                    FROM "{table}"
+                    WHERE sourcetimestamp = $1
+                    LIMIT 1
+                ''', row['sourcetimestamp'])
+                
+                if variantbinary_row is not None:
+                    # Преобразуем в DataValue
+                    return ua.DataValue(
+                        Value=variant_from_binary(Buffer(variantbinary_row['variantbinary'])),
+                        StatusCode_=ua.StatusCode(row['statuscode']),
+                        SourceTimestamp=row['sourcetimestamp'],
+                        ServerTimestamp=row['servertimestamp']
+                    )
             
             return None
             
@@ -1584,19 +1593,30 @@ class HistoryPgSQL(HistoryStorageInterface):
                     validate_table_name(table)
                     
                     row = await self._fetchrow(f'''
-                        SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                        SELECT sourcetimestamp, servertimestamp, statuscode, varianttype
                         FROM "{table}"
                         ORDER BY sourcetimestamp DESC
                         LIMIT 1
                     ''')
                     
                     if row is not None:
-                        result[node_id] = ua.DataValue(
-                            Value=variant_from_binary(Buffer(row['variantbinary'])),
-                            StatusCode_=ua.StatusCode(row['statuscode']),
-                            SourceTimestamp=row['sourcetimestamp'],
-                            ServerTimestamp=row['servertimestamp']
-                        )
+                        # Получаем variantbinary отдельным запросом
+                        variantbinary_row = await self._fetchrow(f'''
+                            SELECT variantbinary
+                            FROM "{table}"
+                            WHERE sourcetimestamp = $1
+                            LIMIT 1
+                        ''', row['sourcetimestamp'])
+                        
+                        if variantbinary_row is not None:
+                            result[node_id] = ua.DataValue(
+                                Value=variant_from_binary(Buffer(variantbinary_row['variantbinary'])),
+                                StatusCode_=ua.StatusCode(row['statuscode']),
+                                SourceTimestamp=row['sourcetimestamp'],
+                                ServerTimestamp=row['servertimestamp']
+                            )
+                        else:
+                            result[node_id] = None
                     else:
                         result[node_id] = None
                         

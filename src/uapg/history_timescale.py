@@ -851,8 +851,8 @@ class HistoryTimescale(HistoryStorageInterface):
             # Индекс для кэш-таблицы последних значений
             await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variables_last_value_updated ON "{self._schema}".variables_last_value(updated_at)')
             
-            # Покрывающий индекс для fallback-запросов последнего значения
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variables_history_vid_ts_desc_covering ON "{self._schema}".variables_history (variable_id, sourcetimestamp DESC) INCLUDE (statuscode, varianttype, variantbinary, servertimestamp)')
+            # Покрывающий индекс для fallback-запросов последнего значения (без variantbinary из-за размера)
+            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variables_history_vid_ts_desc_covering ON "{self._schema}".variables_history (variable_id, sourcetimestamp DESC) INCLUDE (statuscode, varianttype, servertimestamp)')
             
             self.logger.info(f"Unified history tables created successfully in schema '{self._schema}'")
             
@@ -1756,12 +1756,26 @@ class HistoryTimescale(HistoryStorageInterface):
             
             # Fallback: получаем из основной таблицы через покрывающий индекс
             row = await self._fetchrow(f'''
-                SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                SELECT sourcetimestamp, servertimestamp, statuscode, varianttype
                 FROM "{self._schema}".variables_history
                 WHERE variable_id = $1
                 ORDER BY sourcetimestamp DESC
                 LIMIT 1
             ''', variable_id)
+            
+            if row is not None:
+                # Получаем variantbinary отдельным запросом
+                variantbinary_row = await self._fetchrow(f'''
+                    SELECT variantbinary
+                    FROM "{self._schema}".variables_history
+                    WHERE variable_id = $1 AND sourcetimestamp = $2
+                    LIMIT 1
+                ''', variable_id, row['sourcetimestamp'])
+                
+                if variantbinary_row is not None:
+                    row['variantbinary'] = variantbinary_row['variantbinary']
+                else:
+                    row = None
             
             if row is not None:
                 # Преобразуем в DataValue
@@ -1852,7 +1866,7 @@ class HistoryTimescale(HistoryStorageInterface):
             missing_variable_ids = [vid for vid in variable_ids if vid not in cached_variable_ids]
             if missing_variable_ids:
                 fallback_rows = await self._fetch(f'''
-                    SELECT DISTINCT ON (variable_id) variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                    SELECT DISTINCT ON (variable_id) variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype
                     FROM "{self._schema}".variables_history
                     WHERE variable_id = ANY($1)
                     ORDER BY variable_id, sourcetimestamp DESC
@@ -1862,12 +1876,21 @@ class HistoryTimescale(HistoryStorageInterface):
                     variable_id = row['variable_id']
                     node_id = node_to_variable[variable_id]
                     
-                    result[node_id] = ua.DataValue(
-                        Value=variant_from_binary(Buffer(row['variantbinary'])),
-                        StatusCode_=ua.StatusCode(row['statuscode']),
-                        SourceTimestamp=row['sourcetimestamp'],
-                        ServerTimestamp=row['servertimestamp']
-                    )
+                    # Получаем variantbinary отдельным запросом
+                    variantbinary_row = await self._fetchrow(f'''
+                        SELECT variantbinary
+                        FROM "{self._schema}".variables_history
+                        WHERE variable_id = $1 AND sourcetimestamp = $2
+                        LIMIT 1
+                    ''', variable_id, row['sourcetimestamp'])
+                    
+                    if variantbinary_row is not None:
+                        result[node_id] = ua.DataValue(
+                            Value=variant_from_binary(Buffer(variantbinary_row['variantbinary'])),
+                            StatusCode_=ua.StatusCode(row['statuscode']),
+                            SourceTimestamp=row['sourcetimestamp'],
+                            ServerTimestamp=row['servertimestamp']
+                        )
             
             # Заполняем None для узлов, которых вообще нет в истории
             for node_id in node_ids:
