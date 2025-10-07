@@ -1794,14 +1794,14 @@ class HistoryTimescale(HistoryStorageInterface):
                 ''', variable_id, row['sourcetimestamp'])
                 
                 if variantbinary_row is not None:
-                    row['variantbinary'] = variantbinary_row['variantbinary']
+                    variantbinary = variantbinary_row['variantbinary']
                 else:
-                    row = None
+                    return None
             
             if row is not None:
                 # Преобразуем в DataValue
                 return ua.DataValue(
-                    Value=variant_from_binary(Buffer(row['variantbinary'])),
+                    Value=variant_from_binary(Buffer(variantbinary)),
                     StatusCode_=ua.StatusCode(row['statuscode']),
                     SourceTimestamp=row['sourcetimestamp'],
                     ServerTimestamp=row['servertimestamp']
