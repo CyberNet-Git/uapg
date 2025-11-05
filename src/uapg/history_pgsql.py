@@ -33,6 +33,9 @@ class Buffer:
 # Импорт для работы с событиями
 from asyncua.common.events import Event
 
+# Импорт фильтрации событий
+from .event_filter import apply_event_filter
+
 try:
     from asyncua.server.history import get_event_properties_from_type_node
 except ImportError:
@@ -1436,6 +1439,9 @@ class HistoryPgSQL(HistoryStorageInterface):
                     # Фоллбэк, если from_field_dict недоступен у конкретной реализации Event
                     self.logger.debug(f"read_event_history fallback: {e}")
                     results.append(Event(**values))
+            
+            # Применяем EventFilter для фильтрации событий
+            results = apply_event_filter(results, evfilter)
             
             # Определяем время продолжения
             cont = None

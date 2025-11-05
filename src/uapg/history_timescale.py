@@ -41,6 +41,9 @@ class Buffer:
 # Импорт для работы с событиями
 from asyncua.common.events import Event
 
+# Импорт фильтрации событий
+from .event_filter import apply_event_filter
+
 try:
     from asyncua.server.history import get_event_properties_from_type_node
 except ImportError:
@@ -1641,13 +1644,17 @@ class HistoryTimescale(HistoryStorageInterface):
                 values = self._binary_map_to_event_values(data)
                 #payload = {"Time": row["event_timestamp"], "EventType": row["event_type_id"], **values}
                 try:
-                    #self.logger.debug(f"read_event_history: {values}")
+                    #self.logger.debug(f"read_event_history: event: {values}")
                     event = Event.from_field_dict(values)
                     results.append(event)
                 except Exception as e:
                     # Фоллбэк, если from_field_dict недоступен у конкретной реализации Event
-                    #self.logger.debug(f"read_event_history fallback: {e}")
+                    self.logger.debug(f"read_event_history fallback: {e}")
+                    self.logger.debug(f"read_event_history fallback: event: {values}")
                     results.append(Event(**values))
+
+            # Применяем EventFilter для фильтрации событий
+            results = apply_event_filter(results, evfilter)
 
             # Определяем время продолжения
             cont = None
