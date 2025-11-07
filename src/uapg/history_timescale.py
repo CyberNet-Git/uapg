@@ -1651,7 +1651,7 @@ class HistoryTimescale(HistoryStorageInterface):
                     # Фоллбэк, если from_field_dict недоступен у конкретной реализации Event
                     self.logger.debug(f"read_event_history fallback: {e}")
                     self.logger.debug(f"read_event_history fallback: event: {values}")
-                    results.append(Event(**values))
+                    #results.append(Event(**values))
 
             # Применяем EventFilter для фильтрации событий
             results = apply_event_filter(results, evfilter)
