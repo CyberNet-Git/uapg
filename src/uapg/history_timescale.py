@@ -10,8 +10,10 @@ import json
 import asyncio
 import random
 import logging
+import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, List, Optional, Tuple, Union
+from typing import Any, Iterable, List, Optional, Tuple, Union, Dict, Callable, Coroutine
 
 import asyncpg
 from asyncua import ua
@@ -43,6 +45,188 @@ from asyncua.common.events import Event
 
 # Импорт фильтрации событий
 from .event_filter import apply_event_filter
+
+
+@dataclass
+class VariableWriteItem:
+    """
+    Элемент очереди на запись значения переменной.
+    Используется HistoryWriteBuffer для батчевой записи.
+    """
+    variable_id: int
+    node_id_str: str
+    source_timestamp: datetime
+    server_timestamp: datetime
+    status_code: int
+    value_str: str
+    variant_type: int
+    variant_binary: bytes
+    group_key: str
+    datavalue: ua.DataValue
+    future: Optional[asyncio.Future] = None
+
+
+@dataclass
+class EventWriteItem:
+    """
+    Элемент очереди на запись события.
+    Используется HistoryWriteBuffer для батчевой записи.
+    """
+    source_db_id: int
+    event_type_id: int
+    event_timestamp: datetime
+    event_data_json: str
+    group_key: str
+    future: Optional[asyncio.Future] = None
+
+
+class HistoryWriteBuffer:
+    """
+    Универсальный буфер для батчевой записи значений в БД.
+
+    Не знает о структуре таблиц — только управляет очередью, пакетированием
+    и вызовом переданной функции flush_func.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        logger: logging.Logger,
+        max_batch_size: int,
+        max_batch_interval_sec: float,
+        queue_max_size: int,
+        durability_mode: str,
+        flush_func: Callable[[List[Any]], Coroutine[Any, Any, None]],
+    ) -> None:
+        self._name = name
+        self._logger = logger.getChild(f"buffer.{name}") if logger else logging.getLogger(f"HistoryWriteBuffer.{name}")
+        self._max_batch_size = max(1, int(max_batch_size))
+        self._max_batch_interval_sec = max(0.01, float(max_batch_interval_sec))
+        self._durability_mode = durability_mode or "async"
+        self._flush_func = flush_func
+        # maxsize=0 означает неограниченную очередь
+        self._queue: "asyncio.Queue[Any]" = asyncio.Queue(maxsize=max(0, int(queue_max_size)))
+        self._task: Optional[asyncio.Task] = None
+        self._stopped = False
+
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._stopped = False
+            self._task = asyncio.create_task(self._worker(), name=f"HistoryWriteBuffer-{self._name}")
+            self._logger.info(
+                "HistoryWriteBuffer '%s' started (max_batch_size=%s, max_batch_interval_sec=%.3f, queue_max_size=%s, durability_mode=%s)",
+                self._name,
+                self._max_batch_size,
+                self._max_batch_interval_sec,
+                self._queue.maxsize,
+                self._durability_mode,
+            )
+
+    async def stop(self) -> None:
+        self._stopped = True
+        if self._task:
+            # Даем воркеру возможность дописать оставшиеся элементы
+            try:
+                await asyncio.wait_for(self._task, timeout=self._max_batch_interval_sec * 2)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+
+    async def enqueue(self, item: Any, sync: bool = False) -> None:
+        """
+        Добавление элемента в очередь.
+
+        Если sync=True или durability_mode == 'sync', вызывающий ожидает завершения флаша.
+        """
+        future: Optional[asyncio.Future] = None
+        sync_mode = sync or self._durability_mode == "sync"
+
+        if sync_mode:
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            # Ожидается, что элемент поддерживает атрибут future
+            setattr(item, "future", future)
+
+        try:
+            if sync_mode:
+                await self._queue.put(item)
+            else:
+                # В async-режиме не блокируемся, при переполнении просто логируем и отбрасываем
+                self._queue.put_nowait(item)
+        except asyncio.QueueFull:
+            self._logger.error("HistoryWriteBuffer '%s' queue is full, dropping item in async mode", self._name)
+            if future and not future.done():
+                future.set_exception(RuntimeError("HistoryWriteBuffer queue is full"))
+            return
+
+        if sync_mode and future is not None:
+            await future
+
+    async def _worker(self) -> None:
+        """
+        Основной цикл фонового воркера.
+        Собирает пачки из очереди и передает их в flush_func.
+        """
+        pending: List[Any] = []
+
+        while not self._stopped or not self._queue.empty():
+            try:
+                if not pending:
+                    try:
+                        item = await asyncio.wait_for(self._queue.get(), timeout=self._max_batch_interval_sec)
+                    except asyncio.TimeoutError:
+                        continue
+                    pending.append(item)
+
+                # Добираем пачку до max_batch_size без ожидания
+                while len(pending) < self._max_batch_size:
+                    try:
+                        pending.append(self._queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+
+                await self._flush_pending(pending)
+                pending.clear()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._logger.error("HistoryWriteBuffer '%s' worker error: %s", self._name, e, exc_info=True)
+
+        # Финальный флаш оставшихся данных
+        if pending:
+            try:
+                await self._flush_pending(pending)
+            except Exception as e:
+                self._logger.error("HistoryWriteBuffer '%s' final flush error: %s", self._name, e, exc_info=True)
+
+    async def _flush_pending(self, batch: List[Any]) -> None:
+        if not batch:
+            return
+
+        try:
+            await self._flush_func(batch)
+            # Уведомляем ожидающих о завершении
+            now = time.time()
+            for item in batch:
+                fut: Optional[asyncio.Future] = getattr(item, "future", None)
+                if fut is not None and not fut.done():
+                    fut.set_result(now)
+        except Exception as e:
+            self._logger.error(
+                "HistoryWriteBuffer '%s' flush failed for %d items: %s",
+                self._name,
+                len(batch),
+                e,
+                exc_info=True,
+            )
+            for item in batch:
+                fut: Optional[asyncio.Future] = getattr(item, "future", None)
+                if fut is not None and not fut.done():
+                    fut.set_exception(e)
 
 try:
     from asyncua.server.history import get_event_properties_from_type_node
@@ -97,6 +281,20 @@ class HistoryTimescale(HistoryStorageInterface):
         _initialized (bool): Флаг инициализации таблиц
         _schema (str): Имя схемы для размещения таблиц истории
     """
+
+    def _build_group_key_from_node_id(self, node_id_str: str) -> str:
+        """
+        Простая эвристика для группировки переменных по «вышестоящему узлу».
+
+        По сути, используем префикс NodeId до последней точки, если она есть.
+        Это позволяет группировать переменные, имена которых имеют иерархический формат.
+        """
+        try:
+            if "." in node_id_str:
+                return node_id_str.rsplit(".", 1)[0]
+            return node_id_str
+        except Exception:
+            return node_id_str or "default"
 
     def _format_node_id(self, node_id: ua.NodeId) -> str:
         """
@@ -231,6 +429,19 @@ class HistoryTimescale(HistoryStorageInterface):
         config_file: Optional[str] = None,
         encrypted_config: Optional[str] = None,
         master_password: Optional[str] = None,
+        # Параметры оптимизации записи истории и кэшей
+        history_write_batch_enabled: bool = True,
+        history_write_max_batch_size: int = 500,
+        history_write_max_batch_interval_sec: float = 1.0,
+        history_write_queue_max_size: int = 10000,
+        history_write_durability_mode: str = "async",
+        history_write_read_consistency_mode: str = "local",
+        history_cache_enabled: bool = True,
+        history_last_values_cache_enabled: bool = True,
+        history_last_values_cache_max_size_mb: int = 100,
+        history_last_values_init_batch_size: int = 1000,
+        history_metadata_cache_enabled: bool = True,
+        history_metadata_cache_init_max_rows: int = 500000,
         **kwargs
     ) -> None:
         """
@@ -269,7 +480,59 @@ class HistoryTimescale(HistoryStorageInterface):
         self._last_throttled_log_at = None
         self._failed_value_saves_counter = 0
         self._failed_event_saves_counter = 0
-        
+
+        # Параметры оптимизации записи истории
+        self._history_write_batch_enabled = history_write_batch_enabled
+        self._history_write_max_batch_size = int(history_write_max_batch_size)
+        self._history_write_max_batch_interval_sec = float(history_write_max_batch_interval_sec)
+        self._history_write_queue_max_size = int(history_write_queue_max_size)
+        self._history_write_durability_mode = history_write_durability_mode
+        self._history_write_read_consistency_mode = history_write_read_consistency_mode
+        self._history_cache_enabled = history_cache_enabled
+
+        # Параметры и структуры кэша последних значений
+        self._history_last_values_cache_enabled = history_last_values_cache_enabled
+        self._history_last_values_cache_max_size_mb = int(history_last_values_cache_max_size_mb)
+        self._history_last_values_init_batch_size = int(history_last_values_init_batch_size)
+        # variable_id -> DataValue
+        self._last_values_cache: Dict[int, ua.DataValue] = {}
+
+        # Кэши метаданных (node_id / event_type -> внутренние идентификаторы)
+        # Используются для снижения количества обращений к variable_metadata / event_sources / event_types.
+        self._variable_metadata_cache: Dict[str, int] = {}
+        self._event_source_cache: Dict[str, int] = {}
+        self._event_type_cache: Dict[str, int] = {}
+
+        # Параметры кэша метаданных
+        self._history_metadata_cache_enabled = history_metadata_cache_enabled
+        self._history_metadata_cache_init_max_rows = int(history_metadata_cache_init_max_rows)
+
+        # Статистика эффективности кэшей (минимальный накладной расход — простые счётчики)
+        # Значения увеличиваются только монотонно; сброс возможен через публичный метод.
+        self._cache_stats: Dict[str, int] = {
+            # In-memory кэш последних значений (variable_id -> DataValue)
+            "last_values_memory_hits": 0,
+            "last_values_memory_misses": 0,
+            # Таблица variables_last_value как кэш в БД
+            "last_values_table_hits": 0,
+            "last_values_table_misses": 0,
+            # Fallback к основной таблице истории (variables_history)
+            "last_values_history_fallbacks": 0,
+            # Кэш метаданных переменных (node_id -> variable_id)
+            "variable_metadata_hits": 0,
+            "variable_metadata_misses": 0,
+            # Кэш источников событий (source_node_id -> source_id)
+            "event_source_hits": 0,
+            "event_source_misses": 0,
+            # Кэш типов событий (event_type_name -> event_type_id)
+            "event_type_hits": 0,
+            "event_type_misses": 0,
+        }
+
+        # Буферы для батчевой записи истории
+        self._value_write_buffer: Optional[HistoryWriteBuffer] = None
+        self._event_write_buffer: Optional[HistoryWriteBuffer] = None
+
         # Инициализация параметров подключения
         self._conn_params = self._init_connection_params(
             user, password, database, host, port,
@@ -393,6 +656,25 @@ class HistoryTimescale(HistoryStorageInterface):
             'initialized': self._initialized
         }
 
+    def get_cache_stats(self) -> dict:
+        """
+        Получение текущей статистики эффективности кэшей модуля истории.
+
+        Возвращаются только числовые счётчики, инкрементируемые при обращениях к кэшу.
+        Метод не выполняет обращений к БД и имеет минимальный накладной расход.
+        """
+        # Возвращаем копию, чтобы внешний код не мог повлиять на внутренние счётчики.
+        return dict(self._cache_stats)
+
+    def reset_cache_stats(self) -> None:
+        """
+        Сброс статистики эффективности кэшей.
+
+        Полезно при длительной работе сервера или перед началом измерений.
+        """
+        for key in self._cache_stats:
+            self._cache_stats[key] = 0
+
     @classmethod
     def from_config_file(
         cls,
@@ -497,6 +779,40 @@ class HistoryTimescale(HistoryStorageInterface):
             if not self._initialized:
                 await self._create_metadata_tables()
                 self._initialized = True
+
+            # Инициализируем кэш метаданных переменных после готовности схемы/таблиц
+            if self._history_metadata_cache_enabled:
+                await self._init_metadata_cache()
+
+            # Инициализируем буферы записи истории при первом запуске
+            if self._history_write_batch_enabled:
+                if self._value_write_buffer is None:
+                    self._value_write_buffer = HistoryWriteBuffer(
+                        name="variables",
+                        logger=self.logger,
+                        max_batch_size=self._history_write_max_batch_size,
+                        max_batch_interval_sec=self._history_write_max_batch_interval_sec,
+                        queue_max_size=self._history_write_queue_max_size,
+                        durability_mode=self._history_write_durability_mode,
+                        flush_func=self._flush_variable_batch,
+                    )
+                    self._value_write_buffer.start()
+
+                if self._event_write_buffer is None:
+                    self._event_write_buffer = HistoryWriteBuffer(
+                        name="events",
+                        logger=self.logger,
+                        max_batch_size=self._history_write_max_batch_size,
+                        max_batch_interval_sec=self._history_write_max_batch_interval_sec,
+                        queue_max_size=self._history_write_queue_max_size,
+                        durability_mode=self._history_write_durability_mode,
+                        flush_func=self._flush_event_batch,
+                    )
+                    self._event_write_buffer.start()
+
+            # Инициализируем in-memory кэш последних значений из таблицы variables_last_value
+            if self._history_last_values_cache_enabled:
+                await self._init_last_values_cache()
 
             if self._reconnect_task is None or self._reconnect_task.done():
                 self._stop_event.clear()
@@ -661,10 +977,18 @@ class HistoryTimescale(HistoryStorageInterface):
             async with self._pool.acquire() as conn:
                 return await conn.execute(query, *args)
         except Exception as e:
-            self.logger.warning(f"Execute failed, will try to reconnect and retry: {e}")
+            # Ошибка выполнения запроса или проблемы с соединением — логируем как error
+            self.logger.error(f"Execute failed, will try to reconnect and retry: {e}")
+            # Попытка принудительного переподключения; при неудаче _force_reconnect сам залогирует critical и выбросит исключение
             await self._force_reconnect()
-            async with self._pool.acquire() as conn:
-                return await conn.execute(query, *args)
+            # Вторая попытка выполнения запроса
+            try:
+                async with self._pool.acquire() as conn:
+                    return await conn.execute(query, *args)
+            except Exception as e2:
+                # Ошибка выполнения SQL после переподключения — тоже error
+                self.logger.error(f"Execute failed after reconnect: {e2}")
+                raise
 
     async def _fetch(self, query: str, *args) -> List[asyncpg.Record]:
         """
@@ -682,10 +1006,14 @@ class HistoryTimescale(HistoryStorageInterface):
             async with self._pool.acquire() as conn:
                 return await conn.fetch(query, *args)
         except Exception as e:
-            self.logger.warning(f"Fetch failed, will try to reconnect and retry: {e}")
+            self.logger.error(f"Fetch failed, will try to reconnect and retry: {e}")
             await self._force_reconnect()
-            async with self._pool.acquire() as conn:
-                return await conn.fetch(query, *args)
+            try:
+                async with self._pool.acquire() as conn:
+                    return await conn.fetch(query, *args)
+            except Exception as e2:
+                self.logger.error(f"Fetch failed after reconnect: {e2}")
+                raise
 
     async def _fetchval(self, query: str, *args) -> Any:
         """
@@ -703,10 +1031,14 @@ class HistoryTimescale(HistoryStorageInterface):
             async with self._pool.acquire() as conn:
                 return await conn.fetchval(query, *args)
         except Exception as e:
-            self.logger.warning(f"Fetchval failed, will try to reconnect and retry: {e}")
+            self.logger.error(f"Fetchval failed, will try to reconnect and retry: {e}")
             await self._force_reconnect()
-            async with self._pool.acquire() as conn:
-                return await conn.fetchval(query, *args)
+            try:
+                async with self._pool.acquire() as conn:
+                    return await conn.fetchval(query, *args)
+            except Exception as e2:
+                self.logger.error(f"Fetchval failed after reconnect: {e2}")
+                raise
 
     async def _fetchrow(self, query: str, *args) -> Optional[asyncpg.Record]:
         """
@@ -724,10 +1056,14 @@ class HistoryTimescale(HistoryStorageInterface):
             async with self._pool.acquire() as conn:
                 return await conn.fetchrow(query, *args)
         except Exception as e:
-            self.logger.warning(f"Fetchrow failed, will try to reconnect and retry: {e}")
+            self.logger.error(f"Fetchrow failed, will try to reconnect and retry: {e}")
             await self._force_reconnect()
-            async with self._pool.acquire() as conn:
-                return await conn.fetchrow(query, *args)
+            try:
+                async with self._pool.acquire() as conn:
+                    return await conn.fetchrow(query, *args)
+            except Exception as e2:
+                self.logger.error(f"Fetchrow failed after reconnect: {e2}")
+                raise
 
     async def _force_reconnect(self) -> None:
         async with self._pool_lock:
@@ -736,11 +1072,13 @@ class HistoryTimescale(HistoryStorageInterface):
                     try:
                         await self._pool.close()
                     except Exception:
+                        # Игнорируем ошибку при закрытии старого пула
                         pass
                 self._pool = None
                 await self._ensure_pool()
             except Exception as e:
-                self.logger.error(f"Force reconnect failed: {e}")
+                # Невозможно восстановить подключение к БД — критический уровень и проброс исключения наверх
+                self.logger.critical(f"Force reconnect failed, database remains unavailable: {e}")
                 raise
 
     async def _create_metadata_tables(self) -> None:
@@ -931,6 +1269,100 @@ class HistoryTimescale(HistoryStorageInterface):
             self.logger.warning(f"Failed to create TimescaleDB hypertable for table {table}: {e}")
             self.logger.info("Continuing with regular table (without TimescaleDB optimization)")
 
+    async def _flush_variable_batch(self, items: List[VariableWriteItem]) -> None:
+        """
+        Флаш батча значений переменных в таблицы variables_history и variables_last_value.
+        """
+        if not items:
+            return
+
+        await self._ensure_pool()
+
+        history_params = [
+            (
+                it.variable_id,
+                it.server_timestamp,
+                it.source_timestamp,
+                it.status_code,
+                it.value_str,
+                it.variant_type,
+                it.variant_binary,
+            )
+            for it in items
+        ]
+
+        last_value_params = [
+            (
+                it.variable_id,
+                it.source_timestamp,
+                it.server_timestamp,
+                it.status_code,
+                it.variant_type,
+                it.variant_binary,
+            )
+            for it in items
+        ]
+
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.executemany(
+                    f'INSERT INTO "{self._schema}".variables_history '
+                    f'(variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) '
+                    f'VALUES ($1, $2, $3, $4, $5, $6, $7) '
+                    f'ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
+                    history_params,
+                )
+
+                await conn.executemany(
+                    f'''
+                    INSERT INTO "{self._schema}".variables_last_value 
+                        (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (variable_id) DO UPDATE
+                        SET sourcetimestamp = EXCLUDED.sourcetimestamp,
+                            servertimestamp = EXCLUDED.servertimestamp,
+                            statuscode = EXCLUDED.statuscode,
+                            varianttype = EXCLUDED.varianttype,
+                            variantbinary = EXCLUDED.variantbinary,
+                            updated_at = NOW()
+                        WHERE "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
+                    ''',
+                    last_value_params,
+                )
+
+        # Обновляем in-memory кэш последних значений
+        for it in items:
+            self._update_last_values_cache(it.variable_id, it.datavalue)
+
+    async def _flush_event_batch(self, items: List[EventWriteItem]) -> None:
+        """
+        Флаш батча событий в таблицу events_history.
+        """
+        if not items:
+            return
+
+        await self._ensure_pool()
+
+        params = [
+            (
+                it.source_db_id,
+                it.event_type_id,
+                it.event_timestamp,
+                it.event_data_json,
+            )
+            for it in items
+        ]
+
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.executemany(
+                    f'INSERT INTO "{self._schema}".events_history '
+                    f'(source_id, event_type_id, event_timestamp, event_data) '
+                    f'VALUES ($1, $2, $3, $4) '
+                    f'ON CONFLICT (source_id, event_timestamp) DO NOTHING',
+                    params,
+                )
+
     async def _save_variable_metadata(self, node_id: ua.NodeId, period: Optional[timedelta], count: int) -> int:
         """
         Сохранение метаданных переменной.
@@ -969,7 +1401,11 @@ class HistoryTimescale(HistoryStorageInterface):
                 WHERE node_id = $1
                 LIMIT 1
             ''', node_id_str)
-
+        
+        # Обновляем кэш метаданных
+        if result is not None:
+            self._variable_metadata_cache[node_id_str] = result
+        
         return result
 
     async def _save_event_source(self, source_id: ua.NodeId, period: Optional[timedelta], count: int) -> int:
@@ -1003,7 +1439,11 @@ class HistoryTimescale(HistoryStorageInterface):
                 WHERE source_node_id = $1
                 LIMIT 1
             ''', source_node_id_str)
-
+        
+        # Обновляем кэш источников событий
+        if result is not None:
+            self._event_source_cache[source_node_id_str] = result
+        
         return result
 
     async def _save_event_metadata(self, event_type: ua.NodeId, source_id: ua.NodeId, fields: List[str], period: Optional[timedelta], count: int) -> Tuple[int, int]:
@@ -1041,8 +1481,148 @@ class HistoryTimescale(HistoryStorageInterface):
                 WHERE event_type_name = $1
                 LIMIT 1
             ''', event_type_name)
-
+        
+        # Обновляем кэш типов событий
+        if event_db_id is not None:
+            self._event_type_cache[event_type_name] = event_db_id
+        
         return source_db_id, event_db_id
+
+    async def _init_last_values_cache(self) -> None:
+        """
+        Инициализация in-memory кэша последних значений из таблицы variables_last_value.
+
+        Загрузка выполняется пакетами, с грубой оценкой потребления памяти и
+        ограничением по конфигурируемому порогу (history_last_values_cache_max_size_mb).
+        """
+        if not self._history_last_values_cache_enabled:
+            return
+
+        try:
+            await self._ensure_pool()
+            max_bytes = self._history_last_values_cache_max_size_mb * 1024 * 1024
+            approx_bytes = 0
+            batch_size = max(1, self._history_last_values_init_batch_size)
+            offset = 0
+            total_loaded = 0
+
+            async with self._pool.acquire() as conn:
+                # Пытаемся оценить размер таблицы на стороне БД
+                try:
+                    rel_name = f'{self._schema}.variables_last_value'
+                    rel_size = await conn.fetchval(
+                        "SELECT pg_total_relation_size($1::regclass)",
+                        rel_name,
+                    )
+                    if rel_size is not None:
+                        approx_mb = rel_size / (1024 * 1024)
+                        limit_mb = max_bytes / (1024 * 1024)
+                        self.logger.info(
+                            "Estimated relation size for %s: %.1f MB (cache limit %.1f MB)",
+                            rel_name,
+                            approx_mb,
+                            limit_mb,
+                        )
+                except Exception as e:
+                    self.logger.debug(f"Failed to estimate variables_last_value size: {e}")
+
+                while True:
+                    rows = await conn.fetch(
+                        f'''
+                        SELECT variable_id, sourcetimestamp, servertimestamp,
+                               statuscode, varianttype, variantbinary
+                        FROM "{self._schema}".variables_last_value
+                        ORDER BY variable_id
+                        LIMIT $1 OFFSET $2
+                        ''',
+                        batch_size,
+                        offset,
+                    )
+                    if not rows:
+                        break
+
+                    for row in rows:
+                        vid = row["variable_id"]
+                        dv = ua.DataValue(
+                            Value=variant_from_binary(Buffer(row["variantbinary"])),
+                            StatusCode_=ua.StatusCode(row["statuscode"]),
+                            SourceTimestamp=row["sourcetimestamp"],
+                            ServerTimestamp=row["servertimestamp"],
+                        )
+                        self._last_values_cache[vid] = dv
+                        total_loaded += 1
+
+                        # Грубая оценка потребления памяти: размер бинарника + константа
+                        vb = row["variantbinary"] or b""
+                        approx_bytes += len(vb) + 128
+                        if approx_bytes >= max_bytes:
+                            self.logger.warning(
+                                "Last values cache memory limit reached (%.1f MB), "
+                                "stopping further loading (loaded %d entries)",
+                                approx_bytes / (1024 * 1024),
+                                total_loaded,
+                            )
+                            return
+
+                    offset += len(rows)
+
+            self.logger.info(
+                "Last values cache initialized: %d entries (approx %.1f MB)",
+                total_loaded,
+                approx_bytes / (1024 * 1024),
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to initialize last values cache: {e}")
+
+    async def _init_metadata_cache(self) -> None:
+        """
+        Инициализация кэша метаданных переменных (node_id -> variable_id).
+
+        Загружаем пары (node_id, variable_id) из таблицы variable_metadata
+        пакетами, с ограничением по максимальному числу строк.
+        """
+        if not self._history_metadata_cache_enabled:
+            return
+
+        try:
+            await self._ensure_pool()
+            max_rows = max(1, self._history_metadata_cache_init_max_rows)
+            batch_size = min(10000, max_rows)
+            total_loaded = 0
+            last_variable_id = 0
+
+            async with self._pool.acquire() as conn:
+                while total_loaded < max_rows:
+                    rows = await conn.fetch(
+                        f'''
+                        SELECT node_id, variable_id
+                        FROM "{self._schema}".variable_metadata
+                        WHERE variable_id > $1
+                        ORDER BY variable_id
+                        LIMIT $2
+                        ''',
+                        last_variable_id,
+                        min(batch_size, max_rows - total_loaded),
+                    )
+                    if not rows:
+                        break
+
+                    for row in rows:
+                        node_id_str = row["node_id"]
+                        vid = row["variable_id"]
+                        self._variable_metadata_cache[node_id_str] = vid
+                        total_loaded += 1
+                        last_variable_id = vid
+                        if total_loaded >= max_rows:
+                            break
+
+            self.logger.info(
+                "Variable metadata cache initialized: %d entries (limit %d)",
+                total_loaded,
+                max_rows,
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to initialize variable metadata cache: {e}")
 
     def _extract_variant_values(self, event_data: dict) -> dict:
         """
@@ -1077,33 +1657,18 @@ class HistoryTimescale(HistoryStorageInterface):
         """
         if value is None:
             return None
-        elif isinstance(value, (str, int, float, bool)):
-            # Базовые типы уже сериализуемы
-            return value
-        elif isinstance(value, bytes):
-            # Байты преобразуем в base64 строку
-            import base64
-            return base64.b64encode(value).decode('utf-8')
-        elif isinstance(value, (list, tuple)):
-            # Списки и кортежи обрабатываем рекурсивно
-            return [self._make_json_serializable(item) for item in value]
-        elif isinstance(value, dict):
-            # Словари обрабатываем рекурсивно
-            return {k: self._make_json_serializable(v) for k, v in value.items()}
-        elif hasattr(value, '__dict__'):
-            # Для объектов с атрибутами пытаемся извлечь основные поля
-            try:
-                # Пытаемся получить строковое представление
-                return str(value)
-            except:
-                # Если не получается, возвращаем имя типа
-                return f"{type(value).__name__}"
-        else:
-            # Для остальных типов используем строковое представление
-            try:
-                return str(value)
-            except:
-                return f"{type(value).__name__}"
+
+    def _update_last_values_cache(self, variable_id: int, datavalue: ua.DataValue) -> None:
+        """
+        Обновление in-memory кэша последних значений.
+
+        Используется как при инициализации из БД, так и при новых записях.
+        """
+        if not self._history_last_values_cache_enabled:
+            return
+        if variable_id is None or datavalue is None:
+            return
+        self._last_values_cache[variable_id] = datavalue
 
     def _event_to_binary_map(self, ev_dict: dict) -> dict:
         import base64
@@ -1286,46 +1851,83 @@ class HistoryTimescale(HistoryStorageInterface):
                     return
                     
             if variable_id is None:
-                # Если mapping не найден, получаем variable_id из базы данных
+                # Если mapping не найден, пробуем получить variable_id из кэша по node_id_str
                 node_id_str = self._format_node_id(node_id)
-                variable_id = await self._fetchval(f'''
-                    SELECT variable_id FROM "{self._schema}".variable_metadata
-                    WHERE node_id = $1
-                    LIMIT 1
-                ''', node_id_str)
+                cached_vid = self._variable_metadata_cache.get(node_id_str)
+                if cached_vid is not None:
+                    self._cache_stats["variable_metadata_hits"] += 1
+                    variable_id = cached_vid
+                else:
+                    self._cache_stats["variable_metadata_misses"] += 1
+                    # Если в кэше нет, пробуем получить из базы данных
+                    variable_id = await self._fetchval(f'''
+                        SELECT variable_id FROM "{self._schema}".variable_metadata
+                        WHERE node_id = $1
+                        LIMIT 1
+                    ''', node_id_str)
 
                 if variable_id is None:
                     # Если метаданные не найдены, создаем их
                     variable_id = await self._save_variable_metadata(node_id, None, 0)
-                    self._datachanges_period[node_id] = (None, 0, variable_id)
 
-            # Вставка в единую таблицу переменных
-            await self._execute(
-                f'INSERT INTO "{self._schema}".variables_history (variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
-                variable_id,
-                datavalue.ServerTimestamp,
-                datavalue.SourceTimestamp,
-                datavalue.StatusCode.value,
-                str(datavalue.Value.Value),
-                int(datavalue.Value.VariantType),
-                variant_to_binary(datavalue.Value)
-            )
+                # Обновляем in-memory mapping и кэш метаданных
+                self._datachanges_period[node_id] = (None, 0, variable_id)
+                self._variable_metadata_cache[node_id_str] = variable_id
 
-            # Обновляем кэш последних значений
-            await self._execute(f'''
-                INSERT INTO "{self._schema}".variables_last_value 
-                (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (variable_id) DO UPDATE
-                    SET sourcetimestamp = EXCLUDED.sourcetimestamp,
-                        servertimestamp = EXCLUDED.servertimestamp,
-                        statuscode = EXCLUDED.statuscode,
-                        varianttype = EXCLUDED.varianttype,
-                        variantbinary = EXCLUDED.variantbinary,
-                        updated_at = NOW()
-                    WHERE "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
-            ''', variable_id, datavalue.SourceTimestamp, datavalue.ServerTimestamp, 
-                datavalue.StatusCode.value, int(datavalue.Value.VariantType), variant_to_binary(datavalue.Value))
+            # Подготовка данных для записи
+            value_str = str(datavalue.Value.Value)
+            variant_type = int(datavalue.Value.VariantType)
+            variant_binary = variant_to_binary(datavalue.Value)
+
+            # Обновляем in-memory кэш последних значений (read-after-write внутри процесса)
+            self._update_last_values_cache(variable_id, datavalue)
+
+            if self._history_write_batch_enabled and self._value_write_buffer is not None:
+                # Батчированная запись через HistoryWriteBuffer
+                node_id_str = self._format_node_id(node_id)
+                group_key = self._build_group_key_from_node_id(node_id_str)
+                item = VariableWriteItem(
+                    variable_id=variable_id,
+                    node_id_str=node_id_str,
+                    source_timestamp=datavalue.SourceTimestamp,
+                    server_timestamp=datavalue.ServerTimestamp,
+                    status_code=datavalue.StatusCode.value,
+                    value_str=value_str,
+                    variant_type=variant_type,
+                    variant_binary=variant_binary,
+                    group_key=group_key,
+                    datavalue=datavalue,
+                )
+                # В режиме global ожидаем завершения флаша
+                sync = self._history_write_read_consistency_mode == "global"
+                await self._value_write_buffer.enqueue(item, sync=sync)
+            else:
+                # Синхронная запись как раньше (без батчирования)
+                await self._execute(
+                    f'INSERT INTO "{self._schema}".variables_history (variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
+                    variable_id,
+                    datavalue.ServerTimestamp,
+                    datavalue.SourceTimestamp,
+                    datavalue.StatusCode.value,
+                    value_str,
+                    variant_type,
+                    variant_binary,
+                )
+
+                await self._execute(f'''
+                    INSERT INTO "{self._schema}".variables_last_value 
+                    (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (variable_id) DO UPDATE
+                        SET sourcetimestamp = EXCLUDED.sourcetimestamp,
+                            servertimestamp = EXCLUDED.servertimestamp,
+                            statuscode = EXCLUDED.statuscode,
+                            varianttype = EXCLUDED.varianttype,
+                            variantbinary = EXCLUDED.variantbinary,
+                            updated_at = NOW()
+                        WHERE "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
+                ''', variable_id, datavalue.SourceTimestamp, datavalue.ServerTimestamp,
+                    datavalue.StatusCode.value, variant_type, variant_binary)
 
             # Обновляем тип данных в метаданных на основе реального DataValue только при изменении
             if datavalue and hasattr(datavalue, 'Value') and datavalue.Value is not None:
@@ -1405,26 +2007,38 @@ class HistoryTimescale(HistoryStorageInterface):
                     return
 
             if source_db_id is None or event_db_id is None:
-                # Если mapping не найден, получаем IDs из базы данных
+                # Если mapping не найден, получаем IDs из кэша или базы данных
                 # Сначала получаем source_id из event_sources
                 source_node_id_str = self._format_node_id(event.SourceNode)
-                source_db_id = await self._fetchval(f'''
-                    SELECT source_id FROM "{self._schema}".event_sources 
-                    WHERE source_node_id = $1
-                    LIMIT 1
-                ''', source_node_id_str)
+                cached_sid = self._event_source_cache.get(source_node_id_str)
+                if cached_sid is not None:
+                    self._cache_stats["event_source_hits"] += 1
+                    source_db_id = cached_sid
+                else:
+                    self._cache_stats["event_source_misses"] += 1
+                    source_db_id = await self._fetchval(f'''
+                        SELECT source_id FROM "{self._schema}".event_sources 
+                        WHERE source_node_id = $1
+                        LIMIT 1
+                    ''', source_node_id_str)
                 
                 if source_db_id is None:
                     # Если источник не найден, создаем его
                     source_db_id = await self._save_event_source(event.SourceNode, None, 0)
 
-                # Теперь получаем event_type_id из event_types
+                # Теперь получаем event_type_id из event_types (через кэш)
                 event_type_name = self._format_node_id(event_type)
-                event_db_id = await self._fetchval(f'''
-                    SELECT event_type_id FROM "{self._schema}".event_types 
-                    WHERE event_type_name = $1
-                    LIMIT 1
-                ''', event_type_name)
+                cached_eid = self._event_type_cache.get(event_type_name)
+                if cached_eid is not None:
+                    self._cache_stats["event_type_hits"] += 1
+                    event_db_id = cached_eid
+                else:
+                    self._cache_stats["event_type_misses"] += 1
+                    event_db_id = await self._fetchval(f'''
+                        SELECT event_type_id FROM "{self._schema}".event_types 
+                        WHERE event_type_name = $1
+                        LIMIT 1
+                    ''', event_type_name)
                 
                 if event_db_id is None:
                     # Если тип события не найден, создаем его
@@ -1440,14 +2054,33 @@ class HistoryTimescale(HistoryStorageInterface):
             raw_event_data = event.get_event_props_as_fields_dict() if hasattr(event, 'get_event_props_as_fields_dict') else {}
             bin_event_data = self._event_to_binary_map(raw_event_data)
 
-            # Вставка в единую таблицу событий
-            await self._execute(
-                f'INSERT INTO "{self._schema}".events_history (source_id, event_type_id, event_timestamp, event_data) VALUES ($1, $2, $3, $4) ON CONFLICT (source_id, event_timestamp) DO NOTHING',
-                source_db_id,
-                event_db_id,
-                event_time,
-                json.dumps(bin_event_data)  # asyncpg требует сериализованную строку для JSONB
-            )
+            event_data_json = json.dumps(bin_event_data)  # asyncpg требует сериализованную строку для JSONB
+
+            if self._history_write_batch_enabled and self._event_write_buffer is not None:
+                # Батчированная запись событий
+                try:
+                    source_node_id_str = self._format_node_id(event.SourceNode)
+                except Exception:
+                    source_node_id_str = str(getattr(event, "SourceNode", "unknown"))
+                group_key = self._build_group_key_from_node_id(source_node_id_str)
+                item = EventWriteItem(
+                    source_db_id=source_db_id,
+                    event_type_id=event_db_id,
+                    event_timestamp=event_time,
+                    event_data_json=event_data_json,
+                    group_key=group_key,
+                )
+                sync = self._history_write_read_consistency_mode == "global"
+                await self._event_write_buffer.enqueue(item, sync=sync)
+            else:
+                # Синхронная запись как раньше (без батчирования)
+                await self._execute(
+                    f'INSERT INTO "{self._schema}".events_history (source_id, event_type_id, event_timestamp, event_data) VALUES ($1, $2, $3, $4) ON CONFLICT (source_id, event_timestamp) DO NOTHING',
+                    source_db_id,
+                    event_db_id,
+                    event_time,
+                    event_data_json,
+                )
 
             # Очистка старых данных по периоду хранения
             # Получаем параметры хранения из event_sources
@@ -1521,13 +2154,24 @@ class HistoryTimescale(HistoryStorageInterface):
                     return [], None
                     
             if variable_id is None:
-                # Если mapping не найден, получаем variable_id из базы данных
+                # Если mapping не найден, пробуем получить variable_id из кэша по node_id_str
                 node_id_str = self._format_node_id(node_id)
-                variable_id = await self._fetchval(f'''
-                    SELECT variable_id FROM "{self._schema}".variable_metadata
-                    WHERE node_id = $1
-                    LIMIT 1
-                ''', node_id_str)
+                cached_vid = self._variable_metadata_cache.get(node_id_str)
+                if cached_vid is not None:
+                    self._cache_stats["variable_metadata_hits"] += 1
+                    variable_id = cached_vid
+                else:
+                    self._cache_stats["variable_metadata_misses"] += 1
+                    # Если в кэше нет, получаем variable_id из базы данных
+                    variable_id = await self._fetchval(f'''
+                        SELECT variable_id FROM "{self._schema}".variable_metadata
+                        WHERE node_id = $1
+                        LIMIT 1
+                    ''', node_id_str)
+
+                if variable_id is not None:
+                    # Обновляем кэш
+                    self._variable_metadata_cache[node_id_str] = variable_id
 
             if variable_id is None:
                 self.logger.warning(f"No metadata found for node {node_id}")
@@ -1596,17 +2240,27 @@ class HistoryTimescale(HistoryStorageInterface):
             # Получаем source_db_id
             source_data = self._datachanges_period.get(source_id)
             if source_data is None:
-                # Если mapping не найден, получаем source_db_id из базы данных
+                # Если mapping не найден, пробуем получить source_db_id из кэша или базы данных
                 source_node_id_str = self._format_node_id(source_id)
-                source_db_id = await self._fetchval(f'''
-                    SELECT source_id FROM "{self._schema}".event_sources 
-                    WHERE source_node_id = $1
-                    LIMIT 1
-                ''', source_node_id_str)
-                
+                cached_sid = self._event_source_cache.get(source_node_id_str)
+
+                if cached_sid is not None:
+                    self._cache_stats["event_source_hits"] += 1
+                    source_db_id = cached_sid
+                else:
+                    self._cache_stats["event_source_misses"] += 1
+                    source_db_id = await self._fetchval(f'''
+                        SELECT source_id FROM "{self._schema}".event_sources 
+                        WHERE source_node_id = $1
+                        LIMIT 1
+                    ''', source_node_id_str)
+
                 if source_db_id is None:
                     self.logger.warning(f"No metadata found for source {source_id}")
                     return [], None
+                else:
+                    # Обновляем кэш
+                    self._event_source_cache[source_node_id_str] = source_db_id
             else:
                 # Проверяем формат данных
                 if len(source_data) == 4:
@@ -1744,13 +2398,24 @@ class HistoryTimescale(HistoryStorageInterface):
             # Получаем variable_id
             node_data = self._datachanges_period.get(node_id)
             if node_data is None:
-                # Если mapping не найден, получаем variable_id из базы данных
+                # Если mapping не найден, пробуем получить variable_id из кэша по node_id_str
                 node_id_str = self._format_node_id(node_id)
-                variable_id = await self._fetchval(f'''
-                    SELECT variable_id FROM "{self._schema}".variable_metadata
-                    WHERE node_id = $1
-                    LIMIT 1
-                ''', node_id_str)
+                cached_vid = self._variable_metadata_cache.get(node_id_str)
+                if cached_vid is not None:
+                    self._cache_stats["variable_metadata_hits"] += 1
+                    variable_id = cached_vid
+                else:
+                    self._cache_stats["variable_metadata_misses"] += 1
+                    # Если в кэше нет, получаем variable_id из базы данных
+                    variable_id = await self._fetchval(f'''
+                        SELECT variable_id FROM "{self._schema}".variable_metadata
+                        WHERE node_id = $1
+                        LIMIT 1
+                    ''', node_id_str)
+
+                if variable_id is not None:
+                    # Обновляем кэш
+                    self._variable_metadata_cache[node_id_str] = variable_id
             else:
                 # Проверяем формат данных
                 if len(node_data) == 3:
@@ -1765,8 +2430,17 @@ class HistoryTimescale(HistoryStorageInterface):
             
             if variable_id is None:
                 return None
-            
-            # Сначала пытаемся получить из кэша
+
+            # Пытаемся получить из in-memory кэша последних значений
+            if self._history_last_values_cache_enabled:
+                cached = self._last_values_cache.get(variable_id)
+                if cached is not None:
+                    self._cache_stats["last_values_memory_hits"] += 1
+                    return cached
+                else:
+                    self._cache_stats["last_values_memory_misses"] += 1
+
+            # Если в памяти нет, читаем из таблицы кэша в БД
             row = await self._fetchrow(f'''
                 SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
                 FROM "{self._schema}".variables_last_value
@@ -1774,6 +2448,8 @@ class HistoryTimescale(HistoryStorageInterface):
             ''', variable_id)
             
             if row is not None:
+                # Попали в таблицу-кэш последних значений
+                self._cache_stats["last_values_table_hits"] += 1
                 # Преобразуем в DataValue
                 return ua.DataValue(
                     Value=variant_from_binary(Buffer(row['variantbinary'])),
@@ -1783,6 +2459,7 @@ class HistoryTimescale(HistoryStorageInterface):
                 )
             
             # Fallback: получаем из основной таблицы через покрывающий индекс
+            self._cache_stats["last_values_table_misses"] += 1
             row = await self._fetchrow(f'''
                 SELECT sourcetimestamp, servertimestamp, statuscode, varianttype
                 FROM "{self._schema}".variables_history
@@ -1792,6 +2469,7 @@ class HistoryTimescale(HistoryStorageInterface):
             ''', variable_id)
             
             if row is not None:
+                self._cache_stats["last_values_history_fallbacks"] += 1
                 # Получаем variantbinary отдельным запросом
                 variantbinary_row = await self._fetchrow(f'''
                     SELECT variantbinary
@@ -1840,13 +2518,24 @@ class HistoryTimescale(HistoryStorageInterface):
             for node_id in node_ids:
                 node_data = self._datachanges_period.get(node_id)
                 if node_data is None:
-                    # Если mapping не найден, получаем variable_id из базы данных
+                    # Если mapping не найден, пробуем получить variable_id из кэша по node_id_str
                     node_id_str = self._format_node_id(node_id)
-                    variable_id = await self._fetchval(f'''
-                        SELECT variable_id FROM "{self._schema}".variable_metadata
-                        WHERE node_id = $1
-                        LIMIT 1
-                    ''', node_id_str)
+                    cached_vid = self._variable_metadata_cache.get(node_id_str)
+                    if cached_vid is not None:
+                        self._cache_stats["variable_metadata_hits"] += 1
+                        variable_id = cached_vid
+                    else:
+                        self._cache_stats["variable_metadata_misses"] += 1
+                        # Если в кэше нет, получаем variable_id из базы данных
+                        variable_id = await self._fetchval(f'''
+                            SELECT variable_id FROM "{self._schema}".variable_metadata
+                            WHERE node_id = $1
+                            LIMIT 1
+                        ''', node_id_str)
+
+                    if variable_id is not None:
+                        # Обновляем кэш
+                        self._variable_metadata_cache[node_id_str] = variable_id
                 else:
                     # Проверяем формат данных
                     if len(node_data) == 3:
@@ -1865,33 +2554,54 @@ class HistoryTimescale(HistoryStorageInterface):
                     node_to_variable[variable_id] = node_id
                 else:
                     result[node_id] = None
-            
+
             if not variable_ids:
                 return result
-            
-            # Получаем из кэша батчем
+
+            # Сначала пробуем получить значения из in-memory кэша
+            remaining_variable_ids: List[int] = []
+            if self._history_last_values_cache_enabled:
+                for vid in variable_ids:
+                    cached = self._last_values_cache.get(vid)
+                    if cached is not None:
+                        self._cache_stats["last_values_memory_hits"] += 1
+                        node_id = node_to_variable[vid]
+                        result[node_id] = cached
+                    else:
+                        self._cache_stats["last_values_memory_misses"] += 1
+                        remaining_variable_ids.append(vid)
+            else:
+                remaining_variable_ids = list(variable_ids)
+
+            if not remaining_variable_ids:
+                return result
+
+            # Получаем отсутствующие значения из таблицы кэша в БД батчем
             rows = await self._fetch(f'''
                 SELECT variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
                 FROM "{self._schema}".variables_last_value
                 WHERE variable_id = ANY($1)
-            ''', variable_ids)
-            
-            # Обрабатываем результаты из кэша
+            ''', remaining_variable_ids)
+
+            # Обрабатываем результаты из таблицы кэша
             cached_variable_ids = set()
             for row in rows:
                 variable_id = row['variable_id']
                 node_id = node_to_variable[variable_id]
                 cached_variable_ids.add(variable_id)
                 
-                result[node_id] = ua.DataValue(
+                dv = ua.DataValue(
                     Value=variant_from_binary(Buffer(row['variantbinary'])),
                     StatusCode_=ua.StatusCode(row['statuscode']),
                     SourceTimestamp=row['sourcetimestamp'],
                     ServerTimestamp=row['servertimestamp']
                 )
+                result[node_id] = dv
+                self._update_last_values_cache(variable_id, dv)
+                self._cache_stats["last_values_table_hits"] += 1
             
-            # Fallback для узлов, которых нет в кэше
-            missing_variable_ids = [vid for vid in variable_ids if vid not in cached_variable_ids]
+            # Fallback для узлов, которых нет ни в памяти, ни в таблице кэша
+            missing_variable_ids = [vid for vid in remaining_variable_ids if vid not in cached_variable_ids]
             if missing_variable_ids:
                 fallback_rows = await self._fetch(f'''
                     SELECT DISTINCT ON (variable_id) variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype
@@ -1900,6 +2610,9 @@ class HistoryTimescale(HistoryStorageInterface):
                     ORDER BY variable_id, sourcetimestamp DESC
                 ''', missing_variable_ids)
                 
+                if fallback_rows:
+                    self._cache_stats["last_values_history_fallbacks"] += len(fallback_rows)
+
                 for row in fallback_rows:
                     variable_id = row['variable_id']
                     node_id = node_to_variable[variable_id]
@@ -1913,12 +2626,14 @@ class HistoryTimescale(HistoryStorageInterface):
                     ''', variable_id, row['sourcetimestamp'])
                     
                     if variantbinary_row is not None:
-                        result[node_id] = ua.DataValue(
+                        dv = ua.DataValue(
                             Value=variant_from_binary(Buffer(variantbinary_row['variantbinary'])),
                             StatusCode_=ua.StatusCode(row['statuscode']),
                             SourceTimestamp=row['sourcetimestamp'],
                             ServerTimestamp=row['servertimestamp']
                         )
+                        result[node_id] = dv
+                        self._update_last_values_cache(variable_id, dv)
             
             # Заполняем None для узлов, которых вообще нет в истории
             for node_id in node_ids:
@@ -1934,6 +2649,12 @@ class HistoryTimescale(HistoryStorageInterface):
 
     async def close(self) -> None:
         """Закрытие модуля историзации"""
+        # Останавливаем фоновые буферы записи
+        if self._value_write_buffer:
+            await self._value_write_buffer.stop()
+        if self._event_write_buffer:
+            await self._event_write_buffer.stop()
+
         if self._pool:
             await self._pool.close()
             self.logger.info("HistoryTimescale closed")
