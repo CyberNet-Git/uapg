@@ -848,10 +848,15 @@ class HistoryTimescale(HistoryStorageInterface):
         return pool_params
 
     async def _ensure_pool(self) -> None:
-        if self._pool and not self._pool._closed:
+        """
+        Гарантирует наличие рабочего пула соединений.
+
+        Пул считается непригодным, если он закрыт или находится в процессе закрытия.
+        """
+        if self._pool and not self._pool._closed and not getattr(self._pool, "_closing", False):
             return
         async with self._pool_lock:
-            if self._pool and not self._pool._closed:
+            if self._pool and not self._pool._closed and not getattr(self._pool, "_closing", False):
                 return
             pool_params = self._build_pool_params()
             self._pool = await asyncpg.create_pool(**pool_params)
@@ -887,14 +892,14 @@ class HistoryTimescale(HistoryStorageInterface):
             else:
                 self.logger.warning("Database connection unhealthy. Attempting to reconnect...")
             self._was_healthy = False
+            old_pool: Optional[asyncpg.Pool] = None
             try:
-                if self._pool:
-                    try:
-                        await self._pool.close()
-                    except Exception:
-                        pass
+                async with self._pool_lock:
+                    if self._pool:
+                        old_pool = self._pool
+                    # Обнуляем текущий пул, чтобы новые операции могли создать новый
                     self._pool = None
-                await self._ensure_pool()
+                    await self._ensure_pool()
                 self.logger.info("Reconnected to database successfully")
                 delay = self._reconnect_min_delay
             except Exception as e:
@@ -902,6 +907,13 @@ class HistoryTimescale(HistoryStorageInterface):
                 jitter = random.uniform(0, 0.3 * delay)
                 await asyncio.sleep(delay + jitter)
                 delay = min(delay * 2, self._reconnect_max_delay)
+
+            # Закрываем старый пул уже вне блокировки и в фоне
+            if old_pool is not None:
+                try:
+                    asyncio.create_task(old_pool.close())
+                except Exception:
+                    pass
 
     def _reset_outage_stats(self) -> None:
         if self._failed_value_saves_counter or self._failed_event_saves_counter:
@@ -1066,20 +1078,33 @@ class HistoryTimescale(HistoryStorageInterface):
                 raise
 
     async def _force_reconnect(self) -> None:
+        """
+        Принудительно пересоздаёт пул соединений.
+
+        Старый пул закрывается в фоне, чтобы не блокировать выполнение и не
+        застревать в состоянии "pool is closing" для новых операций.
+        """
+        old_pool: Optional[asyncpg.Pool] = None
         async with self._pool_lock:
             try:
                 if self._pool:
-                    try:
-                        await self._pool.close()
-                    except Exception:
-                        # Игнорируем ошибку при закрытии старого пула
-                        pass
+                    old_pool = self._pool
+                # Обнуляем ссылку на пул, чтобы новые вызовы _ensure_pool могли создать новый
                 self._pool = None
+                # Создаём новый пул
                 await self._ensure_pool()
             except Exception as e:
                 # Невозможно восстановить подключение к БД — критический уровень и проброс исключения наверх
                 self.logger.critical(f"Force reconnect failed, database remains unavailable: {e}")
                 raise
+
+        # Старый пул закрываем уже вне блокировки и в фоне
+        if old_pool is not None:
+            try:
+                asyncio.create_task(old_pool.close())
+            except Exception:
+                # Игнорируем ошибку при закрытии старого пула
+                pass
 
     async def _create_metadata_tables(self) -> None:
         """Создание единых таблиц для историзации в указанной схеме."""
@@ -1341,8 +1366,6 @@ class HistoryTimescale(HistoryStorageInterface):
         if not items:
             return
 
-        await self._ensure_pool()
-
         params = [
             (
                 it.source_db_id,
@@ -1353,15 +1376,28 @@ class HistoryTimescale(HistoryStorageInterface):
             for it in items
         ]
 
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.executemany(
-                    f'INSERT INTO "{self._schema}".events_history '
-                    f'(source_id, event_type_id, event_timestamp, event_data) '
-                    f'VALUES ($1, $2, $3, $4) '
-                    f'ON CONFLICT (source_id, event_timestamp) DO NOTHING',
-                    params,
-                )
+        # Делаем до двух попыток записи батча: первая — с текущим пулом,
+        # вторая — после принудительного реконнекта при ошибке.
+        for attempt in (1, 2):
+            await self._ensure_pool()
+            try:
+                async with self._pool.acquire() as conn:
+                    async with conn.transaction():
+                        await conn.executemany(
+                            f'INSERT INTO "{self._schema}".events_history '
+                            f'(source_id, event_type_id, event_timestamp, event_data) '
+                            f'VALUES ($1, $2, $3, $4) '
+                            f'ON CONFLICT (source_id, event_timestamp) DO NOTHING',
+                            params,
+                        )
+                return
+            except Exception as e:
+                if attempt == 1:
+                    self.logger.error(f"Flush event batch failed, will try to reconnect and retry: {e}")
+                    await self._force_reconnect()
+                else:
+                    self.logger.error(f"Flush event batch failed after reconnect: {e}")
+                    raise
 
     async def _save_variable_metadata(self, node_id: ua.NodeId, period: Optional[timedelta], count: int) -> int:
         """
