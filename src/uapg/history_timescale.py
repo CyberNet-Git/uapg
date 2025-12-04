@@ -478,6 +478,8 @@ class HistoryTimescale(HistoryStorageInterface):
         self._was_healthy = True
         self._db_unavailable_since = None
         self._last_throttled_log_at = None
+        # Последнее время, когда мы писали агрегированное сообщение о длительной недоступности БД
+        self._last_reconnect_outage_log_at = None
         self._failed_value_saves_counter = 0
         self._failed_event_saves_counter = 0
 
@@ -868,52 +870,168 @@ class HistoryTimescale(HistoryStorageInterface):
             async with self._pool.acquire() as conn:
                 val = await conn.fetchval('SELECT 1')
                 return val == 1
-        except Exception:
+        except Exception as e:
+            # Логируем технические детали неудачной проверки соединения с PostgreSQL
+            conn_params = getattr(self, "_conn_params", {}) or {}
+            self.logger.debug(
+                "PostgreSQL healthcheck failed (db=%s, user=%s, host=%s, port=%s): %r",
+                conn_params.get("database"),
+                conn_params.get("user"),
+                conn_params.get("host"),
+                conn_params.get("port"),
+                e,
+            )
             return False
 
     async def _reconnect_monitor(self) -> None:
+        """
+        Фоновый монитор состояния подключения к PostgreSQL.
+
+        Периодически выполняет healthcheck и при необходимости вызывает _force_reconnect.
+        Все неожиданные ошибки внутри цикла логируются, чтобы корутина не «исчезала» тихо.
+        """
         delay = self._reconnect_min_delay
         while not self._stop_event.is_set():
-            healthy = await self._is_pool_healthy()
-            if healthy:
-                if not self._was_healthy:
-                    self.logger.info("Database connection restored")
-                    self._was_healthy = True
-                    self._reset_outage_stats()
-                delay = self._reconnect_min_delay
-                try:
-                    await asyncio.wait_for(self._stop_event.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    pass
-                continue
-
-            if self._was_healthy:
-                self.logger.error("Database connection lost. The database became unreachable.")
-            else:
-                self.logger.warning("Database connection unhealthy. Attempting to reconnect...")
-            self._was_healthy = False
-            old_pool: Optional[asyncpg.Pool] = None
             try:
-                async with self._pool_lock:
-                    if self._pool:
-                        old_pool = self._pool
-                    # Обнуляем текущий пул, чтобы новые операции могли создать новый
-                    self._pool = None
-                    await self._ensure_pool()
-                self.logger.info("Reconnected to database successfully")
-                delay = self._reconnect_min_delay
+                healthy = await self._is_pool_healthy()
+                if healthy:
+                    if not self._was_healthy:
+                        # Соединение с PostgreSQL восстановлено
+                        now = datetime.now(timezone.utc)
+                        conn_params = getattr(self, "_conn_params", {}) or {}
+                        if self._db_unavailable_since is not None:
+                            outage = now - self._db_unavailable_since
+                            self.logger.info(
+                                "PostgreSQL connection restored (db=%s, user=%s, host=%s, port=%s) "
+                                "after %.1f seconds of unavailability",
+                                conn_params.get("database"),
+                                conn_params.get("user"),
+                                conn_params.get("host"),
+                                conn_params.get("port"),
+                                outage.total_seconds(),
+                            )
+                        else:
+                            self.logger.info(
+                                "PostgreSQL connection restored (db=%s, user=%s, host=%s, port=%s)",
+                                conn_params.get("database"),
+                                conn_params.get("user"),
+                                conn_params.get("host"),
+                                conn_params.get("port"),
+                            )
+                        self._was_healthy = True
+                        self._reset_outage_stats()
+                        # Сбрасываем таймер аггрегированного логирования реконнекта
+                        self._last_reconnect_outage_log_at = None
+                    delay = self._reconnect_min_delay
+                    try:
+                        await asyncio.wait_for(self._stop_event.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+
+                # Соединение нездорово — начинаем или продолжаем попытки реконнекта
+                now = datetime.now(timezone.utc)
+                conn_params = getattr(self, "_conn_params", {}) or {}
+                # Фиксируем момент начала недоступности, если ещё не зафиксирован
+                if self._db_unavailable_since is None:
+                    self._db_unavailable_since = now
+
+                if self._was_healthy:
+                    # Первый переход в состояние недоступности
+                    self.logger.error(
+                        "PostgreSQL became unreachable (db=%s, user=%s, host=%s, port=%s). "
+                        "Starting reconnect attempts.",
+                        conn_params.get("database"),
+                        conn_params.get("user"),
+                        conn_params.get("host"),
+                        conn_params.get("port"),
+                    )
+                else:
+                    self.logger.warning(
+                        "PostgreSQL is still unhealthy, will continue reconnect attempts "
+                        "(db=%s, host=%s, port=%s).",
+                        conn_params.get("database"),
+                        conn_params.get("host"),
+                        conn_params.get("port"),
+                    )
+                self._was_healthy = False
+                # Периодическое агрегированное сообщение о длительной недоступности PostgreSQL
+                if self._db_unavailable_since is not None:
+                    outage = now - self._db_unavailable_since
+                    if outage >= timedelta(minutes=1):
+                        if (
+                            self._last_reconnect_outage_log_at is None
+                            or (now - self._last_reconnect_outage_log_at) >= timedelta(minutes=1)
+                        ):
+                            self._last_reconnect_outage_log_at = now
+                            self.logger.error(
+                                "PostgreSQL has been unreachable for %.1f seconds "
+                                "(db=%s, user=%s, host=%s, port=%s). Reconnect attempts continue.",
+                                outage.total_seconds(),
+                                conn_params.get("database"),
+                                conn_params.get("user"),
+                                conn_params.get("host"),
+                                conn_params.get("port"),
+                            )
+
+                try:
+                    await self._force_reconnect()
+                    self.logger.info("Reconnected to database successfully")
+                    delay = self._reconnect_min_delay
+                except Exception as e:
+                    # _force_reconnect уже залогировал critical, здесь фиксируем, что монитор продолжает попытки
+                    self.logger.error(f"Reconnect attempt failed in monitor: {e}")
+                    jitter = random.uniform(0, 0.3 * delay)
+                    await asyncio.sleep(delay + jitter)
+                    delay = min(delay * 2, self._reconnect_max_delay)
+            except asyncio.CancelledError:
+                # Нормальное завершение по stop()
+                break
             except Exception as e:
-                self.logger.error(f"Reconnect attempt failed: {e}")
+                # Любая неожиданная ошибка внутри монитора — логируем и продолжаем,
+                # чтобы корутина не завершилась тихо.
+                self.logger.error("Reconnect monitor unexpected error: %r", e, exc_info=True)
                 jitter = random.uniform(0, 0.3 * delay)
                 await asyncio.sleep(delay + jitter)
-                delay = min(delay * 2, self._reconnect_max_delay)
 
-            # Закрываем старый пул уже вне блокировки и в фоне
-            if old_pool is not None:
-                try:
-                    asyncio.create_task(old_pool.close())
-                except Exception:
-                    pass
+    def _log_connection_restored_if_needed(self) -> None:
+        """
+        Фиксирует в логе восстановление подключения к PostgreSQL,
+        если ранее оно считалось недоступным.
+
+        Этот метод вызывается на пути успешного выполнения произвольного SQL‑запроса,
+        чтобы гарантировать появление сообщения «соединение восстановлено» даже
+        если это произошло не через фоновый монитор реконнекта.
+        """
+        if self._was_healthy:
+            return
+
+        now = datetime.now(timezone.utc)
+        conn_params = getattr(self, "_conn_params", {}) or {}
+
+        if self._db_unavailable_since is not None:
+            outage = now - self._db_unavailable_since
+            self.logger.info(
+                "PostgreSQL connection restored via successful query "
+                "(db=%s, user=%s, host=%s, port=%s) after %.1f seconds of unavailability",
+                conn_params.get("database"),
+                conn_params.get("user"),
+                conn_params.get("host"),
+                conn_params.get("port"),
+                outage.total_seconds(),
+            )
+        else:
+            self.logger.info(
+                "PostgreSQL connection restored via successful query "
+                "(db=%s, user=%s, host=%s, port=%s)",
+                conn_params.get("database"),
+                conn_params.get("user"),
+                conn_params.get("host"),
+                conn_params.get("port"),
+            )
+
+        self._was_healthy = True
+        self._reset_outage_stats()
 
     def _reset_outage_stats(self) -> None:
         if self._failed_value_saves_counter or self._failed_event_saves_counter:
@@ -922,6 +1040,7 @@ class HistoryTimescale(HistoryStorageInterface):
             )
         self._db_unavailable_since = None
         self._last_throttled_log_at = None
+        self._last_reconnect_outage_log_at = None
         self._failed_value_saves_counter = 0
         self._failed_event_saves_counter = 0
 
@@ -987,7 +1106,9 @@ class HistoryTimescale(HistoryStorageInterface):
         await self._ensure_pool()
         try:
             async with self._pool.acquire() as conn:
-                return await conn.execute(query, *args)
+                result = await conn.execute(query, *args)
+                self._log_connection_restored_if_needed()
+                return result
         except Exception as e:
             # Ошибка выполнения запроса или проблемы с соединением — логируем как error
             self.logger.error(f"Execute failed, will try to reconnect and retry: {e}")
@@ -996,7 +1117,9 @@ class HistoryTimescale(HistoryStorageInterface):
             # Вторая попытка выполнения запроса
             try:
                 async with self._pool.acquire() as conn:
-                    return await conn.execute(query, *args)
+                    result = await conn.execute(query, *args)
+                    self._log_connection_restored_if_needed()
+                    return result
             except Exception as e2:
                 # Ошибка выполнения SQL после переподключения — тоже error
                 self.logger.error(f"Execute failed after reconnect: {e2}")
@@ -1016,13 +1139,17 @@ class HistoryTimescale(HistoryStorageInterface):
         await self._ensure_pool()
         try:
             async with self._pool.acquire() as conn:
-                return await conn.fetch(query, *args)
+                rows = await conn.fetch(query, *args)
+                self._log_connection_restored_if_needed()
+                return rows
         except Exception as e:
             self.logger.error(f"Fetch failed, will try to reconnect and retry: {e}")
             await self._force_reconnect()
             try:
                 async with self._pool.acquire() as conn:
-                    return await conn.fetch(query, *args)
+                    rows = await conn.fetch(query, *args)
+                    self._log_connection_restored_if_needed()
+                    return rows
             except Exception as e2:
                 self.logger.error(f"Fetch failed after reconnect: {e2}")
                 raise
@@ -1041,13 +1168,17 @@ class HistoryTimescale(HistoryStorageInterface):
         await self._ensure_pool()
         try:
             async with self._pool.acquire() as conn:
-                return await conn.fetchval(query, *args)
+                value = await conn.fetchval(query, *args)
+                self._log_connection_restored_if_needed()
+                return value
         except Exception as e:
             self.logger.error(f"Fetchval failed, will try to reconnect and retry: {e}")
             await self._force_reconnect()
             try:
                 async with self._pool.acquire() as conn:
-                    return await conn.fetchval(query, *args)
+                    value = await conn.fetchval(query, *args)
+                    self._log_connection_restored_if_needed()
+                    return value
             except Exception as e2:
                 self.logger.error(f"Fetchval failed after reconnect: {e2}")
                 raise
@@ -1066,45 +1197,58 @@ class HistoryTimescale(HistoryStorageInterface):
         await self._ensure_pool()
         try:
             async with self._pool.acquire() as conn:
-                return await conn.fetchrow(query, *args)
+                row = await conn.fetchrow(query, *args)
+                self._log_connection_restored_if_needed()
+                return row
         except Exception as e:
             self.logger.error(f"Fetchrow failed, will try to reconnect and retry: {e}")
             await self._force_reconnect()
             try:
                 async with self._pool.acquire() as conn:
-                    return await conn.fetchrow(query, *args)
+                    row = await conn.fetchrow(query, *args)
+                    self._log_connection_restored_if_needed()
+                    return row
             except Exception as e2:
                 self.logger.error(f"Fetchrow failed after reconnect: {e2}")
                 raise
 
     async def _force_reconnect(self) -> None:
         """
-        Принудительно пересоздаёт пул соединений.
+        Полное пересоздание пула соединений.
 
-        Старый пул закрывается в фоне, чтобы не блокировать выполнение и не
-        застревать в состоянии "pool is closing" для новых операций.
+        Старый пул закрывается синхронно, чтобы избежать гонок состояний
+        внутри asyncpg (ошибки вида «another operation is in progress»).
         """
         old_pool: Optional[asyncpg.Pool] = None
         async with self._pool_lock:
             try:
                 if self._pool:
                     old_pool = self._pool
-                # Обнуляем ссылку на пул, чтобы новые вызовы _ensure_pool могли создать новый
+                # Обнуляем ссылку на пул: новые операции будут создавать
+                # соединения только после успешного создания нового пула.
                 self._pool = None
-                # Создаём новый пул
-                await self._ensure_pool()
+            except Exception as e:
+                self.logger.error("Error while preparing to recreate pool: %r", e, exc_info=True)
+                raise
+
+        # Закрываем старый пул уже вне блокировки, но синхронно
+        if old_pool is not None:
+            try:
+                await old_pool.close()
+            except Exception as e:
+                self.logger.warning("Error closing old PostgreSQL pool during reconnect: %r", e, exc_info=True)
+
+        # Создаём новый пул под блокировкой, без использования _ensure_pool,
+        # чтобы избежать рекурсивного захвата замка.
+        async with self._pool_lock:
+            try:
+                pool_params = self._build_pool_params()
+                self._pool = await asyncpg.create_pool(**pool_params)
+                self.logger.info("Connection pool recreated successfully after failure")
             except Exception as e:
                 # Невозможно восстановить подключение к БД — критический уровень и проброс исключения наверх
                 self.logger.critical(f"Force reconnect failed, database remains unavailable: {e}")
                 raise
-
-        # Старый пул закрываем уже вне блокировки и в фоне
-        if old_pool is not None:
-            try:
-                asyncio.create_task(old_pool.close())
-            except Exception:
-                # Игнорируем ошибку при закрытии старого пула
-                pass
 
     async def _create_metadata_tables(self) -> None:
         """Создание единых таблиц для историзации в указанной схеме."""
@@ -1301,8 +1445,6 @@ class HistoryTimescale(HistoryStorageInterface):
         if not items:
             return
 
-        await self._ensure_pool()
-
         history_params = [
             (
                 it.variable_id,
@@ -1328,36 +1470,52 @@ class HistoryTimescale(HistoryStorageInterface):
             for it in items
         ]
 
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.executemany(
-                    f'INSERT INTO "{self._schema}".variables_history '
-                    f'(variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) '
-                    f'VALUES ($1, $2, $3, $4, $5, $6, $7) '
-                    f'ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
-                    history_params,
-                )
+        # Делаем до двух попыток записи батча: первая — с текущим пулом,
+        # вторая — после принудительного реконнекта при ошибке.
+        for attempt in (1, 2):
+            await self._ensure_pool()
+            try:
+                async with self._pool.acquire() as conn:
+                    async with conn.transaction():
+                        await conn.executemany(
+                            f'INSERT INTO "{self._schema}".variables_history '
+                            f'(variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) '
+                            f'VALUES ($1, $2, $3, $4, $5, $6, $7) '
+                            f'ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
+                            history_params,
+                        )
 
-                await conn.executemany(
-                    f'''
-                    INSERT INTO "{self._schema}".variables_last_value 
-                        (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT (variable_id) DO UPDATE
-                        SET sourcetimestamp = EXCLUDED.sourcetimestamp,
-                            servertimestamp = EXCLUDED.servertimestamp,
-                            statuscode = EXCLUDED.statuscode,
-                            varianttype = EXCLUDED.varianttype,
-                            variantbinary = EXCLUDED.variantbinary,
-                            updated_at = NOW()
-                        WHERE "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
-                    ''',
-                    last_value_params,
-                )
+                        await conn.executemany(
+                            f'''
+                            INSERT INTO "{self._schema}".variables_last_value 
+                                (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
+                            VALUES ($1, $2, $3, $4, $5, $6)
+                            ON CONFLICT (variable_id) DO UPDATE
+                                SET sourcetimestamp = EXCLUDED.sourcetimestamp,
+                                    servertimestamp = EXCLUDED.servertimestamp,
+                                    statuscode = EXCLUDED.statuscode,
+                                    varianttype = EXCLUDED.varianttype,
+                                    variantbinary = EXCLUDED.variantbinary,
+                                    updated_at = NOW()
+                                WHERE "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
+                            ''',
+                            last_value_params,
+                        )
 
-        # Обновляем in-memory кэш последних значений
-        for it in items:
-            self._update_last_values_cache(it.variable_id, it.datavalue)
+                # Успешная запись батча — считаем, что соединение восстановлено
+                self._log_connection_restored_if_needed()
+
+                # Обновляем in-memory кэш последних значений
+                for it in items:
+                    self._update_last_values_cache(it.variable_id, it.datavalue)
+                return
+            except Exception as e:
+                if attempt == 1:
+                    self.logger.error(f"Flush variable batch failed, will try to reconnect and retry: {e}")
+                    await self._force_reconnect()
+                else:
+                    self.logger.error(f"Flush variable batch failed after reconnect: {e}")
+                    raise
 
     async def _flush_event_batch(self, items: List[EventWriteItem]) -> None:
         """
