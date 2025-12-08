@@ -531,6 +531,10 @@ class HistoryTimescale(HistoryStorageInterface):
             "event_type_misses": 0,
         }
 
+        # Подавление первого уведомления datachange после подписки
+        self.suppress_initial_datachange = True
+        self._pending_initial_datachange_skip: Dict[str, bool] = {}
+
         # Буферы для батчевой записи истории
         self._value_write_buffer: Optional[HistoryWriteBuffer] = None
         self._event_write_buffer: Optional[HistoryWriteBuffer] = None
@@ -1968,6 +1972,10 @@ class HistoryTimescale(HistoryStorageInterface):
             # Сохраняем mapping node_id -> variable_id для быстрого доступа
             self._datachanges_period[node_id] = (period, count, variable_id)
 
+            if self.suppress_initial_datachange:
+                node_id_str = self._format_node_id(node_id)
+                self._pending_initial_datachange_skip[node_id_str] = True
+
             #self.logger.info(f"Variable node {node_id} registered for historization in unified table (variable_id: {variable_id})")
         except Exception as e:
             self.logger.error(f"Failed to register variable node {node_id}: {e}")
@@ -2027,6 +2035,17 @@ class HistoryTimescale(HistoryStorageInterface):
         #    node_id, getattr(datavalue, 'SourceTimestamp', None), getattr(datavalue, 'ServerTimestamp', None), getattr(datavalue, 'StatusCode', None),
         #)
 
+        node_id_str = self._format_node_id(node_id)
+
+        if self.suppress_initial_datachange:
+            # Подавляем первое уведомление после подписки, чтобы не перезаписывать данные из БД
+            if self._pending_initial_datachange_skip.pop(node_id_str, False):
+                self.logger.debug("save_node_value: suppressed initial datachange for %s", node_id_str)
+                return
+        else:
+            # Если подавление выключено, очищаем возможный накопленный флаг
+            self._pending_initial_datachange_skip.pop(node_id_str, None)
+
         try:
             # Получаем variable_id из mapping
             node_data = self._datachanges_period.get(node_id)
@@ -2046,7 +2065,6 @@ class HistoryTimescale(HistoryStorageInterface):
                     
             if variable_id is None:
                 # Если mapping не найден, пробуем получить variable_id из кэша по node_id_str
-                node_id_str = self._format_node_id(node_id)
                 cached_vid = self._variable_metadata_cache.get(node_id_str)
                 if cached_vid is not None:
                     self._cache_stats["variable_metadata_hits"] += 1
