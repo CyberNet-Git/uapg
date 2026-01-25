@@ -2040,7 +2040,7 @@ class HistoryTimescale(HistoryStorageInterface):
         if self.suppress_initial_datachange:
             # Подавляем первое уведомление после подписки, чтобы не перезаписывать данные из БД
             if self._pending_initial_datachange_skip.pop(node_id_str, False):
-                self.logger.debug("save_node_value: suppressed initial datachange for %s", node_id_str)
+                #self.logger.debug("save_node_value: suppressed initial datachange for %s", node_id_str)
                 return
         else:
             # Если подавление выключено, очищаем возможный накопленный флаг
