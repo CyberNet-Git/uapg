@@ -114,6 +114,8 @@ async def main():
         min_size=5,
         max_size=20,
         schema='public',  # Настраиваемая схема
+        # Глобальная глубина хранения (TimescaleDB retention policy) для таблиц *history
+        global_retention_period=timedelta(days=365),
         # Параметры батчевой записи
         history_write_batch_enabled=True,
         history_write_max_batch_size=500,
@@ -130,6 +132,16 @@ async def main():
     
     # Инициализация (создает таблицы и загружает кэши)
     await history.init()
+
+    # Если используете HistoryTimescale внутри asyncua Server — можно экспортировать настройки хранения
+    # в дерево OPC UA (read-only переменные под 0:Server/<idx:History>/<idx:HistorySettings>):
+    #
+    # from asyncua import Server
+    # server = Server()
+    # await server.init()
+    # idx = await server.register_namespace("http://example.com")
+    # server.iserver.history_manager.set_storage(history)
+    # await history.expose_history_settings_nodes(server, idx)
     
     # Настройка историзации узла
     node_id = ua.NodeId(1, "MyVariable")
@@ -341,6 +353,8 @@ HistoryTimescale автоматически создает TimescaleDB hypertabl
 - **Временное партиционирование** - По полю timestamp (sourcetimestamp для переменных, event_timestamp для событий)
 - **Пространственное партиционирование** - По variable_id или source_id (TimescaleDB 2+)
 - **Автоматическое определение версии** - Поддержка TimescaleDB 1.x и 2.x
+- **Глобальная ретенция** - Опциональная политика хранения через TimescaleDB `add_retention_policy` (параметр `global_retention_period`).
+  При изменении глобального периода в рантайме можно вызвать `reapply_global_retention_policy(...)`.
 
 ### Настраиваемая схема
 

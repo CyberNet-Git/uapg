@@ -11,6 +11,7 @@ import asyncio
 import random
 import logging
 import time
+import importlib.metadata as importlib_metadata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, List, Optional, Tuple, Union, Dict, Callable, Coroutine
@@ -429,6 +430,7 @@ class HistoryTimescale(HistoryStorageInterface):
         config_file: Optional[str] = None,
         encrypted_config: Optional[str] = None,
         master_password: Optional[str] = None,
+        global_retention_period: Optional[timedelta] = None,
         # Параметры оптимизации записи истории и кэшей
         history_write_batch_enabled: bool = True,
         history_write_max_batch_size: int = 500,
@@ -460,6 +462,8 @@ class HistoryTimescale(HistoryStorageInterface):
             config_file: Путь к файлу зашифрованной конфигурации
             encrypted_config: Зашифрованная конфигурация в виде строки
             master_password: Главный пароль для расшифровки конфигурации
+            global_retention_period: Глобальная максимальная глубина хранения (TimescaleDB retention policy) для таблиц *history.
+                Если None — глобальная политика не настраивается (поведение как раньше).
         """
         self.max_history_data_response_size = 1000
         self.logger = logging.getLogger('uapg.history_timescale')
@@ -482,6 +486,16 @@ class HistoryTimescale(HistoryStorageInterface):
         self._last_reconnect_outage_log_at = None
         self._failed_value_saves_counter = 0
         self._failed_event_saves_counter = 0
+
+        # Глобальная политика хранения на уровне hypertable (TimescaleDB).
+        # Используется как верхняя граница для per-node retention_period.
+        self._global_retention_period: Optional[timedelta] = global_retention_period
+
+        # OPC UA nodes для экспонирования текущих настроек хранения истории (только Timescale).
+        # Заполняется через expose_history_settings_nodes().
+        self._opcua_history_settings_nodes: Dict[str, Any] = {}
+        self._opcua_history_settings_namespace_index: Optional[int] = None
+        self._opcua_history_settings_parent: Any = None
 
         # Параметры оптимизации записи истории
         self._history_write_batch_enabled = history_write_batch_enabled
@@ -825,10 +839,155 @@ class HistoryTimescale(HistoryStorageInterface):
                 self._reconnect_task = asyncio.create_task(self._reconnect_monitor())
                 self.logger.info("Reconnect monitor started")
 
+            # Если OPC UA узлы настроек уже экспонированы — обновим их значениями
+            await self.refresh_history_settings_nodes()
+
             self.logger.info("HistoryTimescale initialized successfully")
         except Exception as e:
             self.logger.error(f"Failed to initialize HistoryTimescale: {e}")
             raise
+
+    async def expose_history_settings_nodes(
+        self,
+        server: Any,
+        namespace_index: int,
+        *,
+        parent: Any = None,
+    ) -> None:
+        """
+        Экспортирует read-only переменные с настройками хранения истории в адресное пространство OPC UA.
+
+        Размещение по умолчанию: под `0:Server` (внутри `0:Objects`).
+
+        Args:
+            server: экземпляр asyncua.Server
+            namespace_index: индекс namespace, в котором создавать пользовательские узлы
+            parent: опционально, явный родительский узел. Если не задан — используется `0:Server`.
+        """
+        if server is None:
+            raise ValueError("server is required")
+
+        idx = int(namespace_index)
+
+        async def _get_server_parent() -> Any:
+            if parent is not None:
+                return parent
+            # Пытаемся использовать server.nodes.server, если доступно
+            try:
+                srv_node = getattr(getattr(server, "nodes", None), "server", None)
+                if srv_node is not None:
+                    return srv_node
+            except Exception:
+                pass
+            # Fallback: ищем 0:Server под 0:Objects
+            return await server.nodes.objects.get_child(["0:Server"])
+
+        async def _get_or_add_object(parent_node: Any, name: str) -> Any:
+            qn = f"{idx}:{name}"
+            try:
+                return await parent_node.get_child([qn])
+            except Exception:
+                return await parent_node.add_object(idx, name)
+
+        async def _get_or_add_variable(parent_node: Any, name: str, initial_value: ua.Variant) -> Any:
+            qn = f"{idx}:{name}"
+            try:
+                return await parent_node.get_child([qn])
+            except Exception:
+                # В asyncua переменные по умолчанию read-only, поэтому set_writable() не вызываем
+                return await parent_node.add_variable(idx, name, initial_value)
+
+        server_parent = await _get_server_parent()
+        history_obj = await _get_or_add_object(server_parent, "History")
+        settings_obj = await _get_or_add_object(history_obj, "HistorySettings")
+
+        nodes: Dict[str, Any] = {}
+        nodes["UapgVersion"] = await _get_or_add_variable(
+            settings_obj, "UapgVersion", ua.Variant("unknown", ua.VariantType.String)
+        )
+        nodes["StorageType"] = await _get_or_add_variable(
+            settings_obj, "StorageType", ua.Variant("timescale", ua.VariantType.String)
+        )
+        nodes["Schema"] = await _get_or_add_variable(
+            settings_obj, "Schema", ua.Variant(str(self._schema), ua.VariantType.String)
+        )
+        nodes["GlobalRetentionSeconds"] = await _get_or_add_variable(
+            settings_obj, "GlobalRetentionSeconds", ua.Variant(-1, ua.VariantType.Int64)
+        )
+        nodes["WriteBatchEnabled"] = await _get_or_add_variable(
+            settings_obj, "WriteBatchEnabled", ua.Variant(bool(self._history_write_batch_enabled), ua.VariantType.Boolean)
+        )
+        nodes["WriteMaxBatchSize"] = await _get_or_add_variable(
+            settings_obj, "WriteMaxBatchSize", ua.Variant(int(self._history_write_max_batch_size), ua.VariantType.Int32)
+        )
+        nodes["WriteMaxBatchIntervalSec"] = await _get_or_add_variable(
+            settings_obj, "WriteMaxBatchIntervalSec", ua.Variant(float(self._history_write_max_batch_interval_sec), ua.VariantType.Double)
+        )
+        nodes["WriteQueueMaxSize"] = await _get_or_add_variable(
+            settings_obj, "WriteQueueMaxSize", ua.Variant(int(self._history_write_queue_max_size), ua.VariantType.Int32)
+        )
+        nodes["WriteDurabilityMode"] = await _get_or_add_variable(
+            settings_obj, "WriteDurabilityMode", ua.Variant(str(self._history_write_durability_mode), ua.VariantType.String)
+        )
+        nodes["WriteReadConsistencyMode"] = await _get_or_add_variable(
+            settings_obj, "WriteReadConsistencyMode", ua.Variant(str(self._history_write_read_consistency_mode), ua.VariantType.String)
+        )
+        nodes["TimescaleExtensionAvailable"] = await _get_or_add_variable(
+            settings_obj, "TimescaleExtensionAvailable", ua.Variant(False, ua.VariantType.Boolean)
+        )
+
+        self._opcua_history_settings_nodes = nodes
+        self._opcua_history_settings_namespace_index = idx
+        self._opcua_history_settings_parent = server_parent
+
+        await self.refresh_history_settings_nodes()
+
+    async def refresh_history_settings_nodes(self) -> None:
+        """
+        Обновляет значения OPC UA переменных (если они были экспонированы).
+
+        No-op если expose_history_settings_nodes() ещё не вызывался.
+        """
+        if not self._opcua_history_settings_nodes:
+            return
+
+        try:
+            try:
+                uapg_version = importlib_metadata.version("uapg")
+            except Exception:
+                uapg_version = "unknown"
+
+            retention = self._global_retention_period
+            retention_sec = int(retention.total_seconds()) if retention is not None else -1
+
+            ext_available = await self._timescaledb_available()
+
+            values: Dict[str, ua.Variant] = {
+                "UapgVersion": ua.Variant(str(uapg_version), ua.VariantType.String),
+                "StorageType": ua.Variant("timescale", ua.VariantType.String),
+                "Schema": ua.Variant(str(self._schema), ua.VariantType.String),
+                "GlobalRetentionSeconds": ua.Variant(retention_sec, ua.VariantType.Int64),
+                "WriteBatchEnabled": ua.Variant(bool(self._history_write_batch_enabled), ua.VariantType.Boolean),
+                "WriteMaxBatchSize": ua.Variant(int(self._history_write_max_batch_size), ua.VariantType.Int32),
+                "WriteMaxBatchIntervalSec": ua.Variant(float(self._history_write_max_batch_interval_sec), ua.VariantType.Double),
+                "WriteQueueMaxSize": ua.Variant(int(self._history_write_queue_max_size), ua.VariantType.Int32),
+                "WriteDurabilityMode": ua.Variant(str(self._history_write_durability_mode), ua.VariantType.String),
+                "WriteReadConsistencyMode": ua.Variant(str(self._history_write_read_consistency_mode), ua.VariantType.String),
+                "TimescaleExtensionAvailable": ua.Variant(bool(ext_available), ua.VariantType.Boolean),
+            }
+
+            for k, v in values.items():
+                node = self._opcua_history_settings_nodes.get(k)
+                if node is None:
+                    continue
+                try:
+                    await node.write_value(v)
+                except Exception:
+                    # Если узел удалён/недоступен — просто пропускаем обновление
+                    continue
+        except Exception:
+            # Никогда не ломаем основную функциональность истории из-за OPC UA витрины настроек
+            return
 
     def _build_pool_params(self) -> dict:
         pool_params = {
@@ -1394,6 +1553,9 @@ class HistoryTimescale(HistoryStorageInterface):
             # Настраиваем TimescaleDB hypertables после создания всех индексов
             await self._setup_timescale_hypertable(f'{self._schema}.variables_history', 'sourcetimestamp', 'variable_id', 128)
             await self._setup_timescale_hypertable(f'{self._schema}.events_history', 'event_timestamp', 'source_id', 64)
+
+            # Настраиваем глобальную retention policy (если задана)
+            await self._ensure_global_retention_policies()
         except Exception as e:
             self.logger.error(f"Failed to create unified history tables: {e}")
             raise
@@ -1441,6 +1603,152 @@ class HistoryTimescale(HistoryStorageInterface):
         except Exception as e:
             self.logger.warning(f"Failed to create TimescaleDB hypertable for table {table}: {e}")
             self.logger.info("Continuing with regular table (without TimescaleDB optimization)")
+
+    def _get_effective_retention_period(self, requested: Optional[timedelta]) -> Optional[timedelta]:
+        """
+        Вычисляет эффективный retention_period для узла/источника событий.
+
+        Правило:
+        - если глобальный период не задан — используем requested как есть;
+        - если глобальный задан:
+          - requested is None или requested >= global → используем global;
+          - иначе → используем requested.
+        """
+        global_period = self._global_retention_period
+        if global_period is None:
+            return requested
+        if requested is None:
+            return global_period
+        try:
+            return requested if requested < global_period else global_period
+        except Exception:
+            # На всякий случай (если прилетел неожиданный тип)
+            return global_period
+
+    async def _timescaledb_available(self) -> bool:
+        """True если расширение TimescaleDB установлено в текущей БД."""
+        try:
+            extension_check = await self._fetchval("SELECT COUNT(*) FROM pg_extension WHERE extname = 'timescaledb'")
+            return bool(extension_check and int(extension_check) > 0)
+        except Exception:
+            return False
+
+    async def _setup_retention_policy(self, table_name: str, drop_after: timedelta) -> None:
+        """
+        Идемпотентно обеспечивает наличие TimescaleDB retention policy для hypertable.
+
+        Args:
+            table_name: имя таблицы без схемы (например, 'variables_history')
+            drop_after: interval хранения (chunks старше now()-drop_after будут удаляться)
+        """
+        if drop_after is None:
+            return
+        if drop_after.total_seconds() <= 0:
+            self.logger.warning(f"Global retention period must be >0, got {drop_after}. Skipping policy setup.")
+            return
+
+        if not await self._timescaledb_available():
+            # Нет Timescale — ничего не делаем
+            return
+
+        drop_after_seconds = int(drop_after.total_seconds())
+        try:
+            await self._execute(
+                "SELECT add_retention_policy("
+                "  format('%I.%I', $1::text, $2::text)::regclass, "
+                "  drop_after => make_interval(secs => $3::integer), "
+                "  if_not_exists => TRUE"
+                ")",
+                self._schema,
+                table_name,
+                drop_after_seconds,
+            )
+            self.logger.info(
+                f"Retention policy ensured for {self._schema}.{table_name}: drop_after={drop_after_seconds}s"
+            )
+        except Exception as e:
+            # Не критично для работы — предупреждаем и продолжаем
+            self.logger.warning(f"Failed to ensure retention policy for {self._schema}.{table_name}: {e}")
+
+    async def _ensure_global_retention_policies(self) -> None:
+        """Настраивает глобальную retention policy для таблиц *history (если задано)."""
+        if self._global_retention_period is None:
+            return
+        await self._setup_retention_policy("variables_history", self._global_retention_period)
+        await self._setup_retention_policy("events_history", self._global_retention_period)
+
+    async def reapply_global_retention_policy(
+        self,
+        period: Optional[timedelta] = None,
+        *,
+        drop_immediately: bool = False,
+    ) -> None:
+        """
+        Принудительная переустановка глобальной retention policy для hypertables.
+
+        Использование:
+        - вызвать после `await init()`
+        - при смене `global_retention_period` в рантайме, чтобы обновить Timescale policy без перезапуска
+
+        Args:
+            period: новый глобальный период. Если None — используется текущий self._global_retention_period.
+                Если итоговый период None — политика будет удалена (глобальный лимит отключён).
+            drop_immediately: если True и период задан — выполнить разовый drop_chunks, чтобы
+                уменьшение retention применилось сразу (а не по расписанию фоновой job).
+        """
+        await self._ensure_pool()
+
+        if not await self._timescaledb_available():
+            self.logger.warning("TimescaleDB extension not found. Cannot (re)apply retention policies.")
+            return
+
+        if period is not None:
+            self._global_retention_period = period
+
+        effective = self._global_retention_period
+
+        async def _remove(table: str) -> None:
+            await self._execute(
+                "SELECT remove_retention_policy(format('%I.%I', $1::text, $2::text)::regclass, if_exists => TRUE)",
+                self._schema,
+                table,
+            )
+
+        async def _add(table: str, td: timedelta) -> None:
+            secs = int(td.total_seconds())
+            await self._execute(
+                "SELECT add_retention_policy("
+                "  format('%I.%I', $1::text, $2::text)::regclass, "
+                "  drop_after => make_interval(secs => $3::integer), "
+                "  if_not_exists => FALSE"
+                ")",
+                self._schema,
+                table,
+                secs,
+            )
+            if drop_immediately:
+                await self._execute(
+                    "SELECT drop_chunks("
+                    "  format('%I.%I', $1::text, $2::text)::regclass, "
+                    "  older_than => make_interval(secs => $3::integer)"
+                    ")",
+                    self._schema,
+                    table,
+                    secs,
+                )
+
+        for t in ("variables_history", "events_history"):
+            try:
+                await _remove(t)
+                if effective is not None:
+                    if effective.total_seconds() <= 0:
+                        raise ValueError(f"Global retention period must be >0, got {effective}")
+                    await _add(t, effective)
+            except Exception as e:
+                self.logger.warning(f"Failed to reapply retention policy for {self._schema}.{t}: {e}")
+
+        # Обновим OPC UA витрину настроек, если она включена
+        await self.refresh_history_settings_nodes()
 
     async def _flush_variable_batch(self, items: List[VariableWriteItem]) -> None:
         """
@@ -1506,6 +1814,10 @@ class HistoryTimescale(HistoryStorageInterface):
                             last_value_params,
                         )
 
+                        # Применяем retention (period/max_records) и в батч-режиме
+                        # (иначе per-variable retention не работает при history_write_batch_enabled=True)
+                        await self._apply_variable_retention_policies(conn, [it.variable_id for it in items])
+
                 # Успешная запись батча — считаем, что соединение восстановлено
                 self._log_connection_restored_if_needed()
 
@@ -1520,6 +1832,83 @@ class HistoryTimescale(HistoryStorageInterface):
                 else:
                     self.logger.error(f"Flush variable batch failed after reconnect: {e}")
                     raise
+
+    async def _apply_variable_retention_policies(self, conn: asyncpg.Connection, variable_ids: List[int]) -> None:
+        """
+        Применяет политику очистки variables_history по retention_period и max_records
+        для набора variable_id.
+
+        Важно: рассчитано на вызов внутри транзакции после вставки данных.
+        """
+        if not variable_ids:
+            return
+
+        uniq_ids = sorted({int(v) for v in variable_ids if v is not None})
+        if not uniq_ids:
+            return
+
+        try:
+            rows = await conn.fetch(
+                f'''
+                SELECT variable_id, retention_period, max_records
+                FROM "{self._schema}".variable_metadata
+                WHERE variable_id = ANY($1::bigint[])
+                ''',
+                uniq_ids,
+            )
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch variable retention metadata for batch: {e}")
+            return
+
+        # Группируем по retention_period, чтобы не делать DELETE для каждого variable_id
+        retention_groups: Dict[Optional[timedelta], List[int]] = {}
+        max_records_map: Dict[int, int] = {}
+        for r in rows:
+            vid = int(r["variable_id"])
+            rp = r["retention_period"]
+            mr = r["max_records"]
+            retention_groups.setdefault(rp, []).append(vid)
+            if mr is not None:
+                try:
+                    mr_int = int(mr)
+                except Exception:
+                    mr_int = 0
+                if mr_int > 0:
+                    max_records_map[vid] = mr_int
+
+        # Удаляем старые записи по retention_period (одним DELETE на группу)
+        for rp, vids in retention_groups.items():
+            if not rp:
+                continue
+            try:
+                await conn.execute(
+                    f'''
+                    DELETE FROM "{self._schema}".variables_history
+                    WHERE variable_id = ANY($1::bigint[]) AND sourcetimestamp < (NOW() - $2::interval)
+                    ''',
+                    vids,
+                    rp,
+                )
+            except Exception as e:
+                self.logger.warning(f"Retention DELETE by period failed for {len(vids)} variables: {e}")
+
+        # Удаляем лишние записи по max_records (пока делаем по одному variable_id)
+        for vid, mr in max_records_map.items():
+            try:
+                await conn.execute(
+                    f'''
+                    DELETE FROM "{self._schema}".variables_history
+                    WHERE variable_id = $1 AND id NOT IN (
+                        SELECT id FROM "{self._schema}".variables_history
+                        WHERE variable_id = $1
+                        ORDER BY sourcetimestamp DESC LIMIT $2
+                    )
+                    ''',
+                    vid,
+                    mr,
+                )
+            except Exception as e:
+                self.logger.warning(f"Retention DELETE by max_records failed for variable_id={vid}: {e}")
 
     async def _flush_event_batch(self, items: List[EventWriteItem]) -> None:
         """
@@ -1580,6 +1969,9 @@ class HistoryTimescale(HistoryStorageInterface):
         # При регистрации переменной тип данных пока неизвестен
         # Будет обновлен при первом сохранении значения
         data_type = "Unknown"
+
+        # Приводим период хранения к глобальному максимуму (если задан)
+        period = self._get_effective_retention_period(period)
         
         result = await self._fetchval(f'''
             INSERT INTO "{self._schema}".variable_metadata (node_id, data_type, retention_period, max_records)
@@ -1619,6 +2011,9 @@ class HistoryTimescale(HistoryStorageInterface):
             int: source_id для использования в таблице истории
         """
         source_node_id_str = self._format_node_id(source_id)
+
+        # Приводим период хранения к глобальному максимуму (если задан)
+        period = self._get_effective_retention_period(period)
         
         result = await self._fetchval(f'''
             INSERT INTO "{self._schema}".event_sources (source_node_id, retention_period, max_records)
@@ -1966,11 +2361,12 @@ class HistoryTimescale(HistoryStorageInterface):
         #self.logger.debug("new_historized_node: node_id=%s period=%s count=%s",node_id, period, count,)
 
         try:
+            effective_period = self._get_effective_retention_period(period)
             # Сохраняем метаданные переменной и получаем variable_id
-            variable_id = await self._save_variable_metadata(node_id, period, count)
+            variable_id = await self._save_variable_metadata(node_id, effective_period, count)
 
             # Сохраняем mapping node_id -> variable_id для быстрого доступа
-            self._datachanges_period[node_id] = (period, count, variable_id)
+            self._datachanges_period[node_id] = (effective_period, count, variable_id)
 
             if self.suppress_initial_datachange:
                 node_id_str = self._format_node_id(node_id)
@@ -2004,6 +2400,7 @@ class HistoryTimescale(HistoryStorageInterface):
         )
 
         try:
+            effective_period = self._get_effective_retention_period(period)
             # Получаем поля событий
             ev_fields = await self._get_event_fields(evtypes)
             self._event_fields[source_id] = ev_fields
@@ -2011,11 +2408,11 @@ class HistoryTimescale(HistoryStorageInterface):
             # Сохраняем метаданные для каждого типа события и получаем IDs
             event_ids = {}
             for event_type in evtypes:
-                source_db_id, event_db_id = await self._save_event_metadata(event_type, source_id, ev_fields, period, count)
+                source_db_id, event_db_id = await self._save_event_metadata(event_type, source_id, ev_fields, effective_period, count)
                 event_ids[event_type] = (source_db_id, event_db_id)
 
             # Сохраняем mapping source_id -> (period, count, source_db_id, event_ids)
-            self._datachanges_period[source_id] = (period, count, source_db_id, event_ids)
+            self._datachanges_period[source_id] = (effective_period, count, source_db_id, event_ids)
 
             self.logger.info(f"Event source {source_id} registered for historization in unified table (source_id: {source_db_id})")
         except Exception as e:
@@ -2064,26 +2461,33 @@ class HistoryTimescale(HistoryStorageInterface):
                     return
                     
             if variable_id is None:
-                # Если mapping не найден, пробуем получить variable_id из кэша по node_id_str
+                # Если mapping не найден, пробуем получить метаданные из кэша/БД
                 cached_vid = self._variable_metadata_cache.get(node_id_str)
                 if cached_vid is not None:
                     self._cache_stats["variable_metadata_hits"] += 1
-                    variable_id = cached_vid
                 else:
                     self._cache_stats["variable_metadata_misses"] += 1
-                    # Если в кэше нет, пробуем получить из базы данных
-                    variable_id = await self._fetchval(f'''
-                        SELECT variable_id FROM "{self._schema}".variable_metadata
-                        WHERE node_id = $1
-                        LIMIT 1
-                    ''', node_id_str)
 
-                if variable_id is None:
-                    # Если метаданные не найдены, создаем их
-                    variable_id = await self._save_variable_metadata(node_id, None, 0)
+                meta_row = await self._fetchrow(f'''
+                    SELECT variable_id, retention_period, max_records
+                    FROM "{self._schema}".variable_metadata
+                    WHERE node_id = $1
+                    LIMIT 1
+                ''', node_id_str)
+
+                if meta_row is not None:
+                    variable_id = int(meta_row["variable_id"])
+                    period = meta_row["retention_period"]
+                    count = int(meta_row["max_records"] or 0)
+                else:
+                    # Если метаданные не найдены, создаем их (с учетом глобального retention)
+                    effective_period = self._get_effective_retention_period(None)
+                    variable_id = await self._save_variable_metadata(node_id, effective_period, 0)
+                    period = effective_period
+                    count = 0
 
                 # Обновляем in-memory mapping и кэш метаданных
-                self._datachanges_period[node_id] = (None, 0, variable_id)
+                self._datachanges_period[node_id] = (period, count, variable_id)
                 self._variable_metadata_cache[node_id_str] = variable_id
 
             # Подготовка данных для записи
