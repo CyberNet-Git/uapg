@@ -2924,7 +2924,19 @@ class HistoryTimescale(HistoryStorageInterface):
                     #results.append(Event(**values))
 
             # Применяем EventFilter для фильтрации событий
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "read_event_history: applying event filter %s to %d events",
+                    "present" if evfilter else "absent",
+                    len(results),
+                )
             results = apply_event_filter(results, evfilter)
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "read_event_history: after filter %d events (from %d)",
+                    len(results),
+                    len(rows),
+                )
 
             # Определяем время продолжения
             cont = None

@@ -14,6 +14,8 @@ from asyncua import ua
 from asyncua.common.events import Event
 
 _logger = logging.getLogger(__name__)
+# Отдельный логгер для трассировки фильтрации событий истории
+_trace_logger = logging.getLogger("history_timescale.events")
 
 
 class EventFilterEvaluator:
@@ -44,6 +46,8 @@ class EventFilterEvaluator:
         """
         # Если нет WhereClause, то все события проходят фильтр
         if not self.where_clause or not self.where_clause.Elements:
+            if _trace_logger.isEnabledFor(logging.DEBUG):
+                _trace_logger.debug("EventFilterEvaluator.matches: no WhereClause, event passes by default")
             return True
             
         try:
@@ -65,10 +69,15 @@ class EventFilterEvaluator:
             Результат оценки фильтра
         """
         if not content_filter.Elements:
+            if _trace_logger.isEnabledFor(logging.DEBUG):
+                _trace_logger.debug("EventFilterEvaluator._evaluate_content_filter: empty ContentFilter, event passes")
             return True
             
         # Оцениваем первый элемент фильтра (обычно это корневой элемент)
-        return self._evaluate_filter_element(event, content_filter.Elements[0], content_filter)
+        result = self._evaluate_filter_element(event, content_filter.Elements[0], content_filter)
+        if _trace_logger.isEnabledFor(logging.DEBUG):
+            _trace_logger.debug("EventFilterEvaluator._evaluate_content_filter: root element result=%s", result)
+        return result
     
     def _evaluate_filter_element(
         self, 
@@ -98,34 +107,48 @@ class EventFilterEvaluator:
             else:
                 unpacked_operands.append(operand_ext)
         
+        if _trace_logger.isEnabledFor(logging.DEBUG):
+            _trace_logger.debug(
+                "EventFilterEvaluator._evaluate_filter_element: operator=%s, operands=%d",
+                operator, len(unpacked_operands)
+            )
+        
         # Обрабатываем различные операторы
+        result: bool
         if operator == ua.FilterOperator.Equals:
-            return self._evaluate_equals(event, unpacked_operands)
+            result = self._evaluate_equals(event, unpacked_operands)
         elif operator == ua.FilterOperator.GreaterThan:
-            return self._evaluate_greater_than(event, unpacked_operands)
+            result = self._evaluate_greater_than(event, unpacked_operands)
         elif operator == ua.FilterOperator.LessThan:
-            return self._evaluate_less_than(event, unpacked_operands)
+            result = self._evaluate_less_than(event, unpacked_operands)
         elif operator == ua.FilterOperator.GreaterThanOrEqual:
-            return self._evaluate_greater_than_or_equal(event, unpacked_operands)
+            result = self._evaluate_greater_than_or_equal(event, unpacked_operands)
         elif operator == ua.FilterOperator.LessThanOrEqual:
-            return self._evaluate_less_than_or_equal(event, unpacked_operands)
+            result = self._evaluate_less_than_or_equal(event, unpacked_operands)
         elif operator == ua.FilterOperator.InList:
-            return self._evaluate_in_list(event, unpacked_operands)
+            result = self._evaluate_in_list(event, unpacked_operands)
         elif operator == ua.FilterOperator.And:
-            return self._evaluate_and(event, unpacked_operands, content_filter)
+            result = self._evaluate_and(event, unpacked_operands, content_filter)
         elif operator == ua.FilterOperator.Or:
-            return self._evaluate_or(event, unpacked_operands, content_filter)
+            result = self._evaluate_or(event, unpacked_operands, content_filter)
         elif operator == ua.FilterOperator.Not:
-            return self._evaluate_not(event, unpacked_operands, content_filter)
+            result = self._evaluate_not(event, unpacked_operands, content_filter)
         elif operator == ua.FilterOperator.IsNull:
-            return self._evaluate_is_null(event, unpacked_operands)
+            result = self._evaluate_is_null(event, unpacked_operands)
         elif operator == ua.FilterOperator.Like:
-            return self._evaluate_like(event, unpacked_operands)
+            result = self._evaluate_like(event, unpacked_operands)
         elif operator == ua.FilterOperator.Between:
-            return self._evaluate_between(event, unpacked_operands)
+            result = self._evaluate_between(event, unpacked_operands)
         else:
             _logger.warning(f"Неподдерживаемый оператор фильтра: {operator}")
-            return True
+            result = True
+
+        if _trace_logger.isEnabledFor(logging.DEBUG):
+            _trace_logger.debug(
+                "EventFilterEvaluator._evaluate_filter_element: operator=%s result=%s",
+                operator, result
+            )
+        return result
     
     def _get_operand_value(self, event: Event, operand: Any) -> Any:
         """
@@ -412,21 +435,80 @@ def apply_event_filter(events: List[Event], evfilter: Optional[ua.EventFilter]) 
         Отфильтрованный список событий
     """
     if not evfilter or not evfilter.WhereClause or not evfilter.WhereClause.Elements:
+        if _trace_logger.isEnabledFor(logging.DEBUG):
+            _trace_logger.debug(
+                "apply_event_filter: no WhereClause, returning all events (count=%d)",
+                len(events),
+            )
         return events
     
+    input_count = len(events)
+    if _trace_logger.isEnabledFor(logging.DEBUG):
+        # Краткое описание структуры фильтра
+        where = evfilter.WhereClause
+        select_count = len(evfilter.SelectClauses or [])
+        elements_count = len(where.Elements or []) if where else 0
+        _trace_logger.debug(
+            "apply_event_filter: input_count=%d, select_clauses=%d, where_elements=%d",
+            input_count,
+            select_count,
+            elements_count,
+        )
+        if where and where.Elements:
+            for idx, el in enumerate(where.Elements):
+                operand_kinds = []
+                for op_ext in el.FilterOperands:
+                    body = op_ext.Body if isinstance(op_ext, ua.ExtensionObject) else op_ext
+                    if isinstance(body, ua.SimpleAttributeOperand):
+                        path = "/".join(qn.Name for qn in (body.BrowsePath or []))
+                        operand_kinds.append(f"Attr({path})")
+                    elif isinstance(body, ua.LiteralOperand):
+                        v = body.Value.Value if body.Value else None
+                        v_str = str(v)
+                        if len(v_str) > 64:
+                            v_str = v_str[:61] + "..."
+                        operand_kinds.append(f"Literal({v_str})")
+                    elif isinstance(body, ua.ElementOperand):
+                        operand_kinds.append(f"Element(idx={body.Index})")
+                    else:
+                        operand_kinds.append(type(body).__name__)
+                _trace_logger.debug(
+                    "apply_event_filter: element[%d] operator=%s operands=%s",
+                    idx,
+                    el.FilterOperator,
+                    ", ".join(operand_kinds),
+                )
+    
     evaluator = EventFilterEvaluator(evfilter)
-    filtered_events = []
+    filtered_events: List[Event] = []
     
     for event in events:
         try:
-            if evaluator.matches(event):
+            match = evaluator.matches(event)
+            if match:
                 filtered_events.append(event)
+            if _trace_logger.isEnabledFor(logging.DEBUG):
+                # Пытаемся вывести краткое описание события
+                time_val = getattr(event, "Time", None) or getattr(event, "EventTime", None)
+                etype = getattr(event, "EventType", None)
+                _trace_logger.debug(
+                    "apply_event_filter: event time=%s type=%s matched=%s",
+                    time_val,
+                    etype,
+                    match,
+                )
         except Exception as e:
             _logger.warning(f"Ошибка при фильтрации события: {e}")
             # В случае ошибки можно либо пропустить событие, либо включить его
             # Здесь мы пропускаем событие с ошибкой
             continue
     
+    if _trace_logger.isEnabledFor(logging.DEBUG):
+        _trace_logger.debug(
+            "apply_event_filter: finished, input_count=%d, passed=%d",
+            input_count,
+            len(filtered_events),
+        )
     return filtered_events
 
 
