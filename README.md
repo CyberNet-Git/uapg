@@ -2,7 +2,7 @@
 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-0.1.0--alpha.3-orange.svg)](https://github.com/CyberNet-Git/uapg)
+[![Version](https://img.shields.io/badge/version-0.1.15-orange.svg)](https://github.com/CyberNet-Git/uapg)
 
 UAPG - это модуль для хранения исторических данных OPC UA в PostgreSQL с поддержкой TimescaleDB для эффективной работы с временными рядами. 
 
