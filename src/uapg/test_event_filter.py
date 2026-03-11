@@ -268,6 +268,70 @@ class TestEventFilterComplex(unittest.TestCase):
         self.event.SourceNode = ua.NodeId(1234, 2)
         self.event.EventType = ua.NodeId(ua.ObjectIds.AlarmConditionType)
 
+    def test_root_as_last_element_and(self):
+        """
+        Фильтр, где корневой элемент (And) находится в последнем элементе массива Elements.
+        
+        Elements[0]: Severity > 500
+        Elements[1]: EventType InList [AlarmConditionType]
+        Elements[2]: And(Element(0), Element(1))  <-- корень
+        """
+        evfilter = ua.EventFilter()
+
+        # SelectClauses (не критично для matches, но добавим для полноты)
+        op = ua.SimpleAttributeOperand()
+        op.AttributeId = ua.AttributeIds.Value
+        op.BrowsePath = [ua.QualifiedName("Severity", 0)]
+        op.TypeDefinitionId = ua.NodeId(ua.ObjectIds.BaseEventType)
+        evfilter.SelectClauses.append(op)
+
+        cf = ua.ContentFilter()
+
+        # Element 0: Severity > 500
+        el0 = ua.ContentFilterElement()
+        sev_operand = ua.SimpleAttributeOperand()
+        sev_operand.BrowsePath = [ua.QualifiedName("Severity", 0)]
+        sev_operand.AttributeId = ua.AttributeIds.Value
+        sev_operand.TypeDefinitionId = ua.NodeId(ua.ObjectIds.BaseEventType)
+        el0.FilterOperands.append(ua.ExtensionObject(Body=sev_operand))
+        el0.FilterOperands.append(
+            ua.ExtensionObject(Body=ua.LiteralOperand(Value=ua.Variant(500, ua.VariantType.UInt16)))
+        )
+        el0.FilterOperator = ua.FilterOperator.GreaterThan
+        cf.Elements.append(el0)
+
+        # Element 1: EventType InList [AlarmConditionType]
+        el1 = ua.ContentFilterElement()
+        etype_operand = ua.SimpleAttributeOperand()
+        etype_operand.BrowsePath = [ua.QualifiedName("EventType", 0)]
+        etype_operand.AttributeId = ua.AttributeIds.Value
+        etype_operand.TypeDefinitionId = ua.NodeId(ua.ObjectIds.BaseEventType)
+        el1.FilterOperands.append(ua.ExtensionObject(Body=etype_operand))
+        el1.FilterOperands.append(
+            ua.ExtensionObject(
+                Body=ua.LiteralOperand(
+                    Value=ua.Variant(
+                        ua.NodeId(ua.ObjectIds.AlarmConditionType),
+                        ua.VariantType.NodeId,
+                    )
+                )
+            )
+        )
+        el1.FilterOperator = ua.FilterOperator.InList
+        cf.Elements.append(el1)
+
+        # Element 2: And(ElementOperand(0), ElementOperand(1)) - корень
+        el2 = ua.ContentFilterElement()
+        el2.FilterOperator = ua.FilterOperator.And
+        el2.FilterOperands.append(ua.ExtensionObject(Body=ua.ElementOperand(Index=0)))
+        el2.FilterOperands.append(ua.ExtensionObject(Body=ua.ElementOperand(Index=1)))
+        cf.Elements.append(el2)
+
+        evfilter.WhereClause = cf
+
+        evaluator = EventFilterEvaluator(evfilter)
+        self.assertTrue(evaluator.matches(self.event))
+
 
 def run_tests():
     """Запуск всех тестов."""

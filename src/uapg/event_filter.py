@@ -7,7 +7,7 @@
 3. По значениям свойств события
 """
 
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Set
 import logging
 import re
 from asyncua import ua
@@ -68,22 +68,45 @@ class EventFilterEvaluator:
         Returns:
             Результат оценки фильтра
         """
-        if not content_filter.Elements:
+        elements = content_filter.Elements or []
+        if not elements:
             if _trace_logger.isEnabledFor(logging.DEBUG):
-                _trace_logger.debug("EventFilterEvaluator._evaluate_content_filter: empty ContentFilter, event passes")
+                _trace_logger.debug(
+                    "EventFilterEvaluator._evaluate_content_filter: empty ContentFilter, event passes"
+                )
             return True
-            
-        # Оцениваем первый элемент фильтра (обычно это корневой элемент)
-        result = self._evaluate_filter_element(event, content_filter.Elements[0], content_filter)
+
+        # Согласно типичному паттерну OPC UA корневым элементом считаем последний
+        root_index = len(elements) - 1
+        visited: Set[int] = set()
         if _trace_logger.isEnabledFor(logging.DEBUG):
-            _trace_logger.debug("EventFilterEvaluator._evaluate_content_filter: root element result=%s", result)
+            _trace_logger.debug(
+                "EventFilterEvaluator._evaluate_content_filter: using root_index=%d of %d elements",
+                root_index,
+                len(elements),
+            )
+        result = self._evaluate_filter_element(
+            event,
+            elements[root_index],
+            content_filter,
+            visited_indices=visited,
+            element_index=root_index,
+        )
+        if _trace_logger.isEnabledFor(logging.DEBUG):
+            _trace_logger.debug(
+                "EventFilterEvaluator._evaluate_content_filter: root element index=%d result=%s",
+                root_index,
+                result,
+            )
         return result
     
     def _evaluate_filter_element(
-        self, 
-        event: Event, 
+        self,
+        event: Event,
         element: ua.ContentFilterElement,
-        content_filter: ua.ContentFilter
+        content_filter: ua.ContentFilter,
+        visited_indices: Optional[Set[int]] = None,
+        element_index: Optional[int] = None,
     ) -> bool:
         """
         Оценивает один элемент ContentFilterElement.
@@ -92,10 +115,20 @@ class EventFilterEvaluator:
             event: Событие для оценки
             element: Элемент фильтра
             content_filter: Полный ContentFilter (для доступа к другим элементам)
+            visited_indices: Набор уже посещённых индексов элементов (для защиты от циклов)
+            element_index: Индекс текущего элемента в content_filter.Elements (если известен)
             
         Returns:
             Результат оценки элемента
         """
+        if visited_indices is not None and element_index is not None:
+            if element_index in visited_indices:
+                _logger.warning(
+                    "Обнаружен потенциальный цикл в ContentFilter: повторная оценка элемента с index=%d",
+                    element_index,
+                )
+                return False
+            visited_indices.add(element_index)
         operator = element.FilterOperator
         operands = element.FilterOperands
         
@@ -109,8 +142,10 @@ class EventFilterEvaluator:
         
         if _trace_logger.isEnabledFor(logging.DEBUG):
             _trace_logger.debug(
-                "EventFilterEvaluator._evaluate_filter_element: operator=%s, operands=%d",
-                operator, len(unpacked_operands)
+                "EventFilterEvaluator._evaluate_filter_element: index=%s operator=%s operands=%d",
+                element_index,
+                operator,
+                len(unpacked_operands),
             )
         
         # Обрабатываем различные операторы
@@ -128,11 +163,11 @@ class EventFilterEvaluator:
         elif operator == ua.FilterOperator.InList:
             result = self._evaluate_in_list(event, unpacked_operands)
         elif operator == ua.FilterOperator.And:
-            result = self._evaluate_and(event, unpacked_operands, content_filter)
+            result = self._evaluate_and(event, unpacked_operands, content_filter, visited_indices)
         elif operator == ua.FilterOperator.Or:
-            result = self._evaluate_or(event, unpacked_operands, content_filter)
+            result = self._evaluate_or(event, unpacked_operands, content_filter, visited_indices)
         elif operator == ua.FilterOperator.Not:
-            result = self._evaluate_not(event, unpacked_operands, content_filter)
+            result = self._evaluate_not(event, unpacked_operands, content_filter, visited_indices)
         elif operator == ua.FilterOperator.IsNull:
             result = self._evaluate_is_null(event, unpacked_operands)
         elif operator == ua.FilterOperator.Like:
@@ -145,8 +180,10 @@ class EventFilterEvaluator:
 
         if _trace_logger.isEnabledFor(logging.DEBUG):
             _trace_logger.debug(
-                "EventFilterEvaluator._evaluate_filter_element: operator=%s result=%s",
-                operator, result
+                "EventFilterEvaluator._evaluate_filter_element: index=%s operator=%s result=%s",
+                element_index,
+                operator,
+                result,
             )
         return result
     
@@ -324,34 +361,76 @@ class EventFilterEvaluator:
     
     # Логические операторы
     
-    def _evaluate_and(self, event: Event, operands: List[Any], content_filter: ua.ContentFilter) -> bool:
+    def _evaluate_and(
+        self,
+        event: Event,
+        operands: List[Any],
+        content_filter: ua.ContentFilter,
+        visited_indices: Optional[Set[int]] = None,
+    ) -> bool:
         """Оценивает оператор And."""
         # Все операнды должны быть ElementOperand
         for operand in operands:
             if isinstance(operand, ua.ElementOperand):
                 element_index = operand.Index
-                if element_index < len(content_filter.Elements):
-                    if not self._evaluate_filter_element(event, content_filter.Elements[element_index], content_filter):
-                        return False
+                if element_index < 0 or element_index >= len(content_filter.Elements):
+                    _logger.warning(
+                        "And оператор: некорректный индекс элемента ContentFilter (index=%d, size=%d)",
+                        element_index,
+                        len(content_filter.Elements),
+                    )
+                    return False
+                if not self._evaluate_filter_element(
+                    event,
+                    content_filter.Elements[element_index],
+                    content_filter,
+                    visited_indices=visited_indices,
+                    element_index=element_index,
+                ):
+                    return False
             else:
                 _logger.warning(f"And оператор ожидает ElementOperand, получен {type(operand)}")
                 return False
         return True
     
-    def _evaluate_or(self, event: Event, operands: List[Any], content_filter: ua.ContentFilter) -> bool:
+    def _evaluate_or(
+        self,
+        event: Event,
+        operands: List[Any],
+        content_filter: ua.ContentFilter,
+        visited_indices: Optional[Set[int]] = None,
+    ) -> bool:
         """Оценивает оператор Or."""
         # Хотя бы один операнд должен быть истинным
         for operand in operands:
             if isinstance(operand, ua.ElementOperand):
                 element_index = operand.Index
-                if element_index < len(content_filter.Elements):
-                    if self._evaluate_filter_element(event, content_filter.Elements[element_index], content_filter):
-                        return True
+                if element_index < 0 or element_index >= len(content_filter.Elements):
+                    _logger.warning(
+                        "Or оператор: некорректный индекс элемента ContentFilter (index=%d, size=%d)",
+                        element_index,
+                        len(content_filter.Elements),
+                    )
+                    continue
+                if self._evaluate_filter_element(
+                    event,
+                    content_filter.Elements[element_index],
+                    content_filter,
+                    visited_indices=visited_indices,
+                    element_index=element_index,
+                ):
+                    return True
             else:
                 _logger.warning(f"Or оператор ожидает ElementOperand, получен {type(operand)}")
         return False
     
-    def _evaluate_not(self, event: Event, operands: List[Any], content_filter: ua.ContentFilter) -> bool:
+    def _evaluate_not(
+        self,
+        event: Event,
+        operands: List[Any],
+        content_filter: ua.ContentFilter,
+        visited_indices: Optional[Set[int]] = None,
+    ) -> bool:
         """Оценивает оператор Not."""
         if len(operands) != 1:
             return False
@@ -359,9 +438,22 @@ class EventFilterEvaluator:
         operand = operands[0]
         if isinstance(operand, ua.ElementOperand):
             element_index = operand.Index
-            if element_index < len(content_filter.Elements):
-                return not self._evaluate_filter_element(event, content_filter.Elements[element_index], content_filter)
+            if element_index < 0 or element_index >= len(content_filter.Elements):
+                _logger.warning(
+                    "Not оператор: некорректный индекс элемента ContentFilter (index=%d, size=%d)",
+                    element_index,
+                    len(content_filter.Elements),
+                )
+                return False
+            return not self._evaluate_filter_element(
+                event,
+                content_filter.Elements[element_index],
+                content_filter,
+                visited_indices=visited_indices,
+                element_index=element_index,
+            )
         
+        _logger.warning(f"Not оператор ожидает ElementOperand, получен {type(operand)}")
         return False
     
     def _evaluate_is_null(self, event: Event, operands: List[Any]) -> bool:
