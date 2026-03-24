@@ -497,6 +497,11 @@ class HistoryTimescale(HistoryStorageInterface):
         self._opcua_history_settings_namespace_index: Optional[int] = None
         self._opcua_history_settings_parent: Any = None
 
+        # Защита от перегрузки lock manager при cleanup в батч-режиме:
+        # не выполнять retention DELETE для одного variable_id слишком часто.
+        self._retention_cleanup_min_interval_sec = 30.0
+        self._retention_cleanup_last_run_by_vid: Dict[int, float] = {}
+
         # Параметры оптимизации записи истории
         self._history_write_batch_enabled = history_write_batch_enabled
         self._history_write_max_batch_size = int(history_write_max_batch_size)
@@ -1814,12 +1819,12 @@ class HistoryTimescale(HistoryStorageInterface):
                             last_value_params,
                         )
 
-                        # Применяем retention (period/max_records) и в батч-режиме
-                        # (иначе per-variable retention не работает при history_write_batch_enabled=True)
-                        await self._apply_variable_retention_policies(conn, [it.variable_id for it in items])
-
                 # Успешная запись батча — считаем, что соединение восстановлено
                 self._log_connection_restored_if_needed()
+
+                # Retention cleanup выполняем ПОСЛЕ commit, отдельными запросами.
+                # Это уменьшает количество одновременно удерживаемых lock внутри транзакции записи.
+                await self._apply_variable_retention_policies([it.variable_id for it in items])
 
                 # Обновляем in-memory кэш последних значений
                 for it in items:
@@ -1833,12 +1838,15 @@ class HistoryTimescale(HistoryStorageInterface):
                     self.logger.error(f"Flush variable batch failed after reconnect: {e}")
                     raise
 
-    async def _apply_variable_retention_policies(self, conn: asyncpg.Connection, variable_ids: List[int]) -> None:
+    async def _apply_variable_retention_policies(self, variable_ids: List[int]) -> None:
         """
         Применяет политику очистки variables_history по retention_period и max_records
         для набора variable_id.
 
-        Важно: рассчитано на вызов внутри транзакции после вставки данных.
+        Важно:
+        - вызывается ПОСЛЕ транзакции вставки, отдельными запросами;
+        - дросселируется по variable_id, чтобы снизить риск "out of shared memory"
+          / "max_locks_per_transaction" под нагрузкой.
         """
         if not variable_ids:
             return
@@ -1847,27 +1855,49 @@ class HistoryTimescale(HistoryStorageInterface):
         if not uniq_ids:
             return
 
+        now_monotonic = time.monotonic()
+        filtered_ids: List[int] = []
+        for vid in uniq_ids:
+            last_run = self._retention_cleanup_last_run_by_vid.get(vid)
+            if last_run is None or (now_monotonic - last_run) >= self._retention_cleanup_min_interval_sec:
+                filtered_ids.append(vid)
+
+        if not filtered_ids:
+            return
+
         try:
-            rows = await conn.fetch(
+            rows = await self._fetch(
                 f'''
                 SELECT variable_id, retention_period, max_records
                 FROM "{self._schema}".variable_metadata
                 WHERE variable_id = ANY($1::bigint[])
                 ''',
-                uniq_ids,
+                filtered_ids,
             )
         except Exception as e:
             self.logger.warning(f"Failed to fetch variable retention metadata for batch: {e}")
             return
 
-        # Группируем по retention_period, чтобы не делать DELETE для каждого variable_id
-        retention_groups: Dict[Optional[timedelta], List[int]] = {}
         max_records_map: Dict[int, int] = {}
         for r in rows:
             vid = int(r["variable_id"])
             rp = r["retention_period"]
             mr = r["max_records"]
-            retention_groups.setdefault(rp, []).append(vid)
+
+            # Периодический retention по variable_id (по одному variable_id за запрос)
+            if rp:
+                try:
+                    await self._execute(
+                        f'''
+                        DELETE FROM "{self._schema}".variables_history
+                        WHERE variable_id = $1 AND sourcetimestamp < (NOW() - $2::interval)
+                        ''',
+                        vid,
+                        rp,
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Retention DELETE by period failed for variable_id={vid}: {e}")
+
             if mr is not None:
                 try:
                     mr_int = int(mr)
@@ -1876,26 +1906,10 @@ class HistoryTimescale(HistoryStorageInterface):
                 if mr_int > 0:
                     max_records_map[vid] = mr_int
 
-        # Удаляем старые записи по retention_period (одним DELETE на группу)
-        for rp, vids in retention_groups.items():
-            if not rp:
-                continue
-            try:
-                await conn.execute(
-                    f'''
-                    DELETE FROM "{self._schema}".variables_history
-                    WHERE variable_id = ANY($1::bigint[]) AND sourcetimestamp < (NOW() - $2::interval)
-                    ''',
-                    vids,
-                    rp,
-                )
-            except Exception as e:
-                self.logger.warning(f"Retention DELETE by period failed for {len(vids)} variables: {e}")
-
-        # Удаляем лишние записи по max_records (пока делаем по одному variable_id)
+        # Удаляем лишние записи по max_records (по одному variable_id)
         for vid, mr in max_records_map.items():
             try:
-                await conn.execute(
+                await self._execute(
                     f'''
                     DELETE FROM "{self._schema}".variables_history
                     WHERE variable_id = $1 AND id NOT IN (
@@ -1909,6 +1923,11 @@ class HistoryTimescale(HistoryStorageInterface):
                 )
             except Exception as e:
                 self.logger.warning(f"Retention DELETE by max_records failed for variable_id={vid}: {e}")
+
+        # Отмечаем successful/attempted проход для дросселирования
+        finished_at = time.monotonic()
+        for vid in filtered_ids:
+            self._retention_cleanup_last_run_by_vid[vid] = finished_at
 
     async def _flush_event_batch(self, items: List[EventWriteItem]) -> None:
         """
