@@ -444,6 +444,8 @@ class HistoryTimescale(HistoryStorageInterface):
         history_last_values_init_batch_size: int = 1000,
         history_metadata_cache_enabled: bool = True,
         history_metadata_cache_init_max_rows: int = 500000,
+        db_query_timeout_sec: Optional[float] = 30.0,
+        db_pool_close_timeout_sec: float = 5.0,
         **kwargs
     ) -> None:
         """
@@ -475,13 +477,21 @@ class HistoryTimescale(HistoryStorageInterface):
         self._initialized = False
         self._schema = schema
         self._pool_lock = asyncio.Lock()
+        self._reconnect_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
         self._reconnect_task = None
+        self._stopping = False
         self._reconnect_min_delay = 1.0
         self._reconnect_max_delay = 30.0
         self._was_healthy = True
         self._db_unavailable_since = None
         self._last_throttled_log_at = None
+        self._db_query_timeout_sec = (
+            None
+            if db_query_timeout_sec is None or float(db_query_timeout_sec) <= 0
+            else float(db_query_timeout_sec)
+        )
+        self._db_pool_close_timeout_sec = max(0.1, float(db_pool_close_timeout_sec))
         # Последнее время, когда мы писали агрегированное сообщение о длительной недоступности БД
         self._last_reconnect_outage_log_at = None
         self._failed_value_saves_counter = 0
@@ -799,6 +809,7 @@ class HistoryTimescale(HistoryStorageInterface):
     async def init(self) -> None:
         """Инициализация подключения к базе данных и создание таблиц метаданных."""
         try:
+            self._stopping = False
             await self._ensure_pool()
 
             if not self._initialized:
@@ -1017,16 +1028,52 @@ class HistoryTimescale(HistoryStorageInterface):
 
         return pool_params
 
+    @staticmethod
+    def _is_pool_open(pool: Optional[asyncpg.Pool]) -> bool:
+        return pool is not None and not pool._closed and not getattr(pool, "_closing", False)
+
+    async def _run_db_operation(self, awaitable: Any, operation: str) -> Any:
+        timeout = self._db_query_timeout_sec
+        try:
+            if timeout is None or timeout <= 0:
+                return await awaitable
+            return await asyncio.wait_for(awaitable, timeout=timeout)
+        except asyncio.TimeoutError:
+            self.logger.error("PostgreSQL %s timed out after %.1f seconds", operation, timeout)
+            raise
+
+    async def _close_pool_with_timeout(self, pool: Optional[asyncpg.Pool], reason: str) -> None:
+        if pool is None:
+            return
+        try:
+            await asyncio.wait_for(pool.close(), timeout=self._db_pool_close_timeout_sec)
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                "Timed out closing PostgreSQL pool during %s after %.1f seconds; terminating connections",
+                reason,
+                self._db_pool_close_timeout_sec,
+            )
+            pool.terminate()
+        except Exception as e:
+            self.logger.warning("Error closing PostgreSQL pool during %s: %r", reason, e, exc_info=True)
+
     async def _ensure_pool(self) -> None:
         """
         Гарантирует наличие рабочего пула соединений.
 
         Пул считается непригодным, если он закрыт или находится в процессе закрытия.
         """
-        if self._pool and not self._pool._closed and not getattr(self._pool, "_closing", False):
+        if self._stopping:
+            raise RuntimeError("HistoryTimescale is stopping")
+        if self._is_pool_open(self._pool):
             return
+        if self._reconnect_lock.locked():
+            async with self._reconnect_lock:
+                pass
+            if self._is_pool_open(self._pool):
+                return
         async with self._pool_lock:
-            if self._pool and not self._pool._closed and not getattr(self._pool, "_closing", False):
+            if self._is_pool_open(self._pool):
                 return
             pool_params = self._build_pool_params()
             self._pool = await asyncpg.create_pool(**pool_params)
@@ -1035,9 +1082,11 @@ class HistoryTimescale(HistoryStorageInterface):
     async def _is_pool_healthy(self) -> bool:
         try:
             await self._ensure_pool()
-            async with self._pool.acquire() as conn:
-                val = await conn.fetchval('SELECT 1')
-                return val == 1
+            async def _op() -> Any:
+                async with self._pool.acquire(timeout=self._db_query_timeout_sec) as conn:
+                    return await conn.fetchval('SELECT 1', timeout=self._db_query_timeout_sec)
+            val = await self._run_db_operation(_op(), "healthcheck")
+            return val == 1
         except Exception as e:
             # Логируем технические детали неудачной проверки соединения с PostgreSQL
             conn_params = getattr(self, "_conn_params", {}) or {}
@@ -1143,7 +1192,7 @@ class HistoryTimescale(HistoryStorageInterface):
                             )
 
                 try:
-                    await self._force_reconnect()
+                    await self._force_reconnect(self._pool)
                     self.logger.info("Reconnected to database successfully")
                     delay = self._reconnect_min_delay
                 except Exception as e:
@@ -1247,17 +1296,36 @@ class HistoryTimescale(HistoryStorageInterface):
     async def stop(self) -> None:
         """Остановка и закрытие пула соединений."""
         self._stop_event.set()
+        for buffer in (self._value_write_buffer, self._event_write_buffer):
+            if buffer is not None:
+                try:
+                    await buffer.stop()
+                except Exception as e:
+                    self.logger.warning("Error stopping history write buffer: %r", e, exc_info=True)
+        self._value_write_buffer = None
+        self._event_write_buffer = None
+        self._stopping = True
+
         if self._reconnect_task and not self._reconnect_task.done():
             try:
-                await self._reconnect_task
+                await asyncio.wait_for(self._reconnect_task, timeout=self._db_pool_close_timeout_sec)
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    "Timed out stopping PostgreSQL reconnect monitor after %.1f seconds; cancelling it",
+                    self._db_pool_close_timeout_sec,
+                )
+                self._reconnect_task.cancel()
+                try:
+                    await self._reconnect_task
+                except asyncio.CancelledError:
+                    pass
             except Exception:
                 pass
         self._reconnect_task = None
         if self._pool:
-            try:
-                await self._pool.close()
-            finally:
-                self._pool = None
+            pool = self._pool
+            self._pool = None
+            await self._close_pool_with_timeout(pool, "stop")
         self.logger.info("HistoryTimescale stopped")
 
     async def _execute(self, query: str, *args) -> Any:
@@ -1272,22 +1340,32 @@ class HistoryTimescale(HistoryStorageInterface):
             Результат выполнения запроса
         """
         await self._ensure_pool()
+        failed_pool = self._pool
         try:
-            async with self._pool.acquire() as conn:
-                result = await conn.execute(query, *args)
-                self._log_connection_restored_if_needed()
-                return result
+            async def _op() -> Any:
+                async with failed_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
+                    return await conn.execute(query, *args, timeout=self._db_query_timeout_sec)
+            result = await self._run_db_operation(_op(), "execute")
+            self._log_connection_restored_if_needed()
+            return result
         except Exception as e:
+            if isinstance(e, asyncio.TimeoutError):
+                self.logger.error(f"Execute timed out, will reconnect without retrying: {e}")
+                await self._force_reconnect(failed_pool)
+                raise
             # Ошибка выполнения запроса или проблемы с соединением — логируем как error
             self.logger.error(f"Execute failed, will try to reconnect and retry: {e}")
             # Попытка принудительного переподключения; при неудаче _force_reconnect сам залогирует critical и выбросит исключение
-            await self._force_reconnect()
+            await self._force_reconnect(failed_pool)
             # Вторая попытка выполнения запроса
             try:
-                async with self._pool.acquire() as conn:
-                    result = await conn.execute(query, *args)
-                    self._log_connection_restored_if_needed()
-                    return result
+                retry_pool = self._pool
+                async def _op_retry() -> Any:
+                    async with retry_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
+                        return await conn.execute(query, *args, timeout=self._db_query_timeout_sec)
+                result = await self._run_db_operation(_op_retry(), "execute retry")
+                self._log_connection_restored_if_needed()
+                return result
             except Exception as e2:
                 # Ошибка выполнения SQL после переподключения — тоже error
                 self.logger.error(f"Execute failed after reconnect: {e2}")
@@ -1305,19 +1383,29 @@ class HistoryTimescale(HistoryStorageInterface):
             Список записей
         """
         await self._ensure_pool()
+        failed_pool = self._pool
         try:
-            async with self._pool.acquire() as conn:
-                rows = await conn.fetch(query, *args)
+            async def _op() -> Any:
+                async with failed_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
+                    return await conn.fetch(query, *args, timeout=self._db_query_timeout_sec)
+            rows = await self._run_db_operation(_op(), "fetch")
+            self._log_connection_restored_if_needed()
+            return rows
+        except Exception as e:
+            if isinstance(e, asyncio.TimeoutError):
+                self.logger.error(f"Fetch timed out, will reconnect without retrying: {e}")
+                await self._force_reconnect(failed_pool)
+                raise
+            self.logger.error(f"Fetch failed, will try to reconnect and retry: {e}")
+            await self._force_reconnect(failed_pool)
+            try:
+                retry_pool = self._pool
+                async def _op_retry() -> Any:
+                    async with retry_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
+                        return await conn.fetch(query, *args, timeout=self._db_query_timeout_sec)
+                rows = await self._run_db_operation(_op_retry(), "fetch retry")
                 self._log_connection_restored_if_needed()
                 return rows
-        except Exception as e:
-            self.logger.error(f"Fetch failed, will try to reconnect and retry: {e}")
-            await self._force_reconnect()
-            try:
-                async with self._pool.acquire() as conn:
-                    rows = await conn.fetch(query, *args)
-                    self._log_connection_restored_if_needed()
-                    return rows
             except Exception as e2:
                 self.logger.error(f"Fetch failed after reconnect: {e2}")
                 raise
@@ -1334,19 +1422,29 @@ class HistoryTimescale(HistoryStorageInterface):
             Значение
         """
         await self._ensure_pool()
+        failed_pool = self._pool
         try:
-            async with self._pool.acquire() as conn:
-                value = await conn.fetchval(query, *args)
+            async def _op() -> Any:
+                async with failed_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
+                    return await conn.fetchval(query, *args, timeout=self._db_query_timeout_sec)
+            value = await self._run_db_operation(_op(), "fetchval")
+            self._log_connection_restored_if_needed()
+            return value
+        except Exception as e:
+            if isinstance(e, asyncio.TimeoutError):
+                self.logger.error(f"Fetchval timed out, will reconnect without retrying: {e}")
+                await self._force_reconnect(failed_pool)
+                raise
+            self.logger.error(f"Fetchval failed, will try to reconnect and retry: {e}")
+            await self._force_reconnect(failed_pool)
+            try:
+                retry_pool = self._pool
+                async def _op_retry() -> Any:
+                    async with retry_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
+                        return await conn.fetchval(query, *args, timeout=self._db_query_timeout_sec)
+                value = await self._run_db_operation(_op_retry(), "fetchval retry")
                 self._log_connection_restored_if_needed()
                 return value
-        except Exception as e:
-            self.logger.error(f"Fetchval failed, will try to reconnect and retry: {e}")
-            await self._force_reconnect()
-            try:
-                async with self._pool.acquire() as conn:
-                    value = await conn.fetchval(query, *args)
-                    self._log_connection_restored_if_needed()
-                    return value
             except Exception as e2:
                 self.logger.error(f"Fetchval failed after reconnect: {e2}")
                 raise
@@ -1363,60 +1461,77 @@ class HistoryTimescale(HistoryStorageInterface):
             Одна строка из результата запроса или None
         """
         await self._ensure_pool()
+        failed_pool = self._pool
         try:
-            async with self._pool.acquire() as conn:
-                row = await conn.fetchrow(query, *args)
+            async def _op() -> Any:
+                async with failed_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
+                    return await conn.fetchrow(query, *args, timeout=self._db_query_timeout_sec)
+            row = await self._run_db_operation(_op(), "fetchrow")
+            self._log_connection_restored_if_needed()
+            return row
+        except Exception as e:
+            if isinstance(e, asyncio.TimeoutError):
+                self.logger.error(f"Fetchrow timed out, will reconnect without retrying: {e}")
+                await self._force_reconnect(failed_pool)
+                raise
+            self.logger.error(f"Fetchrow failed, will try to reconnect and retry: {e}")
+            await self._force_reconnect(failed_pool)
+            try:
+                retry_pool = self._pool
+                async def _op_retry() -> Any:
+                    async with retry_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
+                        return await conn.fetchrow(query, *args, timeout=self._db_query_timeout_sec)
+                row = await self._run_db_operation(_op_retry(), "fetchrow retry")
                 self._log_connection_restored_if_needed()
                 return row
-        except Exception as e:
-            self.logger.error(f"Fetchrow failed, will try to reconnect and retry: {e}")
-            await self._force_reconnect()
-            try:
-                async with self._pool.acquire() as conn:
-                    row = await conn.fetchrow(query, *args)
-                    self._log_connection_restored_if_needed()
-                    return row
             except Exception as e2:
                 self.logger.error(f"Fetchrow failed after reconnect: {e2}")
                 raise
 
-    async def _force_reconnect(self) -> None:
+    async def _force_reconnect(self, failed_pool: Optional[asyncpg.Pool] = None) -> None:
         """
         Полное пересоздание пула соединений.
 
         Старый пул закрывается синхронно, чтобы избежать гонок состояний
         внутри asyncpg (ошибки вида «another operation is in progress»).
         """
-        old_pool: Optional[asyncpg.Pool] = None
-        async with self._pool_lock:
-            try:
-                if self._pool:
-                    old_pool = self._pool
-                # Обнуляем ссылку на пул: новые операции будут создавать
-                # соединения только после успешного создания нового пула.
-                self._pool = None
-            except Exception as e:
-                self.logger.error("Error while preparing to recreate pool: %r", e, exc_info=True)
-                raise
+        async with self._reconnect_lock:
+            if self._stopping:
+                raise RuntimeError("HistoryTimescale is stopping")
+            old_pool: Optional[asyncpg.Pool] = None
+            async with self._pool_lock:
+                try:
+                    if (
+                        failed_pool is not None
+                        and self._pool is not failed_pool
+                        and self._is_pool_open(self._pool)
+                    ):
+                        self.logger.debug("Skipping PostgreSQL reconnect: pool was already replaced")
+                        return
+                    if self._pool:
+                        old_pool = self._pool
+                    # Обнуляем ссылку на пул: новые операции дождутся завершения реконнекта
+                    # в _ensure_pool и не создадут конкурирующий пул.
+                    self._pool = None
+                except Exception as e:
+                    self.logger.error("Error while preparing to recreate pool: %r", e, exc_info=True)
+                    raise
 
-        # Закрываем старый пул уже вне блокировки, но синхронно
-        if old_pool is not None:
-            try:
-                await old_pool.close()
-            except Exception as e:
-                self.logger.warning("Error closing old PostgreSQL pool during reconnect: %r", e, exc_info=True)
+            # Закрываем старый пул уже вне блокировки, но синхронно
+            if old_pool is not None:
+                await self._close_pool_with_timeout(old_pool, "reconnect")
 
-        # Создаём новый пул под блокировкой, без использования _ensure_pool,
-        # чтобы избежать рекурсивного захвата замка.
-        async with self._pool_lock:
-            try:
-                pool_params = self._build_pool_params()
-                self._pool = await asyncpg.create_pool(**pool_params)
-                self.logger.info("Connection pool recreated successfully after failure")
-            except Exception as e:
-                # Невозможно восстановить подключение к БД — критический уровень и проброс исключения наверх
-                self.logger.critical(f"Force reconnect failed, database remains unavailable: {e}")
-                raise
+            # Создаём новый пул под блокировкой, без использования _ensure_pool,
+            # чтобы избежать рекурсивного захвата замка.
+            async with self._pool_lock:
+                try:
+                    pool_params = self._build_pool_params()
+                    self._pool = await asyncpg.create_pool(**pool_params)
+                    self.logger.info("Connection pool recreated successfully after failure")
+                except Exception as e:
+                    # Невозможно восстановить подключение к БД — критический уровень и проброс исключения наверх
+                    self.logger.critical(f"Force reconnect failed, database remains unavailable: {e}")
+                    raise
 
     async def _create_metadata_tables(self) -> None:
         """Создание единых таблиц для историзации в указанной схеме."""
@@ -1791,33 +1906,38 @@ class HistoryTimescale(HistoryStorageInterface):
         # вторая — после принудительного реконнекта при ошибке.
         for attempt in (1, 2):
             await self._ensure_pool()
+            failed_pool = self._pool
             try:
-                async with self._pool.acquire() as conn:
-                    async with conn.transaction():
-                        await conn.executemany(
-                            f'INSERT INTO "{self._schema}".variables_history '
-                            f'(variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) '
-                            f'VALUES ($1, $2, $3, $4, $5, $6, $7) '
-                            f'ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
-                            history_params,
-                        )
+                async def _op() -> None:
+                    async with failed_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
+                        async with conn.transaction():
+                            await conn.executemany(
+                                f'INSERT INTO "{self._schema}".variables_history '
+                                f'(variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) '
+                                f'VALUES ($1, $2, $3, $4, $5, $6, $7) '
+                                f'ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
+                                history_params,
+                                timeout=self._db_query_timeout_sec,
+                            )
 
-                        await conn.executemany(
-                            f'''
-                            INSERT INTO "{self._schema}".variables_last_value 
-                                (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
-                            VALUES ($1, $2, $3, $4, $5, $6)
-                            ON CONFLICT (variable_id) DO UPDATE
-                                SET sourcetimestamp = EXCLUDED.sourcetimestamp,
-                                    servertimestamp = EXCLUDED.servertimestamp,
-                                    statuscode = EXCLUDED.statuscode,
-                                    varianttype = EXCLUDED.varianttype,
-                                    variantbinary = EXCLUDED.variantbinary,
-                                    updated_at = NOW()
-                                WHERE "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
-                            ''',
-                            last_value_params,
-                        )
+                            await conn.executemany(
+                                f'''
+                                INSERT INTO "{self._schema}".variables_last_value
+                                    (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
+                                VALUES ($1, $2, $3, $4, $5, $6)
+                                ON CONFLICT (variable_id) DO UPDATE
+                                    SET sourcetimestamp = EXCLUDED.sourcetimestamp,
+                                        servertimestamp = EXCLUDED.servertimestamp,
+                                        statuscode = EXCLUDED.statuscode,
+                                        varianttype = EXCLUDED.varianttype,
+                                        variantbinary = EXCLUDED.variantbinary,
+                                        updated_at = NOW()
+                                    WHERE "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
+                                ''',
+                                last_value_params,
+                                timeout=self._db_query_timeout_sec,
+                            )
+                await self._run_db_operation(_op(), "flush variable batch")
 
                 # Успешная запись батча — считаем, что соединение восстановлено
                 self._log_connection_restored_if_needed()
@@ -1832,8 +1952,12 @@ class HistoryTimescale(HistoryStorageInterface):
                 return
             except Exception as e:
                 if attempt == 1:
+                    if isinstance(e, asyncio.TimeoutError):
+                        self.logger.error(f"Flush variable batch timed out, will reconnect without retrying: {e}")
+                        await self._force_reconnect(failed_pool)
+                        raise
                     self.logger.error(f"Flush variable batch failed, will try to reconnect and retry: {e}")
-                    await self._force_reconnect()
+                    await self._force_reconnect(failed_pool)
                 else:
                     self.logger.error(f"Flush variable batch failed after reconnect: {e}")
                     raise
@@ -1950,21 +2074,29 @@ class HistoryTimescale(HistoryStorageInterface):
         # вторая — после принудительного реконнекта при ошибке.
         for attempt in (1, 2):
             await self._ensure_pool()
+            failed_pool = self._pool
             try:
-                async with self._pool.acquire() as conn:
-                    async with conn.transaction():
-                        await conn.executemany(
-                            f'INSERT INTO "{self._schema}".events_history '
-                            f'(source_id, event_type_id, event_timestamp, event_data) '
-                            f'VALUES ($1, $2, $3, $4) '
-                            f'ON CONFLICT (source_id, event_timestamp) DO NOTHING',
-                            params,
-                        )
+                async def _op() -> None:
+                    async with failed_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
+                        async with conn.transaction():
+                            await conn.executemany(
+                                f'INSERT INTO "{self._schema}".events_history '
+                                f'(source_id, event_type_id, event_timestamp, event_data) '
+                                f'VALUES ($1, $2, $3, $4) '
+                                f'ON CONFLICT (source_id, event_timestamp) DO NOTHING',
+                                params,
+                                timeout=self._db_query_timeout_sec,
+                            )
+                await self._run_db_operation(_op(), "flush event batch")
                 return
             except Exception as e:
                 if attempt == 1:
+                    if isinstance(e, asyncio.TimeoutError):
+                        self.logger.error(f"Flush event batch timed out, will reconnect without retrying: {e}")
+                        await self._force_reconnect(failed_pool)
+                        raise
                     self.logger.error(f"Flush event batch failed, will try to reconnect and retry: {e}")
-                    await self._force_reconnect()
+                    await self._force_reconnect(failed_pool)
                 else:
                     self.logger.error(f"Flush event batch failed after reconnect: {e}")
                     raise
@@ -2118,13 +2250,14 @@ class HistoryTimescale(HistoryStorageInterface):
             offset = 0
             total_loaded = 0
 
-            async with self._pool.acquire() as conn:
+            async with self._pool.acquire(timeout=self._db_query_timeout_sec) as conn:
                 # Пытаемся оценить размер таблицы на стороне БД
                 try:
                     rel_name = f'{self._schema}.variables_last_value'
                     rel_size = await conn.fetchval(
                         "SELECT pg_total_relation_size($1::regclass)",
                         rel_name,
+                        timeout=self._db_query_timeout_sec,
                     )
                     if rel_size is not None:
                         approx_mb = rel_size / (1024 * 1024)
@@ -2149,6 +2282,7 @@ class HistoryTimescale(HistoryStorageInterface):
                         ''',
                         batch_size,
                         offset,
+                        timeout=self._db_query_timeout_sec,
                     )
                     if not rows:
                         break
@@ -2203,7 +2337,7 @@ class HistoryTimescale(HistoryStorageInterface):
             total_loaded = 0
             last_variable_id = 0
 
-            async with self._pool.acquire() as conn:
+            async with self._pool.acquire(timeout=self._db_query_timeout_sec) as conn:
                 while total_loaded < max_rows:
                     rows = await conn.fetch(
                         f'''
@@ -2215,6 +2349,7 @@ class HistoryTimescale(HistoryStorageInterface):
                         ''',
                         last_variable_id,
                         min(batch_size, max_rows - total_loaded),
+                        timeout=self._db_query_timeout_sec,
                     )
                     if not rows:
                         break
