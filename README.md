@@ -312,6 +312,42 @@ history = HistoryTimescale(
 - `local` - Чтение может не видеть только что записанные данные (быстрее)
 - `global` - Чтение всегда видит записанные данные (консистентнее, но медленнее)
 
+### Метрики производительности
+
+HistoryTimescale предоставляет встроенный снимок метрик без обращения к БД:
+
+```python
+metrics = history.get_performance_metrics()
+
+variables = metrics["write"]["variables"]
+print(f"Queue: {variables['queue_size']}/{variables['queue_max_size']}")
+print(f"Dropped: {variables['dropped_total']}")
+print(f"Avg flush ms: {variables['avg_flush_duration_ms']}")
+print(f"Insert history avg ms: {variables['insert_history_avg_ms']}")
+
+# Сбросить счетчики перед новым замером
+history.reset_performance_metrics()
+```
+
+Для публикации метрик в OPC UA адресном пространстве можно создать read-only витрину
+`History/HistoryMetrics`:
+
+```python
+await history.expose_history_metrics_nodes(server, idx)
+
+# Обновлять явно, например из периодической задачи приложения
+await history.refresh_history_metrics_nodes()
+```
+
+Ключевые метрики для диагностики переполнения очереди:
+
+- `queue_size`, `queue_fill_ratio`, `dropped_total` - показывает backpressure и потери.
+- `last_batch_size`, `avg_flush_duration_ms`, `max_flush_duration_ms` - показывает фактическую эффективность batch flush.
+- `insert_history_*`, `upsert_last_value_*` - помогает отделить запись истории от обновления последних значений.
+- `timeouts_total`, `reconnects_total` - показывает проблемы доступности PostgreSQL.
+
+Per-variable и per-event retention cleanup в write path не выполняется. Для автоматического удаления старых данных используйте глобальную TimescaleDB retention policy через `global_retention_period` или отдельные административные cleanup-команды.
+
 ### Многоуровневое кэширование
 
 HistoryTimescale использует несколько уровней кэширования для оптимизации производительности:

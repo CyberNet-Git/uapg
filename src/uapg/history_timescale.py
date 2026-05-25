@@ -81,6 +81,26 @@ class EventWriteItem:
     future: Optional[asyncio.Future] = None
 
 
+def _empty_timing_stats() -> Dict[str, float]:
+    return {
+        "count": 0,
+        "total_ms": 0.0,
+        "last_ms": 0.0,
+        "max_ms": 0.0,
+        "avg_ms": 0.0,
+    }
+
+
+def _observe_timing(stats: Dict[str, float], duration_ms: float) -> None:
+    count = int(stats.get("count", 0)) + 1
+    total = float(stats.get("total_ms", 0.0)) + duration_ms
+    stats["count"] = count
+    stats["total_ms"] = total
+    stats["last_ms"] = duration_ms
+    stats["max_ms"] = max(float(stats.get("max_ms", 0.0)), duration_ms)
+    stats["avg_ms"] = total / count if count else 0.0
+
+
 class HistoryWriteBuffer:
     """
     Универсальный буфер для батчевой записи значений в БД.
@@ -109,6 +129,49 @@ class HistoryWriteBuffer:
         self._queue: "asyncio.Queue[Any]" = asyncio.Queue(maxsize=max(0, int(queue_max_size)))
         self._task: Optional[asyncio.Task] = None
         self._stopped = False
+        self._stats: Dict[str, Any] = self._new_stats()
+
+    @staticmethod
+    def _new_stats() -> Dict[str, Any]:
+        return {
+            "enqueue_attempts_total": 0,
+            "enqueued_total": 0,
+            "dropped_total": 0,
+            "flushed_items_total": 0,
+            "flush_batches_total": 0,
+            "last_batch_size": 0,
+            "max_batch_size_seen": 0,
+            "flush_errors_total": 0,
+            "last_flush_error": "",
+            "flush_duration": _empty_timing_stats(),
+        }
+
+    def get_stats(self) -> Dict[str, Any]:
+        queue_size = self._queue.qsize()
+        queue_max_size = self._queue.maxsize
+        fill_ratio = (queue_size / queue_max_size) if queue_max_size > 0 else 0.0
+        flush_duration = dict(self._stats["flush_duration"])
+        return {
+            "queue_size": queue_size,
+            "queue_max_size": queue_max_size,
+            "queue_fill_ratio": fill_ratio,
+            "enqueue_attempts_total": int(self._stats["enqueue_attempts_total"]),
+            "enqueued_total": int(self._stats["enqueued_total"]),
+            "dropped_total": int(self._stats["dropped_total"]),
+            "flushed_items_total": int(self._stats["flushed_items_total"]),
+            "flush_batches_total": int(self._stats["flush_batches_total"]),
+            "last_batch_size": int(self._stats["last_batch_size"]),
+            "max_batch_size_seen": int(self._stats["max_batch_size_seen"]),
+            "flush_errors_total": int(self._stats["flush_errors_total"]),
+            "last_flush_error": str(self._stats["last_flush_error"]),
+            "last_flush_duration_ms": float(flush_duration["last_ms"]),
+            "max_flush_duration_ms": float(flush_duration["max_ms"]),
+            "avg_flush_duration_ms": float(flush_duration["avg_ms"]),
+            "total_flush_duration_ms": float(flush_duration["total_ms"]),
+        }
+
+    def reset_stats(self) -> None:
+        self._stats = self._new_stats()
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -144,6 +207,7 @@ class HistoryWriteBuffer:
         """
         future: Optional[asyncio.Future] = None
         sync_mode = sync or self._durability_mode == "sync"
+        self._stats["enqueue_attempts_total"] += 1
 
         if sync_mode:
             loop = asyncio.get_running_loop()
@@ -157,7 +221,9 @@ class HistoryWriteBuffer:
             else:
                 # В async-режиме не блокируемся, при переполнении просто логируем и отбрасываем
                 self._queue.put_nowait(item)
+            self._stats["enqueued_total"] += 1
         except asyncio.QueueFull:
+            self._stats["dropped_total"] += 1
             self._logger.error("HistoryWriteBuffer '%s' queue is full, dropping item in async mode", self._name)
             if future and not future.done():
                 future.set_exception(RuntimeError("HistoryWriteBuffer queue is full"))
@@ -208,8 +274,19 @@ class HistoryWriteBuffer:
         if not batch:
             return
 
+        started_at = time.perf_counter()
         try:
             await self._flush_func(batch)
+            duration_ms = (time.perf_counter() - started_at) * 1000.0
+            batch_size = len(batch)
+            self._stats["flush_batches_total"] += 1
+            self._stats["flushed_items_total"] += batch_size
+            self._stats["last_batch_size"] = batch_size
+            self._stats["max_batch_size_seen"] = max(
+                int(self._stats["max_batch_size_seen"]),
+                batch_size,
+            )
+            _observe_timing(self._stats["flush_duration"], duration_ms)
             # Уведомляем ожидающих о завершении
             now = time.time()
             for item in batch:
@@ -217,6 +294,16 @@ class HistoryWriteBuffer:
                 if fut is not None and not fut.done():
                     fut.set_result(now)
         except Exception as e:
+            duration_ms = (time.perf_counter() - started_at) * 1000.0
+            batch_size = len(batch)
+            self._stats["flush_errors_total"] += 1
+            self._stats["last_flush_error"] = str(e)
+            self._stats["last_batch_size"] = batch_size
+            self._stats["max_batch_size_seen"] = max(
+                int(self._stats["max_batch_size_seen"]),
+                batch_size,
+            )
+            _observe_timing(self._stats["flush_duration"], duration_ms)
             self._logger.error(
                 "HistoryWriteBuffer '%s' flush failed for %d items: %s",
                 self._name,
@@ -507,11 +594,6 @@ class HistoryTimescale(HistoryStorageInterface):
         self._opcua_history_settings_namespace_index: Optional[int] = None
         self._opcua_history_settings_parent: Any = None
 
-        # Защита от перегрузки lock manager при cleanup в батч-режиме:
-        # не выполнять retention DELETE для одного variable_id слишком часто.
-        self._retention_cleanup_min_interval_sec = 30.0
-        self._retention_cleanup_last_run_by_vid: Dict[int, float] = {}
-
         # Параметры оптимизации записи истории
         self._history_write_batch_enabled = history_write_batch_enabled
         self._history_write_max_batch_size = int(history_write_max_batch_size)
@@ -560,6 +642,10 @@ class HistoryTimescale(HistoryStorageInterface):
             "event_type_misses": 0,
         }
 
+        # Метрики производительности записи/БД. Чтение не обращается к БД.
+        self._performance_counters: Dict[str, int] = self._new_performance_counters()
+        self._performance_timings: Dict[str, Dict[str, float]] = self._new_performance_timings()
+
         # Подавление первого уведомления datachange после подписки
         self.suppress_initial_datachange = True
         self._pending_initial_datachange_skip: Dict[str, bool] = {}
@@ -567,6 +653,11 @@ class HistoryTimescale(HistoryStorageInterface):
         # Буферы для батчевой записи истории
         self._value_write_buffer: Optional[HistoryWriteBuffer] = None
         self._event_write_buffer: Optional[HistoryWriteBuffer] = None
+
+        # OPC UA nodes для экспонирования текущих метрик производительности.
+        self._opcua_history_metrics_nodes: Dict[str, Any] = {}
+        self._opcua_history_metrics_namespace_index: Optional[int] = None
+        self._opcua_history_metrics_parent: Any = None
 
         # Инициализация параметров подключения
         self._conn_params = self._init_connection_params(
@@ -709,6 +800,131 @@ class HistoryTimescale(HistoryStorageInterface):
         """
         for key in self._cache_stats:
             self._cache_stats[key] = 0
+
+    @staticmethod
+    def _new_performance_counters() -> Dict[str, int]:
+        return {
+            "save_node_value_calls_total": 0,
+            "save_node_value_errors_total": 0,
+            "save_event_calls_total": 0,
+            "save_event_errors_total": 0,
+            "db_operation_timeouts_total": 0,
+            "db_reconnects_total": 0,
+        }
+
+    @staticmethod
+    def _new_performance_timings() -> Dict[str, Dict[str, float]]:
+        return {
+            "variable_flush_total": _empty_timing_stats(),
+            "variable_insert_history": _empty_timing_stats(),
+            "variable_upsert_last_value": _empty_timing_stats(),
+            "event_flush_total": _empty_timing_stats(),
+            "event_insert_history": _empty_timing_stats(),
+        }
+
+    def _perf_inc(self, key: str, amount: int = 1) -> None:
+        self._performance_counters[key] = self._performance_counters.get(key, 0) + amount
+
+    def _perf_observe_ms(self, key: str, duration_ms: float) -> None:
+        stats = self._performance_timings.setdefault(key, _empty_timing_stats())
+        _observe_timing(stats, duration_ms)
+
+    @staticmethod
+    def _format_timing_metrics(prefix: str, stats: Dict[str, float]) -> Dict[str, float]:
+        return {
+            f"{prefix}_count": int(stats.get("count", 0)),
+            f"{prefix}_total_ms": float(stats.get("total_ms", 0.0)),
+            f"{prefix}_last_ms": float(stats.get("last_ms", 0.0)),
+            f"{prefix}_max_ms": float(stats.get("max_ms", 0.0)),
+            f"{prefix}_avg_ms": float(stats.get("avg_ms", 0.0)),
+        }
+
+    def get_performance_metrics(self) -> dict:
+        """
+        Возвращает снимок метрик производительности без обращений к БД.
+        """
+        variable_buffer = (
+            self._value_write_buffer.get_stats()
+            if self._value_write_buffer is not None
+            else self._empty_buffer_metrics()
+        )
+        event_buffer = (
+            self._event_write_buffer.get_stats()
+            if self._event_write_buffer is not None
+            else self._empty_buffer_metrics()
+        )
+
+        variable_metrics: Dict[str, Any] = {
+            "save_node_value_calls_total": self._performance_counters["save_node_value_calls_total"],
+            "save_node_value_errors_total": self._performance_counters["save_node_value_errors_total"],
+            **variable_buffer,
+            **self._format_timing_metrics("flush", self._performance_timings["variable_flush_total"]),
+            **self._format_timing_metrics("insert_history", self._performance_timings["variable_insert_history"]),
+            **self._format_timing_metrics("upsert_last_value", self._performance_timings["variable_upsert_last_value"]),
+        }
+        event_metrics: Dict[str, Any] = {
+            "save_event_calls_total": self._performance_counters["save_event_calls_total"],
+            "save_event_errors_total": self._performance_counters["save_event_errors_total"],
+            **event_buffer,
+            **self._format_timing_metrics("flush", self._performance_timings["event_flush_total"]),
+            **self._format_timing_metrics("insert_history", self._performance_timings["event_insert_history"]),
+        }
+
+        return {
+            "write": {
+                "variables": variable_metrics,
+                "events": event_metrics,
+            },
+            "db": {
+                "timeouts_total": self._performance_counters["db_operation_timeouts_total"],
+                "reconnects_total": self._performance_counters["db_reconnects_total"],
+            },
+            "retention": {
+                "per_variable_cleanup_enabled": False,
+                "per_event_cleanup_enabled": False,
+            },
+            "config": {
+                "history_write_batch_enabled": bool(self._history_write_batch_enabled),
+                "history_write_max_batch_size": int(self._history_write_max_batch_size),
+                "history_write_max_batch_interval_sec": float(self._history_write_max_batch_interval_sec),
+                "history_write_queue_max_size": int(self._history_write_queue_max_size),
+                "history_write_durability_mode": str(self._history_write_durability_mode),
+                "history_write_read_consistency_mode": str(self._history_write_read_consistency_mode),
+                "db_query_timeout_sec": self._db_query_timeout_sec,
+            },
+        }
+
+    @staticmethod
+    def _empty_buffer_metrics() -> Dict[str, Any]:
+        return {
+            "queue_size": 0,
+            "queue_max_size": 0,
+            "queue_fill_ratio": 0.0,
+            "enqueue_attempts_total": 0,
+            "enqueued_total": 0,
+            "dropped_total": 0,
+            "flushed_items_total": 0,
+            "flush_batches_total": 0,
+            "last_batch_size": 0,
+            "max_batch_size_seen": 0,
+            "flush_errors_total": 0,
+            "last_flush_error": "",
+            "last_flush_duration_ms": 0.0,
+            "max_flush_duration_ms": 0.0,
+            "avg_flush_duration_ms": 0.0,
+            "total_flush_duration_ms": 0.0,
+        }
+
+    def reset_performance_metrics(self) -> None:
+        """
+        Сбрасывает метрики производительности и статистику буферов записи.
+        """
+        self._performance_counters = self._new_performance_counters()
+        self._performance_timings = self._new_performance_timings()
+        if self._value_write_buffer is not None:
+            self._value_write_buffer.reset_stats()
+        if self._event_write_buffer is not None:
+            self._event_write_buffer.reset_stats()
 
     @classmethod
     def from_config_file(
@@ -1005,6 +1221,120 @@ class HistoryTimescale(HistoryStorageInterface):
             # Никогда не ломаем основную функциональность истории из-за OPC UA витрины настроек
             return
 
+    @staticmethod
+    def _metric_node_name(metric_path: str) -> str:
+        parts: List[str] = []
+        for path_part in metric_path.split("."):
+            for word in path_part.split("_"):
+                if word:
+                    parts.append(word[:1].upper() + word[1:])
+        return "".join(parts)
+
+    @staticmethod
+    def _flatten_metrics(metrics: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+        flattened: Dict[str, Any] = {}
+        for key, value in metrics.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, dict):
+                flattened.update(HistoryTimescale._flatten_metrics(value, path))
+            else:
+                flattened[path] = value
+        return flattened
+
+    @staticmethod
+    def _metric_variant(value: Any) -> ua.Variant:
+        if isinstance(value, bool):
+            return ua.Variant(value, ua.VariantType.Boolean)
+        if isinstance(value, int):
+            return ua.Variant(value, ua.VariantType.Int64)
+        if isinstance(value, float):
+            return ua.Variant(value, ua.VariantType.Double)
+        if value is None:
+            return ua.Variant("", ua.VariantType.String)
+        return ua.Variant(str(value), ua.VariantType.String)
+
+    async def expose_history_metrics_nodes(
+        self,
+        server: Any,
+        namespace_index: int,
+        *,
+        parent: Any = None,
+    ) -> None:
+        """
+        Экспортирует read-only переменные с метриками производительности в OPC UA.
+
+        Метрики размещаются в `History/HistoryMetrics` и обновляются только
+        явным вызовом `refresh_history_metrics_nodes()`.
+        """
+        if server is None:
+            raise ValueError("server is required")
+
+        idx = int(namespace_index)
+
+        async def _get_server_parent() -> Any:
+            if parent is not None:
+                return parent
+            try:
+                srv_node = getattr(getattr(server, "nodes", None), "server", None)
+                if srv_node is not None:
+                    return srv_node
+            except Exception:
+                pass
+            return await server.nodes.objects.get_child(["0:Server"])
+
+        async def _get_or_add_object(parent_node: Any, name: str) -> Any:
+            qn = f"{idx}:{name}"
+            try:
+                return await parent_node.get_child([qn])
+            except Exception:
+                return await parent_node.add_object(idx, name)
+
+        async def _get_or_add_variable(parent_node: Any, name: str, initial_value: ua.Variant) -> Any:
+            qn = f"{idx}:{name}"
+            try:
+                return await parent_node.get_child([qn])
+            except Exception:
+                return await parent_node.add_variable(idx, name, initial_value)
+
+        server_parent = await _get_server_parent()
+        history_obj = await _get_or_add_object(server_parent, "History")
+        metrics_obj = await _get_or_add_object(history_obj, "HistoryMetrics")
+
+        nodes: Dict[str, Any] = {}
+        for metric_path, value in self._flatten_metrics(self.get_performance_metrics()).items():
+            node_name = self._metric_node_name(metric_path)
+            nodes[metric_path] = await _get_or_add_variable(
+                metrics_obj,
+                node_name,
+                self._metric_variant(value),
+            )
+
+        self._opcua_history_metrics_nodes = nodes
+        self._opcua_history_metrics_namespace_index = idx
+        self._opcua_history_metrics_parent = server_parent
+
+        await self.refresh_history_metrics_nodes()
+
+    async def refresh_history_metrics_nodes(self) -> None:
+        """
+        Обновляет OPC UA переменные метрик, если они были экспонированы.
+        """
+        if not self._opcua_history_metrics_nodes:
+            return
+
+        try:
+            flattened = self._flatten_metrics(self.get_performance_metrics())
+            for metric_path, value in flattened.items():
+                node = self._opcua_history_metrics_nodes.get(metric_path)
+                if node is None:
+                    continue
+                try:
+                    await node.write_value(self._metric_variant(value))
+                except Exception:
+                    continue
+        except Exception:
+            return
+
     def _build_pool_params(self) -> dict:
         pool_params = {
             'user': self._conn_params['user'],
@@ -1039,6 +1369,7 @@ class HistoryTimescale(HistoryStorageInterface):
                 return await awaitable
             return await asyncio.wait_for(awaitable, timeout=timeout)
         except asyncio.TimeoutError:
+            self._perf_inc("db_operation_timeouts_total")
             self.logger.error("PostgreSQL %s timed out after %.1f seconds", operation, timeout)
             raise
 
@@ -1527,6 +1858,7 @@ class HistoryTimescale(HistoryStorageInterface):
                 try:
                     pool_params = self._build_pool_params()
                     self._pool = await asyncpg.create_pool(**pool_params)
+                    self._perf_inc("db_reconnects_total")
                     self.logger.info("Connection pool recreated successfully after failure")
                 except Exception as e:
                     # Невозможно восстановить подключение к БД — критический уровень и проброс исключения наверх
@@ -1911,6 +2243,7 @@ class HistoryTimescale(HistoryStorageInterface):
                 async def _op() -> None:
                     async with failed_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
                         async with conn.transaction():
+                            insert_started_at = time.perf_counter()
                             await conn.executemany(
                                 f'INSERT INTO "{self._schema}".variables_history '
                                 f'(variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) '
@@ -1919,7 +2252,12 @@ class HistoryTimescale(HistoryStorageInterface):
                                 history_params,
                                 timeout=self._db_query_timeout_sec,
                             )
+                            self._perf_observe_ms(
+                                "variable_insert_history",
+                                (time.perf_counter() - insert_started_at) * 1000.0,
+                            )
 
+                            upsert_started_at = time.perf_counter()
                             await conn.executemany(
                                 f'''
                                 INSERT INTO "{self._schema}".variables_last_value
@@ -1937,14 +2275,19 @@ class HistoryTimescale(HistoryStorageInterface):
                                 last_value_params,
                                 timeout=self._db_query_timeout_sec,
                             )
+                            self._perf_observe_ms(
+                                "variable_upsert_last_value",
+                                (time.perf_counter() - upsert_started_at) * 1000.0,
+                            )
+                flush_started_at = time.perf_counter()
                 await self._run_db_operation(_op(), "flush variable batch")
+                self._perf_observe_ms(
+                    "variable_flush_total",
+                    (time.perf_counter() - flush_started_at) * 1000.0,
+                )
 
                 # Успешная запись батча — считаем, что соединение восстановлено
                 self._log_connection_restored_if_needed()
-
-                # Retention cleanup выполняем ПОСЛЕ commit, отдельными запросами.
-                # Это уменьшает количество одновременно удерживаемых lock внутри транзакции записи.
-                await self._apply_variable_retention_policies([it.variable_id for it in items])
 
                 # Обновляем in-memory кэш последних значений
                 for it in items:
@@ -1961,97 +2304,6 @@ class HistoryTimescale(HistoryStorageInterface):
                 else:
                     self.logger.error(f"Flush variable batch failed after reconnect: {e}")
                     raise
-
-    async def _apply_variable_retention_policies(self, variable_ids: List[int]) -> None:
-        """
-        Применяет политику очистки variables_history по retention_period и max_records
-        для набора variable_id.
-
-        Важно:
-        - вызывается ПОСЛЕ транзакции вставки, отдельными запросами;
-        - дросселируется по variable_id, чтобы снизить риск "out of shared memory"
-          / "max_locks_per_transaction" под нагрузкой.
-        """
-        if not variable_ids:
-            return
-
-        uniq_ids = sorted({int(v) for v in variable_ids if v is not None})
-        if not uniq_ids:
-            return
-
-        now_monotonic = time.monotonic()
-        filtered_ids: List[int] = []
-        for vid in uniq_ids:
-            last_run = self._retention_cleanup_last_run_by_vid.get(vid)
-            if last_run is None or (now_monotonic - last_run) >= self._retention_cleanup_min_interval_sec:
-                filtered_ids.append(vid)
-
-        if not filtered_ids:
-            return
-
-        try:
-            rows = await self._fetch(
-                f'''
-                SELECT variable_id, retention_period, max_records
-                FROM "{self._schema}".variable_metadata
-                WHERE variable_id = ANY($1::bigint[])
-                ''',
-                filtered_ids,
-            )
-        except Exception as e:
-            self.logger.warning(f"Failed to fetch variable retention metadata for batch: {e}")
-            return
-
-        max_records_map: Dict[int, int] = {}
-        for r in rows:
-            vid = int(r["variable_id"])
-            rp = r["retention_period"]
-            mr = r["max_records"]
-
-            # Периодический retention по variable_id (по одному variable_id за запрос)
-            if rp:
-                try:
-                    await self._execute(
-                        f'''
-                        DELETE FROM "{self._schema}".variables_history
-                        WHERE variable_id = $1 AND sourcetimestamp < (NOW() - $2::interval)
-                        ''',
-                        vid,
-                        rp,
-                    )
-                except Exception as e:
-                    self.logger.warning(f"Retention DELETE by period failed for variable_id={vid}: {e}")
-
-            if mr is not None:
-                try:
-                    mr_int = int(mr)
-                except Exception:
-                    mr_int = 0
-                if mr_int > 0:
-                    max_records_map[vid] = mr_int
-
-        # Удаляем лишние записи по max_records (по одному variable_id)
-        for vid, mr in max_records_map.items():
-            try:
-                await self._execute(
-                    f'''
-                    DELETE FROM "{self._schema}".variables_history
-                    WHERE variable_id = $1 AND id NOT IN (
-                        SELECT id FROM "{self._schema}".variables_history
-                        WHERE variable_id = $1
-                        ORDER BY sourcetimestamp DESC LIMIT $2
-                    )
-                    ''',
-                    vid,
-                    mr,
-                )
-            except Exception as e:
-                self.logger.warning(f"Retention DELETE by max_records failed for variable_id={vid}: {e}")
-
-        # Отмечаем successful/attempted проход для дросселирования
-        finished_at = time.monotonic()
-        for vid in filtered_ids:
-            self._retention_cleanup_last_run_by_vid[vid] = finished_at
 
     async def _flush_event_batch(self, items: List[EventWriteItem]) -> None:
         """
@@ -2079,6 +2331,7 @@ class HistoryTimescale(HistoryStorageInterface):
                 async def _op() -> None:
                     async with failed_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
                         async with conn.transaction():
+                            insert_started_at = time.perf_counter()
                             await conn.executemany(
                                 f'INSERT INTO "{self._schema}".events_history '
                                 f'(source_id, event_type_id, event_timestamp, event_data) '
@@ -2087,7 +2340,16 @@ class HistoryTimescale(HistoryStorageInterface):
                                 params,
                                 timeout=self._db_query_timeout_sec,
                             )
+                            self._perf_observe_ms(
+                                "event_insert_history",
+                                (time.perf_counter() - insert_started_at) * 1000.0,
+                            )
+                flush_started_at = time.perf_counter()
                 await self._run_db_operation(_op(), "flush event batch")
+                self._perf_observe_ms(
+                    "event_flush_total",
+                    (time.perf_counter() - flush_started_at) * 1000.0,
+                )
                 return
             except Exception as e:
                 if attempt == 1:
@@ -2585,6 +2847,7 @@ class HistoryTimescale(HistoryStorageInterface):
         #    "save_node_value: node_id=%s source_ts=%s server_ts=%s status=%s",
         #    node_id, getattr(datavalue, 'SourceTimestamp', None), getattr(datavalue, 'ServerTimestamp', None), getattr(datavalue, 'StatusCode', None),
         #)
+        self._perf_inc("save_node_value_calls_total")
 
         node_id_str = self._format_node_id(node_id)
 
@@ -2717,22 +2980,8 @@ class HistoryTimescale(HistoryStorageInterface):
                             WHERE variable_id = $2
                         ''', actual_data_type, variable_id)
 
-            # Очистка старых данных по периоду хранения
-            if period:
-                date_limit = datetime.now(timezone.utc) - period
-                await self._execute(f'DELETE FROM "{self._schema}".variables_history WHERE variable_id = $1 AND sourcetimestamp < $2', variable_id, date_limit)
-            elif count > 0:
-                # Удаляем лишние записи по количеству для конкретного узла
-                await self._execute(f'''
-                    DELETE FROM "{self._schema}".variables_history
-                    WHERE variable_id = $1 AND id NOT IN (
-                        SELECT id FROM "{self._schema}".variables_history
-                        WHERE variable_id = $1
-                        ORDER BY sourcetimestamp DESC LIMIT $2
-                    )
-                ''', variable_id, count)
-
         except Exception as e:
+            self._perf_inc("save_node_value_errors_total")
             # Антиспам логирование при длительной недоступности БД
             self._log_save_failure_throttled('value', str(node_id), e, str(datavalue))
     
@@ -2746,6 +2995,7 @@ class HistoryTimescale(HistoryStorageInterface):
         #self.logger.debug(f"save_event: {type(event)}")
         #self.logger.debug(f"save_event: {dir(event)}")
         #self.logger.debug(f"save_event: {event.get_event_props_as_fields_dict()}")
+        self._perf_inc("save_event_calls_total")
 
         if event is None or not hasattr(event, 'SourceNode') or event.SourceNode is None:
             self.logger.error("save_event: invalid event")
@@ -2852,32 +3102,8 @@ class HistoryTimescale(HistoryStorageInterface):
                     event_data_json,
                 )
 
-            # Очистка старых данных по периоду хранения
-            # Получаем параметры хранения из event_sources
-            retention_rows = await self._fetch(f'''
-                SELECT retention_period, max_records FROM "{self._schema}".event_sources 
-                WHERE source_id = $1
-                LIMIT 1
-            ''', source_db_id)
-            
-            if retention_rows:
-                retention_period = retention_rows[0]['retention_period']
-                max_records = retention_rows[0]['max_records']
-                if retention_period:
-                    date_limit = datetime.now(timezone.utc) - retention_period
-                    await self._execute(f'DELETE FROM "{self._schema}".events_history WHERE source_id = $1 AND event_timestamp < $2', source_db_id, date_limit)
-                elif max_records and max_records > 0:
-                    # Удаляем лишние записи по количеству для конкретного источника
-                    await self._execute(f'''
-                        DELETE FROM "{self._schema}".events_history
-                        WHERE source_id = $1 AND id NOT IN (
-                            SELECT id FROM "{self._schema}".events_history
-                            WHERE source_id = $1
-                            ORDER BY event_timestamp DESC LIMIT $2
-                        )
-                    ''', source_db_id, max_records)
-
         except Exception as e:
+            self._perf_inc("save_event_errors_total")
             # Антиспам логирование при длительной недоступности БД
             src = getattr(event, 'SourceNode', 'unknown')
             self._log_save_failure_throttled('event', str(src), e)
