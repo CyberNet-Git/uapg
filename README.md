@@ -6,8 +6,21 @@
 
 UAPG - это модуль для хранения исторических данных OPC UA в PostgreSQL с поддержкой TimescaleDB для эффективной работы с временными рядами. 
 
+### HistoryTimescaleV2 — typed events storage (0.2.0)
+
+- **HistoryTimescaleV2** — dual-write в legacy `events_history` и v2 (`events_ts` + typed tables `evt_<slug>`)
+- **Режимы** — `UAPG_EVENTS_STORAGE_MODE`: `legacy` | `dual` (по умолчанию) | `v2`
+- **SQL push-down** — `FilterPlan` JSON, `uapg_read_events_v2`, typed ILIKE по колонкам registry
+- **Schema registry** — auto DDL при `new_historized_event`, advisory lock
+- **Backfill** — `run_events_backfill()` для миграции legacy → v2
+- **Timescale** — compression/retention на `events_ts`, optional CAGG `uapg_events_hourly`
+- **Roadmap** — skeleton variables V2 + OPC UA Aggregation (ADR-003, migrations `101_*`, `102_*`)
+
+Подробнее: `doc/adr/`, `doc/INTEGRATION.md`.
+
 ### Основные компоненты
 
+- **HistoryTimescaleV2** — typed events, SQL search (релиз 0.2.x)
 - **HistoryTimescale** ⭐ **Рекомендуется** - Продвинутая версия с едиными таблицами, батчевой записью и многоуровневым кэшированием для TimescaleDB. Основное направление развития проекта.
 - **HistoryPgSQL** - Базовый модуль для работы с историческими данными OPC UA (поддерживается для обратной совместимости)
 - **DatabaseManager** - Утилита для управления базой данных с зашифрованной конфигурацией
