@@ -323,7 +323,11 @@ class HistoryTimescaleV2(HistoryTimescale):
 
         planner = EventFilterPlanner(field_aliases=self._events_v2_config.field_aliases)
         plan = planner.build(evfilter)
-        event_type_ids = planner.extract_event_type_ids(plan)
+        event_type_ids = None
+        if self._event_store:
+            event_type_ids = await self._event_store._resolve_event_type_ids(planner, plan)
+        else:
+            event_type_ids = planner.extract_event_type_ids(plan)
         allowed = None
         if self._registry and event_type_ids:
             allowed = await self._registry.get_allowed_fields(event_type_ids)
@@ -332,7 +336,10 @@ class HistoryTimescaleV2(HistoryTimescale):
                 field_aliases=self._events_v2_config.field_aliases,
             )
             plan = planner.build(evfilter)
-            event_type_ids = planner.extract_event_type_ids(plan)
+            if self._event_store:
+                event_type_ids = await self._event_store._resolve_event_type_ids(planner, plan)
+            else:
+                event_type_ids = planner.extract_event_type_ids(plan)
         return await self._gateway.explain_event_filter(
             source_db_id, start_time, end_time, limit, order, event_type_ids
         )

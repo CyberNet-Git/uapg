@@ -8,7 +8,8 @@ CREATE TABLE IF NOT EXISTS "{schema}".events_ts (
     schema_version INTEGER NOT NULL DEFAULT 1,
     legacy_row_id BIGINT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (event_id, event_timestamp)
+    -- Timescale space partition on source_id requires PK to include source_id
+    PRIMARY KEY (source_id, event_timestamp, event_id)
 );
 
 CREATE TABLE IF NOT EXISTS "{schema}".event_type_schema (
@@ -29,14 +30,8 @@ CREATE TABLE IF NOT EXISTS "{schema}".event_type_storage (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_events_ts_source_ts
-    ON "{schema}".events_ts (source_id, event_timestamp DESC, event_id DESC);
-
 CREATE INDEX IF NOT EXISTS idx_events_ts_type_source
     ON "{schema}".events_ts (event_type_id, source_id, event_timestamp DESC);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_events_ts_source_ts
-    ON "{schema}".events_ts (source_id, event_timestamp);
 
 CREATE INDEX IF NOT EXISTS idx_events_ts_legacy_row
     ON "{schema}".events_ts (legacy_row_id)
@@ -45,7 +40,7 @@ CREATE INDEX IF NOT EXISTS idx_events_ts_legacy_row
 CREATE INDEX IF NOT EXISTS idx_event_type_schema_type
     ON "{schema}".event_type_schema (event_type_id, schema_version DESC);
 
--- Timescale hypertable (idempotent)
+-- Timescale hypertable (idempotent); indexes after conversion
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb') THEN
@@ -63,3 +58,9 @@ BEGIN
         END IF;
     END IF;
 END $$;
+
+CREATE INDEX IF NOT EXISTS idx_events_ts_source_ts
+    ON "{schema}".events_ts (source_id, event_timestamp DESC, event_id DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_ts_source_ts_uniq
+    ON "{schema}".events_ts (source_id, event_timestamp);

@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS "{schema}".variables_ts (
     value_bool BOOLEAN,
     value_text TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (value_id, sourcetimestamp)
+    -- Timescale space partition on variable_id requires PK to include variable_id
+    PRIMARY KEY (variable_id, sourcetimestamp, value_id)
 );
 
 CREATE TABLE IF NOT EXISTS "{schema}".variable_schema (
@@ -27,9 +28,6 @@ CREATE TABLE IF NOT EXISTS "{schema}".variable_schema (
     effective_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (variable_id, schema_version)
 );
-
-CREATE INDEX IF NOT EXISTS idx_variables_ts_var_ts
-    ON "{schema}".variables_ts (variable_id, sourcetimestamp DESC);
 
 DO $$
 BEGIN
@@ -48,6 +46,9 @@ BEGIN
         END IF;
     END IF;
 END $$;
+
+CREATE INDEX IF NOT EXISTS idx_variables_ts_var_ts
+    ON "{schema}".variables_ts (variable_id, sourcetimestamp DESC);
 
 INSERT INTO "{schema}".uapg_backfill_state (domain, last_legacy_id, rows_processed)
 VALUES ('variables', 0, 0)

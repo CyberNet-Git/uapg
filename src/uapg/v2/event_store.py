@@ -76,7 +76,9 @@ class EventStoreV2:
             field_aliases=self._registry.events_config.field_aliases,
         )
         plan = planner.build(evfilter)
-        event_type_ids = planner.extract_event_type_ids(plan)
+        event_type_ids = await self._resolve_event_type_ids(planner, plan)
+        if planner.extract_event_type_names(plan) and not event_type_ids:
+            return [], None, partial
         typed_fields = planner._collect_typed_fields(plan)
 
         if typed_fields and event_type_ids and len(event_type_ids) == 1:
@@ -98,6 +100,36 @@ class EventStoreV2:
         events = await self._hydrate_events(rows, binary_map_to_values)
         cont = rows[-1]["event_timestamp"] if len(rows) == limit and rows else None
         return events, cont, partial
+
+    async def _resolve_event_type_ids(
+        self,
+        planner: EventFilterPlanner,
+        plan: Dict[str, Any],
+    ) -> Optional[List[int]]:
+        numeric = planner.extract_event_type_ids(plan)
+        if numeric:
+            return numeric
+        names = planner.extract_event_type_names(plan)
+        if not names:
+            return None
+        ids: List[int] = []
+        for name in names:
+            row = await self._pool.fetchval(
+                f'''
+                SELECT event_type_id
+                FROM "{self._schema}".event_types
+                WHERE event_type_name = $1
+                   OR event_type_name LIKE $2
+                   OR event_type_name LIKE $3
+                LIMIT 1
+                ''',
+                name,
+                f"%;s=Events.{name}",
+                f"%;s={name}",
+            )
+            if row is not None:
+                ids.append(int(row))
+        return ids if ids else None
 
     async def _read_typed(
         self,

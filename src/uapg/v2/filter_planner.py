@@ -23,6 +23,29 @@ def _like_to_ilike(pattern: str) -> str:
     return str(pattern).replace("*", "%").replace("?", "_")
 
 
+def event_type_name_from_literal(value: Any) -> Optional[str]:
+    """Extract short event type name from OPC UA InList literal (NodeId or string)."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return None
+    ident: Any = value
+    if isinstance(value, ua.NodeId):
+        ident = value.Identifier
+    elif hasattr(value, "Identifier"):
+        ident = getattr(value, "Identifier")
+    if isinstance(ident, int):
+        return None
+    name = str(ident).strip()
+    if not name:
+        return None
+    if name.startswith("ns=") and ";s=" in name:
+        name = name.split(";s=", 1)[1]
+    if name.startswith("Events."):
+        name = name[len("Events.") :]
+    return name or None
+
+
 class EventFilterPlanner:
     """Builds a FilterPlan JSON document from ua.EventFilter."""
 
@@ -44,24 +67,38 @@ class EventFilterPlanner:
     def has_typed_pushdown(self, plan: FilterPlan) -> bool:
         return bool(self._collect_typed_fields(plan))
 
-    def extract_event_type_ids(self, plan: FilterPlan) -> Optional[List[int]]:
-        ids: List[int] = []
+    def extract_event_type_literals(self, plan: FilterPlan) -> Optional[List[Any]]:
+        literals: List[Any] = []
 
         def walk(node: FilterPlan) -> None:
             if not node:
                 return
             if "field" in node and node.get("field") == "EventType" and node.get("op") == "in":
-                for v in node.get("value") or []:
-                    if isinstance(v, int):
-                        ids.append(v)
-                    elif hasattr(v, "Identifier"):
-                        ids.append(int(v.Identifier))
+                literals.extend(node.get("value") or [])
             for key in ("and", "or"):
                 for child in node.get(key) or []:
                     walk(child)
 
         walk(plan)
+        return literals or None
+
+    def extract_event_type_ids(self, plan: FilterPlan) -> Optional[List[int]]:
+        """Numeric event_type_id values only (DB ids), skips string NodeIds."""
+        ids: List[int] = []
+        for value in self.extract_event_type_literals(plan) or []:
+            if isinstance(value, int):
+                ids.append(value)
+            elif hasattr(value, "Identifier") and isinstance(value.Identifier, int):
+                ids.append(int(value.Identifier))
         return ids or None
+
+    def extract_event_type_names(self, plan: FilterPlan) -> Optional[List[str]]:
+        names: List[str] = []
+        for value in self.extract_event_type_literals(plan) or []:
+            name = event_type_name_from_literal(value)
+            if name and name not in names:
+                names.append(name)
+        return names or None
 
     def strip_event_type(self, plan: FilterPlan) -> FilterPlan:
         if not plan:
@@ -144,7 +181,10 @@ class EventFilterPlanner:
             raw = self._literal_value(value_operand)
             return {"field": field, "op": "ilike", "value": _like_to_ilike(str(raw))}
         if operator == ua.FilterOperator.InList:
-            return {"field": field, "op": "in", "value": self._literal_list(value_operand)}
+            values: List[Any] = []
+            for operand in operands[1:]:
+                values.extend(self._literal_list(operand))
+            return {"field": field, "op": "in", "value": values}
         return None
 
     def _operand_field_name(self, operand: Any) -> Optional[str]:
