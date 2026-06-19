@@ -37,7 +37,7 @@ from asyncua.common.events import Event
 from .event_filter import apply_event_filter
 
 try:
-    from asyncua.server.history import get_event_properties_from_type_node
+    from asyncua.common.events import get_event_properties_from_type_node
 except ImportError:
     # Fallback для старых версий asyncua
     async def get_event_properties_from_type_node(event_type):

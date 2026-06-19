@@ -102,11 +102,17 @@ class HistoryTimescaleV2(HistoryTimescale):
         period: Any,
         count: int = 0,
     ) -> None:
-        await super().new_historized_event(source_id, evtypes, period, count)
+        from .opc_node_id import coerce_node_id
+
+        source_nid = coerce_node_id(source_id)
+        evtypes_raw = evtypes
+        evtypes_nid = [coerce_node_id(event_type) for event_type in evtypes_raw]
+        await super().new_historized_event(source_nid, evtypes_nid, period, count)
         if not should_write_v2(self._events_storage_mode) or not self._registry or not self._gateway:
             return
-        for event_type in evtypes:
-            event_type_name = self._format_node_id(event_type)
+        for raw_event_type in evtypes_raw:
+            event_type_nid = coerce_node_id(raw_event_type)
+            event_type_name = self._format_node_id(event_type_nid)
             event_db_id = self._event_type_cache.get(event_type_name)
             if event_db_id is None:
                 event_db_id = await self._fetchval(
@@ -119,10 +125,10 @@ class HistoryTimescaleV2(HistoryTimescale):
                 )
             if event_db_id is None:
                 continue
-            fields = await self._registry.introspect_fields([event_type], self._get_event_fields)
+            fields = await self._registry.introspect_fields([raw_event_type], self._get_event_fields)
             table, schema_version = await self._registry.sync_event_type(
                 int(event_db_id),
-                event_type,
+                event_type_nid,
                 None,
                 fields,
                 self._gateway,

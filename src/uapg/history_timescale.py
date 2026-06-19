@@ -317,7 +317,7 @@ class HistoryWriteBuffer:
                     fut.set_exception(e)
 
 try:
-    from asyncua.server.history import get_event_properties_from_type_node
+    from asyncua.common.events import get_event_properties_from_type_node
 except ImportError:
     # Fallback для старых версий asyncua
     async def get_event_properties_from_type_node(event_type):
@@ -337,6 +337,10 @@ def validate_table_name(name: str) -> None:
     import re
     if not re.match(r'^[\w\-]+$', name):
         raise ValueError(f"Invalid table name: {name}")
+
+
+from .opc_node_id import coerce_node_id as _coerce_node_id
+
 
 class HistoryTimescale(HistoryStorageInterface):
     """
@@ -2753,6 +2757,13 @@ class HistoryTimescale(HistoryStorageInterface):
         """
         ev_aggregate_fields = []
         for event_type in evtypes:
+            if isinstance(event_type, ua.NodeId):
+                self.logger.warning(
+                    "Cannot introspect event fields from NodeId %s without server Node; "
+                    "pass asyncua Node from historize_event",
+                    event_type,
+                )
+                continue
             ev_aggregate_fields.extend(await get_event_properties_from_type_node(event_type))
         ev_fields = []
         for field in set(ev_aggregate_fields):
@@ -2816,9 +2827,12 @@ class HistoryTimescale(HistoryStorageInterface):
         )
 
         try:
+            evtypes_raw = evtypes
+            source_id = _coerce_node_id(source_id)
+            evtypes = [_coerce_node_id(event_type) for event_type in evtypes_raw]
             effective_period = self._get_effective_retention_period(period)
-            # Получаем поля событий
-            ev_fields = await self._get_event_fields(evtypes)
+            # Поля читаем из asyncua Node до приведения к NodeId
+            ev_fields = await self._get_event_fields(evtypes_raw)
             self._event_fields[source_id] = ev_fields
 
             # Сохраняем метаданные для каждого типа события и получаем IDs

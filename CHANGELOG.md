@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.2] - 2026-06-17
+
+### Исправлено
+
+- **История событий (V2):** `new_historized_event` принимает типы событий как `asyncua.Node` (как передаёт asyncua из `get_referenced_nodes`), а не только `NodeId`. Исправлено падение `'Node' object has no attribute 'NamespaceIndex'` при включении historization — из-за него не создавалась подписка и `save_event` не вызывался.
+- **История событий (V2):** исправлен импорт `get_event_properties_from_type_node` из `asyncua.common.events` (раньше — из несуществующего `asyncua.server.history`, срабатывал fallback с пустым списком полей). Typed-таблицы создавались без колонок (`serial`, `dev_eui` и др.), из-за чего `insert_typed_row` падал с `UndefinedColumnError`.
+- **История событий (V2):** `insert_typed_row` перед записью добавляет отсутствующие колонки в typed-таблицу по ключам события (lazy migration для таблиц с пустой схемой).
+- **История событий (V2):** `python_value_to_sql` приводит числовые и булевы значения к строке для TEXT-колонок typed-таблиц (исправлена ошибка `expected str, got int` при flush).
+
 ## [0.2.1] - 2026-06-15
 
 ### Исправлено

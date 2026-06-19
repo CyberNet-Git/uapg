@@ -31,7 +31,10 @@ _OPC_TO_SQL = {
 
 
 def slug_from_node_id(node_id: ua.NodeId) -> str:
-    raw = f"{node_id.NamespaceIndex}_{node_id.Identifier}"
+    from ..opc_node_id import coerce_node_id
+
+    nid = coerce_node_id(node_id)
+    raw = f"{nid.NamespaceIndex}_{nid.Identifier}"
     slug = re.sub(r"[^a-zA-Z0-9_]+", "_", str(raw)).strip("_").lower()
     if not slug:
         slug = "unknown"
@@ -61,6 +64,11 @@ def python_value_to_sql(value: Any) -> Any:
         return value.decode("utf-8", errors="replace")
     if isinstance(value, ua.DateTime):
         return value
+    # Typed event tables use TEXT columns; asyncpg rejects int/bool for TEXT.
+    if isinstance(value, (bool, int, float)):
+        return str(value)
+    if not isinstance(value, str):
+        return str(value)
     return value
 
 
@@ -239,6 +247,30 @@ class EventSchemaRegistry:
         finally:
             await self._execute("SELECT pg_advisory_unlock($1)", lock_key)
 
+    async def ensure_columns_from_typed_values(
+        self, table: str, typed_values: Dict[str, Any]
+    ) -> None:
+        """Добавляет в typed-таблицу колонки, отсутствующие в схеме (lazy migration)."""
+        skip = frozenset({"Time", "EventType", "SourceNode", "ReceiveTime", "LocalTime"})
+        indexed = self._events_config.indexed_fields
+        aliases = self._events_config.field_aliases
+        fields: List[Dict[str, Any]] = []
+        for key in typed_values:
+            if key in skip:
+                continue
+            column = str(aliases.get(key, key))
+            if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", column):
+                continue
+            fields.append(
+                {
+                    "name": column,
+                    "sql_type": "TEXT",
+                    "index": column in indexed or key in indexed,
+                }
+            )
+        if fields:
+            await self._ensure_physical_table(table, fields)
+
     async def insert_typed_row(
         self,
         table: str,
@@ -247,6 +279,7 @@ class EventSchemaRegistry:
         source_id: int,
         typed_values: Dict[str, Any],
     ) -> None:
+        await self.ensure_columns_from_typed_values(table, typed_values)
         aliases = self._events_config.field_aliases
         base_cols = ["event_id", "event_timestamp", "source_id"]
         base_vals = [event_id, event_timestamp, source_id]
