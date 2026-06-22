@@ -5,11 +5,10 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from asyncua import ua
 
-from .event_filter import apply_event_filter
 from .history_timescale import EventWriteItem, HistoryTimescale
 from .v2.backfill_worker import EventsBackfillWorker
 from .v2.event_store import EventStoreV2
@@ -299,12 +298,13 @@ class HistoryTimescaleV2(HistoryTimescale):
             order,
             evfilter,
             self._binary_map_to_event_values,
+            continuation=None,
             partial=partial,
         )
-        results = apply_event_filter(results, evfilter)
         if is_partial and self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug("read_event_history v2 partial=true (backfill incomplete)")
-        return results, cont
+        opc_cont: Optional[Union[datetime, Tuple[datetime, int]]] = cont[0] if cont else None
+        return results, opc_cont
 
     async def run_events_backfill(self, batch_size: int = 500) -> Dict[str, int]:
         if not self._backfill_worker:
@@ -330,8 +330,10 @@ class HistoryTimescaleV2(HistoryTimescale):
         planner = EventFilterPlanner(field_aliases=self._events_v2_config.field_aliases)
         plan = planner.build(evfilter)
         event_type_ids = None
+        pinned_event_type_ids = None
         if self._event_store:
             event_type_ids = await self._event_store._resolve_event_type_ids(planner, plan)
+            pinned_event_type_ids = event_type_ids
         else:
             event_type_ids = planner.extract_event_type_ids(plan)
         allowed = None
@@ -343,7 +345,10 @@ class HistoryTimescaleV2(HistoryTimescale):
             )
             plan = planner.build(evfilter)
             if self._event_store:
-                event_type_ids = await self._event_store._resolve_event_type_ids(planner, plan)
+                event_type_ids = (
+                    await self._event_store._resolve_event_type_ids(planner, plan)
+                    or pinned_event_type_ids
+                )
             else:
                 event_type_ids = planner.extract_event_type_ids(plan)
         return await self._gateway.explain_event_filter(

@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.3] - 2026-06-19
+
+### Добавлено
+
+- **Keyset-пагинация событий V2:** `EventStoreV2.read_events` передаёт `cursor_ts`/`cursor_event_id` в `uapg_read_events_v2`, возвращает continuation `(event_timestamp, event_id)`, цикл догрузки после post-filter (до 5 итераций).
+- **Multi-type SQL push-down:** typed-чтение для нескольких `event_type_ids` через `UNION ALL` при общих indexed-полях; whitelist `allowed_fields` в read path.
+
+### Исправлено
+
+- **`HistoryTimescaleV2.read_event_history`:** убран ошибочный `sql_continuation` от нижней границы диапазона; пагинация DESC опирается на границы из `_get_bounds` и OPC continuation timestamp.
+- **`EventStoreV2.read_events`:** сохранение `event_type_ids` при пересборке FilterPlan с `allowed_fields` — совместный фильтр тип+поле не теряет SQL-фильтр по типу.
+- **`EventStoreV2.read_events`:** при фильтре только по полям payload (`dev_eui` и т.д.) без `EventType` — typed SQL push-down по всем типам с physical table (`UNION ALL`).
+- **`EventStoreV2` typed SQL push-down:** исправлена нумерация SQL-параметров для фильтров по typed-полям; фильтр `dev_eui` больше не конфликтует с `event_type_id` и не вызывает `BadInternalError`.
+
 ## [0.2.2] - 2026-06-17
 
 ### Исправлено

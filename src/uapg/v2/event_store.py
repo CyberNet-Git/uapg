@@ -5,15 +5,19 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from asyncua.common.events import Event
 
+from ..event_filter import apply_event_filter
 from .filter_planner import EventFilterPlanner, sql_where_from_plan
 from .procedure_gateway import ProcedureGateway
 from .schema_registry import EventSchemaRegistry, python_value_to_sql
 
 _logger = logging.getLogger(__name__)
+
+MAX_REFILL_ITERATIONS = 5
+EventContinuation = Tuple[datetime, int]
 
 
 class EventStoreV2:
@@ -70,36 +74,213 @@ class EventStoreV2:
         evfilter: Any,
         binary_map_to_values: Any,
         *,
+        continuation: Optional[EventContinuation] = None,
         partial: bool = False,
-    ) -> Tuple[List[Any], Optional[datetime], bool]:
+    ) -> Tuple[List[Any], Optional[EventContinuation], bool]:
         planner = EventFilterPlanner(
             field_aliases=self._registry.events_config.field_aliases,
         )
         plan = planner.build(evfilter)
         event_type_ids = await self._resolve_event_type_ids(planner, plan)
+        pinned_event_type_ids = event_type_ids
         if planner.extract_event_type_names(plan) and not event_type_ids:
             return [], None, partial
-        typed_fields = planner._collect_typed_fields(plan)
 
-        if typed_fields and event_type_ids and len(event_type_ids) == 1:
-            events, cont, is_partial = await self._read_typed(
+        allowed = None
+        if event_type_ids:
+            allowed = await self._registry.get_allowed_fields(event_type_ids)
+            if allowed:
+                planner = EventFilterPlanner(
+                    allowed_fields=allowed,
+                    field_aliases=self._registry.events_config.field_aliases,
+                )
+                plan = planner.build(evfilter)
+                event_type_ids = await self._resolve_event_type_ids(planner, plan) or pinned_event_type_ids
+
+        typed_fields = planner._collect_typed_fields(plan)
+        if typed_fields and not event_type_ids:
+            event_type_ids = await self._resolve_pushdown_event_type_ids(typed_fields)
+
+        matched: List[Any] = []
+        cursor = continuation
+        db_exhausted = False
+        last_cont: Optional[EventContinuation] = None
+
+        for _ in range(MAX_REFILL_ITERATIONS):
+            if len(matched) >= limit:
+                break
+
+            fetch_limit = limit - len(matched)
+            rows, path_partial = await self._fetch_rows(
                 source_db_id,
-                int(event_type_ids[0]),
                 start,
                 end,
-                limit,
+                fetch_limit,
                 order,
                 plan,
-                binary_map_to_values,
+                event_type_ids,
+                typed_fields,
+                cursor,
             )
-            return events, cont, is_partial or partial
+            if path_partial:
+                partial = True
+
+            if not rows:
+                db_exhausted = True
+                break
+
+            events = await self._hydrate_events(rows, binary_map_to_values)
+            if evfilter:
+                before_count = len(events)
+                events = apply_event_filter(events, evfilter)
+                # #region agent log
+                try:
+                    import json
+                    import time
+                    sample_dev_euis = []
+                    for event in events[:10]:
+                        val = getattr(event, 'dev_eui', None)
+                        sample_dev_euis.append(str(val) if val is not None else '<empty>')
+                    with open('/home/vvp/prod/opcvibroiot/.cursor/debug-c9d643.log', 'a', encoding='utf-8') as _dbg:
+                        _dbg.write(json.dumps({
+                            'sessionId': 'c9d643',
+                            'timestamp': int(time.time() * 1000),
+                            'location': 'event_store.py:read_events',
+                            'message': 'apply_event_filter result',
+                            'data': {
+                                'before_count': before_count,
+                                'after_count': len(events),
+                                'sample_dev_euis': sample_dev_euis,
+                            },
+                            'hypothesisId': 'H5',
+                            'runId': 'pre-fix',
+                        }, ensure_ascii=False) + '\n')
+                except Exception:
+                    pass
+                # #endregion
+            matched.extend(events)
+
+            last_row = rows[-1]
+            last_cont = (
+                last_row["event_timestamp"],
+                int(last_row["event_id"]),
+            )
+            cursor = last_cont
+
+            if len(rows) < fetch_limit:
+                db_exhausted = True
+                break
+
+        matched = matched[:limit]
+        cont: Optional[EventContinuation] = None
+        if not db_exhausted and last_cont is not None and len(matched) >= limit:
+            cont = last_cont
+        return matched, cont, partial
+
+    async def _fetch_rows(
+        self,
+        source_db_id: int,
+        start: datetime,
+        end: datetime,
+        limit: int,
+        order: str,
+        plan: Dict[str, Any],
+        event_type_ids: Optional[List[int]],
+        typed_fields: Set[str],
+        cursor: Optional[EventContinuation],
+    ) -> Tuple[List[Any], bool]:
+        cursor_ts = cursor[0] if cursor else None
+        cursor_event_id = cursor[1] if cursor else None
+
+        read_path = 'generic'
+        if typed_fields and event_type_ids:
+            read_path = 'typed_single' if len(event_type_ids) == 1 else 'typed_multi'
+
+        # #region agent log
+        try:
+            import json
+            import time
+            with open('/home/vvp/prod/opcvibroiot/.cursor/debug-c9d643.log', 'a', encoding='utf-8') as _dbg:
+                _dbg.write(json.dumps({
+                    'sessionId': 'c9d643',
+                    'timestamp': int(time.time() * 1000),
+                    'location': 'event_store.py:_fetch_rows',
+                    'message': 'fetch rows path',
+                    'data': {
+                        'read_path': read_path,
+                        'typed_fields': sorted(typed_fields),
+                        'event_type_ids_count': len(event_type_ids or []),
+                        'plan_keys': list(plan.keys()) if isinstance(plan, dict) else [],
+                        'plan_has_dev_eui': 'dev_eui' in json.dumps(plan, default=str),
+                    },
+                    'hypothesisId': 'H2',
+                    'runId': 'pre-fix',
+                }, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        # #endregion
+
+        if typed_fields and event_type_ids:
+            if len(event_type_ids) == 1:
+                return await self._read_typed_rows(
+                    source_db_id,
+                    int(event_type_ids[0]),
+                    start,
+                    end,
+                    limit,
+                    order,
+                    plan,
+                    cursor_ts,
+                    cursor_event_id,
+                )
+            common_fields = await self._common_pushdown_fields(event_type_ids, typed_fields)
+            if common_fields:
+                return await self._read_typed_multi_rows(
+                    source_db_id,
+                    event_type_ids,
+                    start,
+                    end,
+                    limit,
+                    order,
+                    plan,
+                    common_fields,
+                    cursor_ts,
+                    cursor_event_id,
+                )
 
         rows = await self._gateway.read_events_v2(
-            source_db_id, start, end, limit, order, event_type_ids
+            source_db_id,
+            start,
+            end,
+            limit,
+            order,
+            event_type_ids,
+            cursor_ts,
+            cursor_event_id,
         )
-        events = await self._hydrate_events(rows, binary_map_to_values)
-        cont = rows[-1]["event_timestamp"] if len(rows) == limit and rows else None
-        return events, cont, partial
+        return list(rows), False
+
+    async def _common_pushdown_fields(
+        self,
+        event_type_ids: List[int],
+        typed_fields: Set[str],
+    ) -> Optional[Set[str]]:
+        configured = set(self._registry.events_config.sql_filter_fields)
+        if configured:
+            common = typed_fields & configured
+            return common if common else None
+
+        allowed_sets: List[Set[str]] = []
+        for type_id in event_type_ids:
+            allowed = await self._registry.get_allowed_fields([int(type_id)])
+            if not allowed:
+                return None
+            allowed_sets.append(allowed)
+
+        common = typed_fields.copy()
+        for allowed in allowed_sets:
+            common &= allowed
+        return common if common else None
 
     async def _resolve_event_type_ids(
         self,
@@ -131,7 +312,64 @@ class EventStoreV2:
                 ids.append(int(row))
         return ids if ids else None
 
-    async def _read_typed(
+    async def _resolve_pushdown_event_type_ids(self, typed_fields: Set[str]) -> Optional[List[int]]:
+        """Все типы с typed-таблицами, когда в фильтре есть поля payload, но нет InList по EventType."""
+        if not typed_fields:
+            return None
+        configured = set(self._registry.events_config.sql_filter_fields)
+        if configured and not typed_fields.issubset(configured):
+            return None
+        rows = await self._pool.fetch(
+            f'''
+            SELECT et.event_type_id
+            FROM "{self._schema}".event_types et
+            INNER JOIN "{self._schema}".event_type_storage ets
+              ON ets.event_type_id = et.event_type_id
+            ORDER BY et.event_type_id
+            '''
+        )
+        ids = [int(row["event_type_id"]) for row in rows]
+        return ids or None
+
+    def _cursor_clause(
+        self,
+        order: str,
+        *,
+        table_alias: str = "e",
+        cursor_ts: Optional[datetime],
+        cursor_event_id: Optional[int],
+        param_index: int,
+    ) -> Tuple[str, List[Any]]:
+        if cursor_ts is None:
+            return "", []
+        order_sql = "DESC" if order.upper() == "DESC" else "ASC"
+        ts_param = param_index
+        id_param = param_index + 1
+        if order_sql == "DESC":
+            clause = f'''
+              AND (
+                  {table_alias}.event_timestamp < ${ts_param}
+                  OR (
+                      {table_alias}.event_timestamp = ${ts_param}
+                      AND ${id_param}::bigint IS NOT NULL
+                      AND {table_alias}.event_id < ${id_param}
+                  )
+              )
+            '''
+        else:
+            clause = f'''
+              AND (
+                  {table_alias}.event_timestamp > ${ts_param}
+                  OR (
+                      {table_alias}.event_timestamp = ${ts_param}
+                      AND ${id_param}::bigint IS NOT NULL
+                      AND {table_alias}.event_id > ${id_param}
+                  )
+              )
+            '''
+        return clause, [cursor_ts, cursor_event_id]
+
+    async def _read_typed_rows(
         self,
         source_db_id: int,
         event_type_id: int,
@@ -140,15 +378,21 @@ class EventStoreV2:
         limit: int,
         order: str,
         plan: Dict[str, Any],
-        binary_map_to_values: Any,
-    ) -> Tuple[List[Any], Optional[datetime], bool]:
+        cursor_ts: Optional[datetime],
+        cursor_event_id: Optional[int],
+    ) -> Tuple[List[Any], bool]:
         table = await self._registry.get_storage_table(event_type_id)
         if not table:
-            return [], None, True
+            return [], True
 
         typed_plan = EventFilterPlanner().strip_event_type(plan)
-        where_sql, params, _ = sql_where_from_plan(typed_plan, table_alias="t")
+        where_sql, params, next_idx = sql_where_from_plan(
+            typed_plan,
+            table_alias="t",
+            param_offset=5,
+        )
         order_sql = "DESC" if order.upper() == "DESC" else "ASC"
+        args: List[Any] = [source_db_id, event_type_id, start, end]
         sql = f'''
             SELECT e.event_id, e.event_timestamp, e.event_type_id, e.legacy_row_id
             FROM "{self._schema}".events_ts e
@@ -158,17 +402,159 @@ class EventStoreV2:
               AND e.event_type_id = $2
               AND e.event_timestamp BETWEEN $3 AND $4
         '''
-        args: List[Any] = [source_db_id, event_type_id, start, end]
         if where_sql:
             sql += f" AND {where_sql}"
             args.extend(params)
+            next_idx = len(args) + 1
+
+        cursor_sql, cursor_params = self._cursor_clause(
+            order,
+            cursor_ts=cursor_ts,
+            cursor_event_id=cursor_event_id,
+            param_index=next_idx,
+        )
+        if cursor_sql:
+            sql += cursor_sql
+            args.extend(cursor_params)
+
         sql += f" ORDER BY e.event_timestamp {order_sql}, e.event_id {order_sql} LIMIT ${len(args) + 1}"
         args.append(limit)
 
         rows = await self._pool.fetch(sql, *args)
-        events = await self._hydrate_events(rows, binary_map_to_values)
-        cont = rows[-1]["event_timestamp"] if len(rows) == limit and rows else None
-        return events, cont, False
+        return list(rows), False
+
+    async def _read_typed_multi_rows(
+        self,
+        source_db_id: int,
+        event_type_ids: List[int],
+        start: datetime,
+        end: datetime,
+        limit: int,
+        order: str,
+        plan: Dict[str, Any],
+        common_fields: Set[str],
+        cursor_ts: Optional[datetime],
+        cursor_event_id: Optional[int],
+    ) -> Tuple[List[Any], bool]:
+        typed_plan = EventFilterPlanner().strip_event_type(plan)
+        filtered_plan = self._filter_plan_fields(typed_plan, common_fields)
+        order_sql = "DESC" if order.upper() == "DESC" else "ASC"
+        branches: List[str] = []
+        branch_args: List[Any] = [source_db_id, start, end]
+        param_idx = 4
+
+        for event_type_id in event_type_ids:
+            table = await self._registry.get_storage_table(int(event_type_id))
+            if not table:
+                continue
+            event_type_param_idx = param_idx
+            branch_args.append(int(event_type_id))
+            param_idx += 1
+            where_sql, params, _ = sql_where_from_plan(
+                filtered_plan, table_alias="t", param_offset=param_idx
+            )
+            branch = f'''
+                SELECT e.event_id, e.event_timestamp, e.event_type_id, e.legacy_row_id
+                FROM "{self._schema}".events_ts e
+                INNER JOIN "{self._schema}"."{table}" t
+                  ON t.event_id = e.event_id AND t.event_timestamp = e.event_timestamp
+                WHERE e.source_id = $1
+                  AND e.event_type_id = ${event_type_param_idx}
+                  AND e.event_timestamp BETWEEN $2 AND $3
+            '''
+            if where_sql:
+                branch += f" AND {where_sql}"
+                branch_args.extend(params)
+                param_idx = len(branch_args) + 1
+            branches.append(branch)
+
+        if not branches:
+            return [], True
+
+        union_sql = " UNION ALL ".join(branches)
+        cursor_sql, cursor_params = self._cursor_clause(
+            order,
+            table_alias="merged",
+            cursor_ts=cursor_ts,
+            cursor_event_id=cursor_event_id,
+            param_index=param_idx,
+        )
+        args = branch_args + cursor_params
+        limit_idx = len(args) + 1
+        sql = f'''
+            SELECT merged.event_id, merged.event_timestamp, merged.event_type_id, merged.legacy_row_id
+            FROM ({union_sql}) merged
+            WHERE TRUE
+            {cursor_sql}
+            ORDER BY merged.event_timestamp {order_sql}, merged.event_id {order_sql}
+            LIMIT ${limit_idx}
+        '''
+        args.append(limit)
+        # #region agent log
+        try:
+            import json
+            import time
+            with open('/home/vvp/prod/opcvibroiot/.cursor/debug-c9d643.log', 'a', encoding='utf-8') as _dbg:
+                _dbg.write(json.dumps({
+                    'sessionId': 'c9d643',
+                    'timestamp': int(time.time() * 1000),
+                    'location': 'event_store.py:_read_typed_multi_rows',
+                    'message': 'typed multi sql before fetch',
+                    'data': {
+                        'branches_count': len(branches),
+                        'common_fields': sorted(common_fields),
+                        'filtered_plan': filtered_plan,
+                        'args_count': len(args),
+                        'limit': limit,
+                        'filter_params': [str(arg) for arg in args if isinstance(arg, str)][:10],
+                    },
+                    'hypothesisId': 'H6',
+                    'runId': 'post-fix',
+                }, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        # #endregion
+        rows = await self._pool.fetch(sql, *args)
+        # #region agent log
+        try:
+            import json
+            import time
+            rows_list = list(rows)
+            with open('/home/vvp/prod/opcvibroiot/.cursor/debug-c9d643.log', 'a', encoding='utf-8') as _dbg:
+                _dbg.write(json.dumps({
+                    'sessionId': 'c9d643',
+                    'timestamp': int(time.time() * 1000),
+                    'location': 'event_store.py:_read_typed_multi_rows',
+                    'message': 'typed multi sql after fetch',
+                    'data': {
+                        'rows_count': len(rows_list),
+                        'event_type_ids_sample': [int(row['event_type_id']) for row in rows_list[:10]],
+                        'legacy_ids_sample': [int(row['legacy_row_id'] or 0) for row in rows_list[:10]],
+                    },
+                    'hypothesisId': 'H6',
+                    'runId': 'post-fix',
+                }, ensure_ascii=False) + '\n')
+            return rows_list, False
+        except Exception:
+            pass
+        # #endregion
+        return list(rows), False
+
+    def _filter_plan_fields(self, plan: Dict[str, Any], allowed: Set[str]) -> Dict[str, Any]:
+        if not plan:
+            return {}
+        if "and" in plan:
+            children = [self._filter_plan_fields(child, allowed) for child in plan["and"]]
+            children = [child for child in children if child]
+            return {"and": children} if children else {}
+        if "or" in plan:
+            children = [self._filter_plan_fields(child, allowed) for child in plan["or"]]
+            children = [child for child in children if child]
+            return {"or": children} if children else {}
+        field = plan.get("field")
+        if field and field not in allowed and field != "EventType":
+            return {}
+        return plan
 
     async def _hydrate_events(self, rows: List[Any], binary_map_to_values: Any) -> List[Any]:
         if not rows:
