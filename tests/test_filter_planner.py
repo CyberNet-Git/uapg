@@ -9,17 +9,18 @@ def test_events_v2_config_from_csv() -> None:
     cfg = EventsV2Config.from_csv(
         indexed="serial,dev_eui",
         filterable="EventType,serial",
-        aliases="mountpoint:mountpoint_tag",
+        aliases="api_field:db_column",
     )
     assert cfg.indexed_fields == frozenset({"serial", "dev_eui"})
     assert cfg.sql_filter_fields == frozenset({"EventType", "serial"})
-    assert cfg.column_name("mountpoint") == "mountpoint_tag"
+    assert cfg.column_name("api_field") == "db_column"
 
 
 def test_normalize_field_name_with_aliases() -> None:
-    aliases = {"mountpoint": "mountpoint_tag"}
-    assert normalize_field_name("mountpoint", aliases) == "mountpoint_tag"
+    aliases = {"filter_name": "column_name"}
+    assert normalize_field_name("filter_name", aliases) == "column_name"
     assert normalize_field_name("serial", aliases) == "serial"
+    assert normalize_field_name("column_name", aliases) == "column_name"
 
 
 def test_sql_where_ilike() -> None:

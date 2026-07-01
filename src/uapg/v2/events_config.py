@@ -58,3 +58,28 @@ class EventsV2Config:
 
     def sql_filter_fields_csv(self) -> str:
         return ",".join(sorted(self.sql_filter_fields))
+
+
+def expand_sql_filter_fields(
+    fields: FrozenSet[str] | set[str],
+    aliases: Optional[Mapping[str, str]] = None,
+) -> set[str]:
+    """Расширяет whitelist полей парой alias src↔dst (конфигурация деплоя)."""
+    expanded = set(fields)
+    if aliases:
+        for src, dst in aliases.items():
+            if src in expanded:
+                expanded.add(dst)
+            if dst in expanded:
+                expanded.add(src)
+    return expanded
+
+
+def typed_fields_supported(
+    typed_fields: set[str],
+    configured: FrozenSet[str] | set[str],
+    aliases: Optional[Mapping[str, str]] = None,
+) -> bool:
+    if not configured:
+        return True
+    return typed_fields.issubset(expand_sql_filter_fields(configured, aliases))

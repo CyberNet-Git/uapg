@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from asyncua.common.events import Event
 
 from ..event_filter import apply_event_filter
+from .events_config import expand_sql_filter_fields, typed_fields_supported
 from .filter_planner import EventFilterPlanner, sql_where_from_plan
 from .procedure_gateway import ProcedureGateway
 from .schema_registry import EventSchemaRegistry, python_value_to_sql
@@ -131,33 +132,7 @@ class EventStoreV2:
 
             events = await self._hydrate_events(rows, binary_map_to_values)
             if evfilter:
-                before_count = len(events)
                 events = apply_event_filter(events, evfilter)
-                # #region agent log
-                try:
-                    import json
-                    import time
-                    sample_dev_euis = []
-                    for event in events[:10]:
-                        val = getattr(event, 'dev_eui', None)
-                        sample_dev_euis.append(str(val) if val is not None else '<empty>')
-                    with open('/home/vvp/prod/opcvibroiot/.cursor/debug-c9d643.log', 'a', encoding='utf-8') as _dbg:
-                        _dbg.write(json.dumps({
-                            'sessionId': 'c9d643',
-                            'timestamp': int(time.time() * 1000),
-                            'location': 'event_store.py:read_events',
-                            'message': 'apply_event_filter result',
-                            'data': {
-                                'before_count': before_count,
-                                'after_count': len(events),
-                                'sample_dev_euis': sample_dev_euis,
-                            },
-                            'hypothesisId': 'H5',
-                            'runId': 'pre-fix',
-                        }, ensure_ascii=False) + '\n')
-                except Exception:
-                    pass
-                # #endregion
             matched.extend(events)
 
             last_row = rows[-1]
@@ -192,34 +167,6 @@ class EventStoreV2:
         cursor_ts = cursor[0] if cursor else None
         cursor_event_id = cursor[1] if cursor else None
 
-        read_path = 'generic'
-        if typed_fields and event_type_ids:
-            read_path = 'typed_single' if len(event_type_ids) == 1 else 'typed_multi'
-
-        # #region agent log
-        try:
-            import json
-            import time
-            with open('/home/vvp/prod/opcvibroiot/.cursor/debug-c9d643.log', 'a', encoding='utf-8') as _dbg:
-                _dbg.write(json.dumps({
-                    'sessionId': 'c9d643',
-                    'timestamp': int(time.time() * 1000),
-                    'location': 'event_store.py:_fetch_rows',
-                    'message': 'fetch rows path',
-                    'data': {
-                        'read_path': read_path,
-                        'typed_fields': sorted(typed_fields),
-                        'event_type_ids_count': len(event_type_ids or []),
-                        'plan_keys': list(plan.keys()) if isinstance(plan, dict) else [],
-                        'plan_has_dev_eui': 'dev_eui' in json.dumps(plan, default=str),
-                    },
-                    'hypothesisId': 'H2',
-                    'runId': 'pre-fix',
-                }, ensure_ascii=False) + '\n')
-        except Exception:
-            pass
-        # #endregion
-
         if typed_fields and event_type_ids:
             if len(event_type_ids) == 1:
                 return await self._read_typed_rows(
@@ -235,18 +182,23 @@ class EventStoreV2:
                 )
             common_fields = await self._common_pushdown_fields(event_type_ids, typed_fields)
             if common_fields:
-                return await self._read_typed_multi_rows(
-                    source_db_id,
+                eligible_type_ids = await self._event_type_ids_with_fields(
                     event_type_ids,
-                    start,
-                    end,
-                    limit,
-                    order,
-                    plan,
                     common_fields,
-                    cursor_ts,
-                    cursor_event_id,
                 )
+                if eligible_type_ids:
+                    return await self._read_typed_multi_rows(
+                        source_db_id,
+                        eligible_type_ids,
+                        start,
+                        end,
+                        limit,
+                        order,
+                        plan,
+                        common_fields,
+                        cursor_ts,
+                        cursor_event_id,
+                    )
 
         rows = await self._gateway.read_events_v2(
             source_db_id,
@@ -265,22 +217,37 @@ class EventStoreV2:
         event_type_ids: List[int],
         typed_fields: Set[str],
     ) -> Optional[Set[str]]:
-        configured = set(self._registry.events_config.sql_filter_fields)
-        if configured:
-            common = typed_fields & configured
-            return common if common else None
-
+        aliases = self._registry.events_config.field_aliases
+        configured = expand_sql_filter_fields(
+            set(self._registry.events_config.sql_filter_fields),
+            aliases,
+        )
         allowed_sets: List[Set[str]] = []
         for type_id in event_type_ids:
-            allowed = await self._registry.get_allowed_fields([int(type_id)])
-            if not allowed:
+            schema_fields = await self._registry.get_schema_fields_for_event_type(int(type_id))
+            if not schema_fields:
                 return None
-            allowed_sets.append(allowed)
+            if configured:
+                allowed_sets.append(schema_fields & configured)
+            else:
+                allowed_sets.append(schema_fields)
 
         common = typed_fields.copy()
         for allowed in allowed_sets:
             common &= allowed
         return common if common else None
+
+    async def _event_type_ids_with_fields(
+        self,
+        event_type_ids: List[int],
+        required_fields: Set[str],
+    ) -> List[int]:
+        eligible: List[int] = []
+        for type_id in event_type_ids:
+            schema_fields = await self._registry.get_schema_fields_for_event_type(int(type_id))
+            if required_fields.issubset(schema_fields):
+                eligible.append(int(type_id))
+        return eligible
 
     async def _resolve_event_type_ids(
         self,
@@ -316,8 +283,9 @@ class EventStoreV2:
         """Все типы с typed-таблицами, когда в фильтре есть поля payload, но нет InList по EventType."""
         if not typed_fields:
             return None
-        configured = set(self._registry.events_config.sql_filter_fields)
-        if configured and not typed_fields.issubset(configured):
+        cfg = self._registry.events_config
+        configured = set(cfg.sql_filter_fields)
+        if configured and not typed_fields_supported(typed_fields, configured, cfg.field_aliases):
             return None
         rows = await self._pool.fetch(
             f'''
@@ -490,54 +458,7 @@ class EventStoreV2:
             LIMIT ${limit_idx}
         '''
         args.append(limit)
-        # #region agent log
-        try:
-            import json
-            import time
-            with open('/home/vvp/prod/opcvibroiot/.cursor/debug-c9d643.log', 'a', encoding='utf-8') as _dbg:
-                _dbg.write(json.dumps({
-                    'sessionId': 'c9d643',
-                    'timestamp': int(time.time() * 1000),
-                    'location': 'event_store.py:_read_typed_multi_rows',
-                    'message': 'typed multi sql before fetch',
-                    'data': {
-                        'branches_count': len(branches),
-                        'common_fields': sorted(common_fields),
-                        'filtered_plan': filtered_plan,
-                        'args_count': len(args),
-                        'limit': limit,
-                        'filter_params': [str(arg) for arg in args if isinstance(arg, str)][:10],
-                    },
-                    'hypothesisId': 'H6',
-                    'runId': 'post-fix',
-                }, ensure_ascii=False) + '\n')
-        except Exception:
-            pass
-        # #endregion
         rows = await self._pool.fetch(sql, *args)
-        # #region agent log
-        try:
-            import json
-            import time
-            rows_list = list(rows)
-            with open('/home/vvp/prod/opcvibroiot/.cursor/debug-c9d643.log', 'a', encoding='utf-8') as _dbg:
-                _dbg.write(json.dumps({
-                    'sessionId': 'c9d643',
-                    'timestamp': int(time.time() * 1000),
-                    'location': 'event_store.py:_read_typed_multi_rows',
-                    'message': 'typed multi sql after fetch',
-                    'data': {
-                        'rows_count': len(rows_list),
-                        'event_type_ids_sample': [int(row['event_type_id']) for row in rows_list[:10]],
-                        'legacy_ids_sample': [int(row['legacy_row_id'] or 0) for row in rows_list[:10]],
-                    },
-                    'hypothesisId': 'H6',
-                    'runId': 'post-fix',
-                }, ensure_ascii=False) + '\n')
-            return rows_list, False
-        except Exception:
-            pass
-        # #endregion
         return list(rows), False
 
     def _filter_plan_fields(self, plan: Dict[str, Any], allowed: Set[str]) -> Dict[str, Any]:

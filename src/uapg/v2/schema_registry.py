@@ -201,6 +201,31 @@ class EventSchemaRegistry:
                     allowed.add(str(name))
         return allowed
 
+    async def get_schema_fields_for_event_type(self, event_type_id: int) -> Set[str]:
+        row = await self._fetchrow(
+            f'''
+            SELECT fields
+            FROM "{self._schema}".event_type_schema
+            WHERE event_type_id = $1
+            ORDER BY schema_version DESC
+            LIMIT 1
+            ''',
+            int(event_type_id),
+        )
+        if not row:
+            return set()
+        fields = row["fields"]
+        if isinstance(fields, str):
+            import json
+
+            fields = json.loads(fields)
+        names: Set[str] = set()
+        for fld in fields or []:
+            name = fld.get("name") if isinstance(fld, dict) else None
+            if name:
+                names.add(str(name))
+        return names
+
     async def _ensure_physical_table(self, table: str, fields: List[Dict[str, Any]]) -> None:
         lock_key = abs(hash(table)) % (2**31 - 1)
         await self._execute("SELECT pg_advisory_lock($1)", lock_key)

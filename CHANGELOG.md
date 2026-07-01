@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.4] - 2026-07-01
+
+### Исправлено
+
+- **`EventStoreV2._common_pushdown_fields`:** пересечение typed-полей с учётом схемы каждого `event_type_id` — UNION ALL не ссылается на несуществующие колонки.
+- **Убраны привязки к конкретному проекту:** хардкод `mountpoint`/`mountpoint_tag` заменён на generic `field_aliases`; удалена отладочная запись в пути opcvibroiot.
+
+### Изменено
+
+- **`expand_sql_filter_fields` / `typed_fields_supported`:** принимают `aliases` из конфигурации деплоя вместо захардкоженных имён полей.
+
 ## [0.2.3] - 2026-06-19
 
 ### Добавлено

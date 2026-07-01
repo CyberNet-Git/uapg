@@ -1,0 +1,27 @@
+---
+description: uapg — без привязок к конкретному проекту/деплою
+alwaysApply: true
+---
+
+# uapg: универсальная библиотека
+
+uapg — переиспользуемый пакет OPC UA history storage. **Запрещены привязки к конкретному проекту** (VibroIoT, opcvibroiot, ovic и т.п.) в коде ядра.
+
+## Правила
+
+- Не хардкодить имена полей, типов событий, пути к файлам и env конкретного деплоя.
+- Маппинг имён полей — только через `EventsV2Config.field_aliases` / `UAPG_EVENTS_FIELD_ALIASES` (`filter_name:column_name`).
+- Whitelist SQL-фильтров — через `sql_filter_fields`; расширение пар alias — в `expand_sql_filter_fields(fields, aliases)`.
+- Не писать debug-логи в пути вне пакета; не импортировать модули потребителей.
+- Документация интеграции с конкретным проектом — только в `doc/INTEGRATION.md`, не в runtime-коде.
+
+## Пример
+
+```python
+# ❌ в ядре uapg
+if name == "legacy_api_name":
+    return "canonical_column"
+
+# ✅ в конфиге деплоя
+UAPG_EVENTS_FIELD_ALIASES=legacy_api_name:canonical_column
+```
