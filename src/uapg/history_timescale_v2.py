@@ -103,10 +103,10 @@ class HistoryTimescaleV2(HistoryTimescale):
     ) -> None:
         from .opc_node_id import coerce_node_id
 
-        source_nid = coerce_node_id(source_id)
         evtypes_raw = evtypes
         evtypes_nid = [coerce_node_id(event_type) for event_type in evtypes_raw]
-        await super().new_historized_event(source_nid, evtypes_nid, period, count)
+        # Legacy path introspects fields from asyncua Node (see HistoryTimescale.new_historized_event).
+        await super().new_historized_event(source_id, evtypes_raw, period, count)
         if not should_write_v2(self._events_storage_mode) or not self._registry or not self._gateway:
             return
         for raw_event_type in evtypes_raw:

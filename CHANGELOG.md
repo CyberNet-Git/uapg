@@ -64,6 +64,10 @@
 
 ## [Unreleased]
 
+### Исправлено
+
+- **HistoryTimescaleV2.new_historized_event:** в legacy-ветку (`HistoryTimescale`) снова передаются исходные `asyncua.Node` из `historize_event`, а не только `NodeId`. Устранены предупреждения `_get_event_fields: Cannot introspect event fields from NodeId ... without server Node` при старте с `HISTORY_STORAGE_VERSION=v2` и пустой `_event_fields` для legacy-чтения.
+
 ### Fixed
 - Исправлено именование колонок: все колонки теперь используют нижний регистр
 - Заменено `_EventTypeName` на `_eventtypename`
