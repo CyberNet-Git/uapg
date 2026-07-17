@@ -1943,7 +1943,11 @@ class HistoryTimescale(HistoryStorageInterface):
                 )
             ''')
             
-            # Таблица кэша последних значений переменных
+            # Таблица кэша последних значений переменных.
+            # Инвариант: для каждой зарегистрированной переменной здесь есть строка
+            # (см. seed_last_values) — чтение последних значений не обращается к истории.
+            # is_seed=TRUE — строка-дефолт, ещё не сверенная с историей
+            # (снимается реальной записью значения или backfill_last_values).
             await self._execute(f'''
                 CREATE TABLE IF NOT EXISTS "{self._schema}".variables_last_value (
                     variable_id BIGINT PRIMARY KEY,
@@ -1954,6 +1958,10 @@ class HistoryTimescale(HistoryStorageInterface):
                     variantbinary BYTEA NOT NULL,
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
+            ''')
+            await self._execute(f'''
+                ALTER TABLE "{self._schema}".variables_last_value
+                ADD COLUMN IF NOT EXISTS is_seed BOOLEAN NOT NULL DEFAULT FALSE
             ''')
             
             # Создаем индексы для производительности и связей
@@ -2273,8 +2281,10 @@ class HistoryTimescale(HistoryStorageInterface):
                                         statuscode = EXCLUDED.statuscode,
                                         varianttype = EXCLUDED.varianttype,
                                         variantbinary = EXCLUDED.variantbinary,
+                                        is_seed = FALSE,
                                         updated_at = NOW()
-                                    WHERE "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
+                                    WHERE "{self._schema}".variables_last_value.is_seed
+                                       OR "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
                                 ''',
                                 last_value_params,
                                 timeout=self._db_query_timeout_sec,
@@ -3035,7 +3045,7 @@ class HistoryTimescale(HistoryStorageInterface):
                 )
 
                 await self._execute(f'''
-                    INSERT INTO "{self._schema}".variables_last_value 
+                    INSERT INTO "{self._schema}".variables_last_value
                     (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
                     VALUES ($1, $2, $3, $4, $5, $6)
                     ON CONFLICT (variable_id) DO UPDATE
@@ -3044,8 +3054,10 @@ class HistoryTimescale(HistoryStorageInterface):
                             statuscode = EXCLUDED.statuscode,
                             varianttype = EXCLUDED.varianttype,
                             variantbinary = EXCLUDED.variantbinary,
+                            is_seed = FALSE,
                             updated_at = NOW()
-                        WHERE "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
+                        WHERE "{self._schema}".variables_last_value.is_seed
+                           OR "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
                 ''', variable_id, datavalue.SourceTimestamp, datavalue.ServerTimestamp,
                     datavalue.StatusCode.value, variant_type, variant_binary)
 
@@ -3593,13 +3605,22 @@ class HistoryTimescale(HistoryStorageInterface):
             self.logger.error(f"Failed to read last value for {node_id}: {e}")
             return None
 
-    async def read_last_values(self, node_ids: List[ua.NodeId]) -> dict:
+    async def read_last_values(
+        self,
+        node_ids: List[ua.NodeId],
+        history_lookback: Optional[timedelta] = None,
+    ) -> dict:
         """
         Быстрое получение последних сохраненных значений для списка переменных.
-        
+
         Args:
             node_ids: Список идентификаторов узлов OPC UA
-            
+            history_lookback: Ограничение фоллбэк-чтения из variables_history
+                последними history_lookback времени. Позволяет TimescaleDB
+                исключить старые чанки: без ограничения переменные, у которых
+                нет данных вообще, заставляют пробегать индексы всех чанков.
+                None — без ограничения (полная история).
+
         Returns:
             Словарь {node_id: DataValue} или {node_id: None} для отсутствующих
         """
@@ -3703,21 +3724,68 @@ class HistoryTimescale(HistoryStorageInterface):
             # всех чанков (секунды на вызов).
             missing_variable_ids = [vid for vid in remaining_variable_ids if vid not in cached_variable_ids]
             if missing_variable_ids:
-                fallback_rows = await self._fetch(f'''
-                    SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
-                           h.statuscode, h.varianttype, h.variantbinary
-                    FROM unnest($1::bigint[]) AS v(variable_id)
-                    CROSS JOIN LATERAL (
-                        SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
-                        FROM "{self._schema}".variables_history
-                        WHERE variable_id = v.variable_id
-                        ORDER BY sourcetimestamp DESC
-                        LIMIT 1
-                    ) h
-                ''', missing_variable_ids)
+                if history_lookback is not None:
+                    since = datetime.now(timezone.utc) - history_lookback
+                    fallback_rows = await self._fetch(f'''
+                        SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
+                               h.statuscode, h.varianttype, h.variantbinary
+                        FROM unnest($1::bigint[]) AS v(variable_id)
+                        CROSS JOIN LATERAL (
+                            SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                            FROM "{self._schema}".variables_history
+                            WHERE variable_id = v.variable_id
+                              AND sourcetimestamp >= $2
+                            ORDER BY sourcetimestamp DESC
+                            LIMIT 1
+                        ) h
+                    ''', missing_variable_ids, since)
+                else:
+                    fallback_rows = await self._fetch(f'''
+                        SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
+                               h.statuscode, h.varianttype, h.variantbinary
+                        FROM unnest($1::bigint[]) AS v(variable_id)
+                        CROSS JOIN LATERAL (
+                            SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                            FROM "{self._schema}".variables_history
+                            WHERE variable_id = v.variable_id
+                            ORDER BY sourcetimestamp DESC
+                            LIMIT 1
+                        ) h
+                    ''', missing_variable_ids)
 
                 if fallback_rows:
                     self._cache_stats["last_values_history_fallbacks"] += len(fallback_rows)
+                    # Самозалечивание: найденное фоллбэком фиксируем в таблице-кэше
+                    # variables_last_value, чтобы при следующих чтениях (и рестартах)
+                    # фоллбэк по истории для этих переменных больше не требовался
+                    try:
+                        await self._execute(f'''
+                            INSERT INTO "{self._schema}".variables_last_value
+                            (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
+                            SELECT * FROM unnest(
+                                $1::bigint[], $2::timestamptz[], $3::timestamptz[],
+                                $4::integer[], $5::integer[], $6::bytea[]
+                            )
+                            ON CONFLICT (variable_id) DO UPDATE
+                                SET sourcetimestamp = EXCLUDED.sourcetimestamp,
+                                    servertimestamp = EXCLUDED.servertimestamp,
+                                    statuscode = EXCLUDED.statuscode,
+                                    varianttype = EXCLUDED.varianttype,
+                                    variantbinary = EXCLUDED.variantbinary,
+                                    is_seed = FALSE,
+                                    updated_at = NOW()
+                                WHERE "{self._schema}".variables_last_value.is_seed
+                                   OR "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
+                        ''',
+                            [r['variable_id'] for r in fallback_rows],
+                            [r['sourcetimestamp'] for r in fallback_rows],
+                            [r['servertimestamp'] for r in fallback_rows],
+                            [r['statuscode'] for r in fallback_rows],
+                            [r['varianttype'] for r in fallback_rows],
+                            [r['variantbinary'] for r in fallback_rows],
+                        )
+                    except Exception as e:
+                        self.logger.debug(f"Failed to backfill variables_last_value from fallback: {e}")
 
                 for row in fallback_rows:
                     variable_id = row['variable_id']
@@ -3742,6 +3810,192 @@ class HistoryTimescale(HistoryStorageInterface):
             self.logger.error(f"Failed to read last values: {e}")
             # Возвращаем None для всех узлов при ошибке
             return {node_id: None for node_id in node_ids}
+
+    def _resolve_variable_id_cached(self, node_id: ua.NodeId) -> Optional[int]:
+        """variable_id из mapping историзации или кэша метаданных, без обращения к БД."""
+        node_data = self._datachanges_period.get(node_id)
+        if node_data is not None and len(node_data) == 3:
+            return node_data[2]
+        return self._variable_metadata_cache.get(self._format_node_id(node_id))
+
+    async def seed_last_values(self, items: List[Tuple[ua.NodeId, ua.DataValue]]) -> int:
+        """
+        Гарантирует строку в variables_last_value для каждой переданной переменной:
+        вставляет значение по умолчанию с is_seed=TRUE, НЕ трогая существующие
+        строки (ON CONFLICT DO NOTHING). Вместе с backfill_last_values поддерживает
+        инвариант «у каждой зарегистрированной переменной есть строка последнего
+        значения», благодаря которому чтение последних значений никогда не
+        обращается к таблице истории.
+
+        Args:
+            items: Пары (node_id, DataValue с текущим/дефолтным значением узла)
+
+        Returns:
+            Число вставленных строк-сидов.
+        """
+        now = datetime.now(timezone.utc)
+        vids: List[int] = []
+        source_ts: List[datetime] = []
+        server_ts: List[datetime] = []
+        statuscodes: List[int] = []
+        varianttypes: List[int] = []
+        binaries: List[bytes] = []
+        seen: set = set()
+        dv_by_vid: Dict[int, ua.DataValue] = {}
+        for node_id, dv in items:
+            variable_id = self._resolve_variable_id_cached(node_id)
+            if variable_id is None or variable_id in seen:
+                continue
+            try:
+                variant = getattr(dv, 'Value', None) if dv is not None else None
+                if variant is None:
+                    variant = ua.Variant(None)
+                binary = variant_to_binary(variant)
+            except Exception as e:
+                self.logger.debug(f"seed_last_values: cannot serialize value for {node_id}: {e}")
+                continue
+            seen.add(variable_id)
+            vids.append(variable_id)
+            source_ts.append(getattr(dv, 'SourceTimestamp', None) or now)
+            server_ts.append(getattr(dv, 'ServerTimestamp', None) or now)
+            sc = getattr(dv, 'StatusCode', None)
+            statuscodes.append(sc.value if sc is not None else 0)
+            varianttypes.append(variant.VariantType.value)
+            binaries.append(binary)
+            dv_by_vid[variable_id] = dv
+
+        if not vids:
+            return 0
+
+        rows = await self._fetch(f'''
+            INSERT INTO "{self._schema}".variables_last_value
+                (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary, is_seed)
+            SELECT u.variable_id, u.sourcetimestamp, u.servertimestamp,
+                   u.statuscode, u.varianttype, u.variantbinary, TRUE
+            FROM unnest(
+                $1::bigint[], $2::timestamptz[], $3::timestamptz[],
+                $4::integer[], $5::integer[], $6::bytea[]
+            ) AS u(variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
+            ON CONFLICT (variable_id) DO NOTHING
+            RETURNING variable_id
+        ''', vids, source_ts, server_ts, statuscodes, varianttypes, binaries)
+
+        inserted = len(rows)
+        for row in rows:
+            dv = dv_by_vid.get(row['variable_id'])
+            if dv is not None:
+                self._update_last_values_cache(row['variable_id'], dv)
+        self.logger.info(
+            "seed_last_values: %d of %d rows seeded (existing preserved)",
+            inserted, len(vids),
+        )
+        return inserted
+
+    async def backfill_last_values(
+        self,
+        *,
+        chunk_size: int = 1000,
+        pause_sec: float = 0.5,
+        query_timeout_sec: float = 120.0,
+    ) -> dict:
+        """
+        Фоновая идемпотентная сверка variables_last_value с историей:
+          - зарегистрированным переменным без строки добавляется последнее
+            значение из истории (если оно есть);
+          - строки-сиды (is_seed=TRUE) замещаются реальным последним значением
+            из истории; сиды без истории помечаются сверенными (is_seed=FALSE).
+
+        После первого полного прохода кандидатов не остаётся и вызов
+        завершается мгновенно. Предназначен для запуска фоновой задачей
+        после старта сервера.
+
+        Returns:
+            Статистика {'candidates', 'restored_from_history', 'confirmed_defaults', 'errors'}
+        """
+        await self._ensure_pool()
+        rows = await self._fetch(f'''
+            SELECT m.variable_id
+            FROM "{self._schema}".variable_metadata m
+            LEFT JOIN "{self._schema}".variables_last_value lv ON lv.variable_id = m.variable_id
+            WHERE lv.variable_id IS NULL OR lv.is_seed
+            ORDER BY m.variable_id
+        ''')
+        candidate_ids = [r['variable_id'] for r in rows]
+        stats = {
+            "candidates": len(candidate_ids),
+            "restored_from_history": 0,
+            "confirmed_defaults": 0,
+            "errors": 0,
+        }
+        if not candidate_ids:
+            return stats
+        self.logger.info("Backfill variables_last_value: %d candidates", len(candidate_ids))
+
+        chunk_size = max(1, int(chunk_size))
+        for i in range(0, len(candidate_ids), chunk_size):
+            chunk = candidate_ids[i:i + chunk_size]
+            try:
+                pool = self._pool
+                async def _op():
+                    async with pool.acquire(timeout=query_timeout_sec) as conn:
+                        found = await conn.fetch(f'''
+                            SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
+                                   h.statuscode, h.varianttype, h.variantbinary
+                            FROM unnest($1::bigint[]) AS v(variable_id)
+                            CROSS JOIN LATERAL (
+                                SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                                FROM "{self._schema}".variables_history
+                                WHERE variable_id = v.variable_id
+                                ORDER BY sourcetimestamp DESC
+                                LIMIT 1
+                            ) h
+                        ''', chunk, timeout=query_timeout_sec)
+                        if found:
+                            await conn.execute(f'''
+                                INSERT INTO "{self._schema}".variables_last_value
+                                    (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
+                                SELECT * FROM unnest(
+                                    $1::bigint[], $2::timestamptz[], $3::timestamptz[],
+                                    $4::integer[], $5::integer[], $6::bytea[]
+                                )
+                                ON CONFLICT (variable_id) DO UPDATE
+                                    SET sourcetimestamp = EXCLUDED.sourcetimestamp,
+                                        servertimestamp = EXCLUDED.servertimestamp,
+                                        statuscode = EXCLUDED.statuscode,
+                                        varianttype = EXCLUDED.varianttype,
+                                        variantbinary = EXCLUDED.variantbinary,
+                                        is_seed = FALSE,
+                                        updated_at = NOW()
+                                    WHERE "{self._schema}".variables_last_value.is_seed
+                                       OR "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
+                            ''',
+                                [r['variable_id'] for r in found],
+                                [r['sourcetimestamp'] for r in found],
+                                [r['servertimestamp'] for r in found],
+                                [r['statuscode'] for r in found],
+                                [r['varianttype'] for r in found],
+                                [r['variantbinary'] for r in found],
+                                timeout=query_timeout_sec,
+                            )
+                        # Сиды, для которых истории не нашлось, считаем сверенными:
+                        # их дефолт и есть последнее известное состояние
+                        await conn.execute(f'''
+                            UPDATE "{self._schema}".variables_last_value
+                            SET is_seed = FALSE
+                            WHERE variable_id = ANY($1) AND is_seed
+                        ''', chunk, timeout=query_timeout_sec)
+                        return found
+                found = await asyncio.wait_for(_op(), timeout=query_timeout_sec * 2)
+                stats["restored_from_history"] += len(found)
+                stats["confirmed_defaults"] += len(chunk) - len(found)
+            except Exception as e:
+                stats["errors"] += 1
+                self.logger.warning("Backfill chunk failed (%d ids): %r", len(chunk), e)
+            if pause_sec > 0:
+                await asyncio.sleep(pause_sec)
+
+        self.logger.info("Backfill variables_last_value done: %s", stats)
+        return stats
 
     async def close(self) -> None:
         """Закрытие модуля историзации"""
