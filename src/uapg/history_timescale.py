@@ -2789,21 +2789,94 @@ class HistoryTimescale(HistoryStorageInterface):
 
         try:
             effective_period = self._get_effective_retention_period(period)
-            # Сохраняем метаданные переменной и получаем variable_id
-            variable_id = await self._save_variable_metadata(node_id, effective_period, count)
+            node_id_str = self._format_node_id(node_id)
+            # Если variable_id уже есть в кэше метаданных (прогревается из БД при init),
+            # upsert не нужен: retention применяется глобально через Timescale policy,
+            # а data_type обновляется при сохранении значения.
+            variable_id = self._variable_metadata_cache.get(node_id_str)
+            if variable_id is None:
+                variable_id = await self._save_variable_metadata(node_id, effective_period, count)
 
             # Сохраняем mapping node_id -> variable_id для быстрого доступа
             self._datachanges_period[node_id] = (effective_period, count, variable_id)
 
             if self.suppress_initial_datachange:
-                node_id_str = self._format_node_id(node_id)
                 self._pending_initial_datachange_skip[node_id_str] = True
 
             #self.logger.info(f"Variable node {node_id} registered for historization in unified table (variable_id: {variable_id})")
         except Exception as e:
             self.logger.error(f"Failed to register variable node {node_id}: {e}")
             raise
-    
+
+    async def new_historized_nodes(
+        self,
+        node_ids: List[ua.NodeId],
+        period: Optional[timedelta],
+        count: int = 0
+    ) -> None:
+        """
+        Батчевая регистрация узлов для историзации: один SQL-запрос на все узлы,
+        отсутствующие в кэше метаданных, вместо upsert-роундтрипа на каждый узел.
+
+        Семантика идентична последовательным вызовам new_historized_node()
+        с одинаковыми period/count.
+
+        Args:
+            node_ids: Список идентификаторов узлов OPC UA
+            period: Период хранения данных (None для бесконечного хранения)
+            count: Максимальное количество записей (0 для неограниченного)
+        """
+        effective_period = self._get_effective_retention_period(period)
+
+        # Дедупликация по строковому node_id с сохранением порядка
+        pairs: List[Tuple[ua.NodeId, str]] = []
+        seen: set = set()
+        for node_id in node_ids:
+            node_id_str = self._format_node_id(node_id)
+            if node_id_str in seen:
+                continue
+            seen.add(node_id_str)
+            pairs.append((node_id, node_id_str))
+
+        to_upsert = [node_id_str for _, node_id_str in pairs
+                     if node_id_str not in self._variable_metadata_cache]
+        if to_upsert:
+            # data_type при конфликте не сбрасываем в 'Unknown': реальный тип
+            # уже определён при сохранении значений и не должен теряться
+            rows = await self._fetch(f'''
+                INSERT INTO "{self._schema}".variable_metadata (node_id, data_type, retention_period, max_records)
+                SELECT t.node_id, 'Unknown', $2, $3
+                FROM unnest($1::text[]) AS t(node_id)
+                ON CONFLICT (node_id) DO UPDATE SET
+                    retention_period = EXCLUDED.retention_period,
+                    max_records = EXCLUDED.max_records,
+                    updated_at = NOW()
+                RETURNING node_id, variable_id
+            ''', to_upsert, effective_period, count)
+            for row in rows:
+                self._variable_metadata_cache[row["node_id"]] = row["variable_id"]
+
+        missing: List[ua.NodeId] = []
+        registered = 0
+        for node_id, node_id_str in pairs:
+            variable_id = self._variable_metadata_cache.get(node_id_str)
+            if variable_id is None:
+                missing.append(node_id)
+                continue
+            self._datachanges_period[node_id] = (effective_period, count, variable_id)
+            if self.suppress_initial_datachange:
+                self._pending_initial_datachange_skip[node_id_str] = True
+            registered += 1
+
+        # Фоллбэк на поштучную регистрацию (не должен срабатывать в норме)
+        for node_id in missing:
+            await self.new_historized_node(node_id, period, count)
+
+        self.logger.info(
+            "Bulk historized-node registration: %d nodes (%d upserted, %d fallback)",
+            registered + len(missing), len(to_upsert), len(missing),
+        )
+
     async def new_historized_event(
         self,
         source_id: ua.NodeId,
