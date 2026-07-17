@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.7] - 2026-07-17
+
+### Исправлено
+
+- **`HistoryTimescale.read_last_values`:** фоллбэк-чтение последних значений из `variables_history` переведён с `SELECT DISTINCT ON (variable_id) ... WHERE variable_id = ANY(...)` (на hypertable с большим числом чанков — секунды на вызов) на `unnest + CROSS JOIN LATERAL ... ORDER BY sourcetimestamp DESC LIMIT 1` — точечный top-1 проход по индексу `(variable_id, sourcetimestamp DESC)`; `variantbinary` читается тем же запросом, убран дополнительный роундтрип на каждую найденную строку.
+
 ## [0.2.6] - 2026-07-17
 
 ### Добавлено

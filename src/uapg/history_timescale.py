@@ -3695,40 +3695,41 @@ class HistoryTimescale(HistoryStorageInterface):
                 self._update_last_values_cache(variable_id, dv)
                 self._cache_stats["last_values_table_hits"] += 1
             
-            # Fallback для узлов, которых нет ни в памяти, ни в таблице кэша
+            # Fallback для узлов, которых нет ни в памяти, ни в таблице кэша.
+            # LATERAL top-1 на каждый variable_id: планировщик идёт по индексу
+            # (variable_id, sourcetimestamp DESC) от новых чанков к старым и
+            # останавливается на первом значении. DISTINCT ON ... ORDER BY на
+            # hypertable с большим числом чанков деградирует до слияния индексов
+            # всех чанков (секунды на вызов).
             missing_variable_ids = [vid for vid in remaining_variable_ids if vid not in cached_variable_ids]
             if missing_variable_ids:
                 fallback_rows = await self._fetch(f'''
-                    SELECT DISTINCT ON (variable_id) variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype
-                    FROM "{self._schema}".variables_history
-                    WHERE variable_id = ANY($1)
-                    ORDER BY variable_id, sourcetimestamp DESC
+                    SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
+                           h.statuscode, h.varianttype, h.variantbinary
+                    FROM unnest($1::bigint[]) AS v(variable_id)
+                    CROSS JOIN LATERAL (
+                        SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                        FROM "{self._schema}".variables_history
+                        WHERE variable_id = v.variable_id
+                        ORDER BY sourcetimestamp DESC
+                        LIMIT 1
+                    ) h
                 ''', missing_variable_ids)
-                
+
                 if fallback_rows:
                     self._cache_stats["last_values_history_fallbacks"] += len(fallback_rows)
 
                 for row in fallback_rows:
                     variable_id = row['variable_id']
                     node_id = node_to_variable[variable_id]
-                    
-                    # Получаем variantbinary отдельным запросом
-                    variantbinary_row = await self._fetchrow(f'''
-                        SELECT variantbinary
-                        FROM "{self._schema}".variables_history
-                        WHERE variable_id = $1 AND sourcetimestamp = $2
-                        LIMIT 1
-                    ''', variable_id, row['sourcetimestamp'])
-                    
-                    if variantbinary_row is not None:
-                        dv = ua.DataValue(
-                            Value=variant_from_binary(Buffer(variantbinary_row['variantbinary'])),
-                            StatusCode_=ua.StatusCode(row['statuscode']),
-                            SourceTimestamp=row['sourcetimestamp'],
-                            ServerTimestamp=row['servertimestamp']
-                        )
-                        result[node_id] = dv
-                        self._update_last_values_cache(variable_id, dv)
+                    dv = ua.DataValue(
+                        Value=variant_from_binary(Buffer(row['variantbinary'])),
+                        StatusCode_=ua.StatusCode(row['statuscode']),
+                        SourceTimestamp=row['sourcetimestamp'],
+                        ServerTimestamp=row['servertimestamp']
+                    )
+                    result[node_id] = dv
+                    self._update_last_values_cache(variable_id, dv)
             
             # Заполняем None для узлов, которых вообще нет в истории
             for node_id in node_ids:
