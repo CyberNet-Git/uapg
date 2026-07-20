@@ -3609,6 +3609,8 @@ class HistoryTimescale(HistoryStorageInterface):
         self,
         node_ids: List[ua.NodeId],
         history_lookback: Optional[timedelta] = None,
+        *,
+        allow_history_fallback: bool = True,
     ) -> dict:
         """
         Быстрое получение последних сохраненных значений для списка переменных.
@@ -3620,6 +3622,10 @@ class HistoryTimescale(HistoryStorageInterface):
                 исключить старые чанки: без ограничения переменные, у которых
                 нет данных вообще, заставляют пробегать индексы всех чанков.
                 None — без ограничения (полная история).
+            allow_history_fallback: Если False — только memory/variables_last_value,
+                без LATERAL по hypertable. Нужен для bulk-restore при старте:
+                фоллбэк по тысячам «пустых» переменных иначе упирается в
+                db_query_timeout и рвёт пул соединений.
 
         Returns:
             Словарь {node_id: DataValue} или {node_id: None} для отсутствующих
@@ -3723,6 +3729,12 @@ class HistoryTimescale(HistoryStorageInterface):
             # hypertable с большим числом чанков деградирует до слияния индексов
             # всех чанков (секунды на вызов).
             missing_variable_ids = [vid for vid in remaining_variable_ids if vid not in cached_variable_ids]
+            if missing_variable_ids and not allow_history_fallback:
+                self._cache_stats["last_values_history_fallbacks_skipped"] = (
+                    self._cache_stats.get("last_values_history_fallbacks_skipped", 0)
+                    + len(missing_variable_ids)
+                )
+                missing_variable_ids = []
             if missing_variable_ids:
                 if history_lookback is not None:
                     since = datetime.now(timezone.utc) - history_lookback
@@ -3894,9 +3906,13 @@ class HistoryTimescale(HistoryStorageInterface):
     async def backfill_last_values(
         self,
         *,
-        chunk_size: int = 1000,
+        chunk_size: int = 100,
         pause_sec: float = 0.5,
         query_timeout_sec: float = 120.0,
+        history_lookback: Optional[timedelta] = None,
+        on_chunk_restored: Optional[
+            Callable[[List[Tuple[str, ua.DataValue]]], Union[Coroutine[Any, Any, Any], Any]]
+        ] = None,
     ) -> dict:
         """
         Фоновая идемпотентная сверка variables_last_value с историей:
@@ -3905,55 +3921,95 @@ class HistoryTimescale(HistoryStorageInterface):
           - строки-сиды (is_seed=TRUE) замещаются реальным последним значением
             из истории; сиды без истории помечаются сверенными (is_seed=FALSE).
 
-        После первого полного прохода кандидатов не остаётся и вызов
-        завершается мгновенно. Предназначен для запуска фоновой задачей
-        после старта сервера.
+        LATERAL по hypertable выполняется только для кандидатов и (при заданном
+        history_lookback) с time predicate для chunk exclusion. По умолчанию
+        мелкие чанки (100), чтобы не упираться в db_query_timeout.
+
+        Args:
+            chunk_size: размер батча variable_id
+            pause_sec: пауза между чанками (снижение нагрузки на пул)
+            query_timeout_sec: таймаут acquire/SQL на чанк
+            history_lookback: ограничить поиск в истории (None — вся история)
+            on_chunk_restored: async/sync callback со списком
+                (node_id_str, DataValue) для применения в address space
 
         Returns:
-            Статистика {'candidates', 'restored_from_history', 'confirmed_defaults', 'errors'}
+            Статистика: candidates, restored_from_history, confirmed_defaults,
+            errors, restored_items (list[(node_id_str, DataValue)])
         """
         await self._ensure_pool()
+        # Только строки-сиды: отсутствующие last_value должен создавать seed_last_values
+        # при historize. Иначе orphan metadata без истории вечно гоняет LATERAL.
         rows = await self._fetch(f'''
-            SELECT m.variable_id
+            SELECT m.variable_id, m.node_id
             FROM "{self._schema}".variable_metadata m
-            LEFT JOIN "{self._schema}".variables_last_value lv ON lv.variable_id = m.variable_id
-            WHERE lv.variable_id IS NULL OR lv.is_seed
+            INNER JOIN "{self._schema}".variables_last_value lv ON lv.variable_id = m.variable_id
+            WHERE lv.is_seed
             ORDER BY m.variable_id
         ''')
         candidate_ids = [r['variable_id'] for r in rows]
+        node_id_by_vid = {r['variable_id']: r['node_id'] for r in rows}
         stats = {
             "candidates": len(candidate_ids),
             "restored_from_history": 0,
             "confirmed_defaults": 0,
             "errors": 0,
+            "restored_items": [],
         }
         if not candidate_ids:
             return stats
-        self.logger.info("Backfill variables_last_value: %d candidates", len(candidate_ids))
+        since = None
+        if history_lookback is not None:
+            since = datetime.now(timezone.utc) - history_lookback
+        self.logger.info(
+            "Backfill variables_last_value: %d candidates (chunk=%d, lookback=%s)",
+            len(candidate_ids),
+            max(1, int(chunk_size)),
+            history_lookback if history_lookback is not None else "full",
+        )
 
         chunk_size = max(1, int(chunk_size))
         for i in range(0, len(candidate_ids), chunk_size):
             chunk = candidate_ids[i:i + chunk_size]
             try:
                 pool = self._pool
-                async def _op():
+
+                async def _op(chunk_ids=chunk):
                     async with pool.acquire(timeout=query_timeout_sec) as conn:
-                        found = await conn.fetch(f'''
-                            SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
-                                   h.statuscode, h.varianttype, h.variantbinary
-                            FROM unnest($1::bigint[]) AS v(variable_id)
-                            CROSS JOIN LATERAL (
-                                SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
-                                FROM "{self._schema}".variables_history
-                                WHERE variable_id = v.variable_id
-                                ORDER BY sourcetimestamp DESC
-                                LIMIT 1
-                            ) h
-                        ''', chunk, timeout=query_timeout_sec)
+                        if since is not None:
+                            found = await conn.fetch(f'''
+                                SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
+                                       h.statuscode, h.varianttype, h.variantbinary
+                                FROM unnest($1::bigint[]) AS v(variable_id)
+                                CROSS JOIN LATERAL (
+                                    SELECT sourcetimestamp, servertimestamp, statuscode,
+                                           varianttype, variantbinary
+                                    FROM "{self._schema}".variables_history
+                                    WHERE variable_id = v.variable_id
+                                      AND sourcetimestamp >= $2
+                                    ORDER BY sourcetimestamp DESC
+                                    LIMIT 1
+                                ) h
+                            ''', chunk_ids, since, timeout=query_timeout_sec)
+                        else:
+                            found = await conn.fetch(f'''
+                                SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
+                                       h.statuscode, h.varianttype, h.variantbinary
+                                FROM unnest($1::bigint[]) AS v(variable_id)
+                                CROSS JOIN LATERAL (
+                                    SELECT sourcetimestamp, servertimestamp, statuscode,
+                                           varianttype, variantbinary
+                                    FROM "{self._schema}".variables_history
+                                    WHERE variable_id = v.variable_id
+                                    ORDER BY sourcetimestamp DESC
+                                    LIMIT 1
+                                ) h
+                            ''', chunk_ids, timeout=query_timeout_sec)
                         if found:
                             await conn.execute(f'''
                                 INSERT INTO "{self._schema}".variables_last_value
-                                    (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
+                                    (variable_id, sourcetimestamp, servertimestamp, statuscode,
+                                     varianttype, variantbinary)
                                 SELECT * FROM unnest(
                                     $1::bigint[], $2::timestamptz[], $3::timestamptz[],
                                     $4::integer[], $5::integer[], $6::bytea[]
@@ -3967,7 +4023,8 @@ class HistoryTimescale(HistoryStorageInterface):
                                         is_seed = FALSE,
                                         updated_at = NOW()
                                     WHERE "{self._schema}".variables_last_value.is_seed
-                                       OR "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
+                                       OR "{self._schema}".variables_last_value.sourcetimestamp
+                                          <= EXCLUDED.sourcetimestamp
                             ''',
                                 [r['variable_id'] for r in found],
                                 [r['sourcetimestamp'] for r in found],
@@ -3977,24 +4034,64 @@ class HistoryTimescale(HistoryStorageInterface):
                                 [r['variantbinary'] for r in found],
                                 timeout=query_timeout_sec,
                             )
-                        # Сиды, для которых истории не нашлось, считаем сверенными:
-                        # их дефолт и есть последнее известное состояние
+                        # Сиды без истории в этом окне — считаем сверенными
                         await conn.execute(f'''
                             UPDATE "{self._schema}".variables_last_value
                             SET is_seed = FALSE
                             WHERE variable_id = ANY($1) AND is_seed
-                        ''', chunk, timeout=query_timeout_sec)
+                        ''', chunk_ids, timeout=query_timeout_sec)
                         return found
+
                 found = await asyncio.wait_for(_op(), timeout=query_timeout_sec * 2)
                 stats["restored_from_history"] += len(found)
                 stats["confirmed_defaults"] += len(chunk) - len(found)
+
+                chunk_items: List[Tuple[str, ua.DataValue]] = []
+                for row in found:
+                    node_id_str = node_id_by_vid.get(row['variable_id'])
+                    if not node_id_str:
+                        continue
+                    try:
+                        dv = ua.DataValue(
+                            Value=variant_from_binary(Buffer(row['variantbinary'])),
+                            StatusCode_=ua.StatusCode(row['statuscode']),
+                            SourceTimestamp=row['sourcetimestamp'],
+                            ServerTimestamp=row['servertimestamp'],
+                        )
+                    except Exception as e:
+                        self.logger.debug(
+                            "Backfill: cannot decode value for %s: %s", node_id_str, e
+                        )
+                        continue
+                    self._update_last_values_cache(row['variable_id'], dv)
+                    item = (node_id_str, dv)
+                    chunk_items.append(item)
+                    # Полный список — только без callback (иначе O(N) память на десятки тысяч)
+                    if on_chunk_restored is None:
+                        stats["restored_items"].append(item)
+
+                if chunk_items and on_chunk_restored is not None:
+                    try:
+                        result = on_chunk_restored(chunk_items)
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception as e:
+                        self.logger.warning(
+                            "Backfill on_chunk_restored failed (%d items): %r",
+                            len(chunk_items), e,
+                        )
             except Exception as e:
                 stats["errors"] += 1
                 self.logger.warning("Backfill chunk failed (%d ids): %r", len(chunk), e)
             if pause_sec > 0:
                 await asyncio.sleep(pause_sec)
 
-        self.logger.info("Backfill variables_last_value done: %s", stats)
+        # Не засорять лог полным списком DataValue
+        log_stats = {
+            k: v for k, v in stats.items() if k != "restored_items"
+        }
+        log_stats["restored_items_count"] = len(stats["restored_items"])
+        self.logger.info("Backfill variables_last_value done: %s", log_stats)
         return stats
 
     async def close(self) -> None:

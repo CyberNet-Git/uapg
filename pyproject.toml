@@ -1,6 +1,6 @@
 [project]
 name = "uapg"
-version = "0.2.8"
+version = "0.2.10"
 description = "OPC UA PostgreSQL History Storage Backend"
 readme = "README.md"
 authors = [

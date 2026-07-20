@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.10] - 2026-07-20
+
+### Изменено
+
+- **`backfill_last_values`:** lookback (`history_lookback`) для chunk exclusion TimescaleDB; дефолтный `chunk_size=100`; возвращает `restored_items` как `(node_id_str, DataValue)`; опциональный callback `on_chunk_restored` для применения в address space по мере нахождения значений. Обновляет in-memory last-values cache. Кандидаты — только `is_seed` (строки без last_value создаёт `seed_last_values` при historize; orphan metadata без истории больше не гоняет LATERAL).
+
+## [0.2.9] - 2026-07-17
+
+### Добавлено
+
+- **`read_last_values(..., allow_history_fallback=True)`:** при `False` читает только memory/`variables_last_value`, без LATERAL по `variables_history`. Для bulk-restore при старте сервера: иначе тысячи переменных без строк в кэше упираются в `db_query_timeout` (30 с) и рвут пул (`Fetch timed out, will reconnect`).
+
 ## [0.2.8] - 2026-07-17
 
 ### Добавлено
