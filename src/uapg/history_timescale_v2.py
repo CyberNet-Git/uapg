@@ -94,6 +94,24 @@ class HistoryTimescaleV2(HistoryTimescale):
         )
         self.logger.info("HistoryTimescaleV2 initialized (mode=%s)", self._events_storage_mode.value)
 
+    def _rebind_v2_pool(self) -> None:
+        """Синхронизировать кэшированные pool-ссылки V2 с актуальным self._pool.
+
+        EventStoreV2 / ProcedureGateway / EventsBackfillWorker получают объект pool
+        при init и иначе продолжают ходить в закрытый пул после _force_reconnect.
+        """
+        pool = self._pool
+        if self._gateway is not None:
+            self._gateway._pool = pool
+        if self._event_store is not None:
+            self._event_store._pool = pool
+        if self._backfill_worker is not None:
+            self._backfill_worker._pool = pool
+
+    async def _force_reconnect(self, failed_pool=None) -> None:
+        await super()._force_reconnect(failed_pool)
+        self._rebind_v2_pool()
+
     async def new_historized_event(
         self,
         source_id: ua.NodeId,
@@ -276,7 +294,7 @@ class HistoryTimescaleV2(HistoryTimescale):
 
         partial = False
         if self._backfill_worker:
-            lag = await self._pool.fetchval(
+            lag = await self._fetchval(
                 f'''
                 SELECT count(*)::bigint
                 FROM "{self._schema}".events_history eh
@@ -447,7 +465,7 @@ class HistoryTimescaleV2(HistoryTimescale):
         backfill_complete = True
         if self._v2_ready and self._pool:
             try:
-                lag = await self._pool.fetchval(
+                lag = await self._fetchval(
                     f'''
                     SELECT count(*)::bigint
                     FROM "{self._schema}".events_history eh

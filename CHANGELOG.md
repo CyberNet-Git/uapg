@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.11] - 2026-07-24
+
+### Исправлено
+
+- **HistoryTimescaleV2 / pool is closed:** после `_force_reconnect` обновляются кэшированные ссылки на asyncpg pool в `EventStoreV2`, `ProcedureGateway` и `EventsBackfillWorker`. Раньше value history продолжала работать через `_fetch`/`_ensure_pool`, а чтение event history V2 ходило в уже закрытый pool. Lag-запросы в `read_event_history` и `refresh_history_settings_nodes` переведены на `_fetchval` (timeout + reconnect).
+
 ## [0.2.10] - 2026-07-20
 
 ### Изменено
