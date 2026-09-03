@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.12] - 2026-09-03
+
+### Исправлено
+
+- **`HistoryTimescaleV2._flush_event_batch` при `UAPG_EVENTS_STORAGE_MODE=v2`:** батч больше не пишет «пустой» ряд только в `events_ts` без `event_data`/`legacy_row_id`. Чтение HistoryRead (UAExpert, ovic) гидратирует поля из `events_history` — без payload события приходили с незаполненными полями. Режим `v2` теперь тоже вызывает `save_event_dual` / `uapg_save_event_v2` (как `dual` и одиночный `save_event`). Уже записанные в сломанном режиме строки без `legacy_row_id` не восстанавливаются — нужны новые события после обновления.
+
 ## [0.2.11] - 2026-07-24
 
 ### Исправлено

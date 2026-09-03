@@ -21,7 +21,7 @@
 
 - `legacy` — только старый путь.
 - `dual` — запись в оба слоя; чтение v2 first.
-- `v2` — только v2 (legacy archive).
+- `v2` — чтение/индекс через `events_ts` (+ typed); payload OPC UA для HistoryRead по-прежнему в `events_history.event_data` (через `uapg_save_event_v2`), иначе гидратация полей пустая.
 
 ## Legacy fallback
 
