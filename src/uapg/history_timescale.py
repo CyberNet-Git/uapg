@@ -12,6 +12,7 @@ import random
 import logging
 import time
 import importlib.metadata as importlib_metadata
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, List, Optional, Tuple, Union, Dict, Callable, Coroutine
@@ -91,6 +92,10 @@ def _empty_timing_stats() -> Dict[str, float]:
     }
 
 
+DEFAULT_DROP_LOG_INTERVAL_SEC = 60.0
+DEFAULT_WORKER_RESTART_MAX_BACKOFF_SEC = 30.0
+
+
 def _observe_timing(stats: Dict[str, float], duration_ms: float) -> None:
     count = int(stats.get("count", 0)) + 1
     total = float(stats.get("total_ms", 0.0)) + duration_ms
@@ -118,6 +123,8 @@ class HistoryWriteBuffer:
         queue_max_size: int,
         durability_mode: str,
         flush_func: Callable[[List[Any]], Coroutine[Any, Any, None]],
+        drop_log_interval_sec: float = DEFAULT_DROP_LOG_INTERVAL_SEC,
+        worker_restart_max_backoff_sec: float = DEFAULT_WORKER_RESTART_MAX_BACKOFF_SEC,
     ) -> None:
         self._name = name
         self._logger = logger.getChild(f"buffer.{name}") if logger else logging.getLogger(f"HistoryWriteBuffer.{name}")
@@ -130,6 +137,19 @@ class HistoryWriteBuffer:
         self._task: Optional[asyncio.Task] = None
         self._stopped = False
         self._stats: Dict[str, Any] = self._new_stats()
+        # Надзор за воркером
+        self._ever_started = False
+        self._worker_exit_reason: str = ""
+        self._worker_restarts_total = 0
+        self._worker_restart_attempt = 0
+        self._worker_restart_max_backoff_sec = max(1.0, float(worker_restart_max_backoff_sec))
+        self._restart_handle: Optional[asyncio.TimerHandle] = None
+        self._last_flush_monotonic: Optional[float] = None
+        self._last_enqueue_monotonic: Optional[float] = None
+        # Ограничение частоты лога об отбрасывании
+        self._drop_log_interval_sec = max(0.0, float(drop_log_interval_sec))
+        self._drop_log_last_monotonic: Optional[float] = None
+        self._drops_since_last_log = 0
 
     @staticmethod
     def _new_stats() -> Dict[str, Any]:
@@ -168,7 +188,24 @@ class HistoryWriteBuffer:
             "max_flush_duration_ms": float(flush_duration["max_ms"]),
             "avg_flush_duration_ms": float(flush_duration["avg_ms"]),
             "total_flush_duration_ms": float(flush_duration["total_ms"]),
+            # Надзор за воркером: worker_alive отличает мёртвый воркер от живого,
+            # а seconds_since_last_flush — живого, но залипшего в ожидании БД.
+            "worker_alive": self.is_worker_alive(),
+            "worker_restarts_total": int(self._worker_restarts_total),
+            "last_worker_exit_reason": str(self._worker_exit_reason),
+            "seconds_since_last_flush": self._seconds_since(self._last_flush_monotonic),
+            "seconds_since_last_enqueue": self._seconds_since(self._last_enqueue_monotonic),
         }
+
+    @staticmethod
+    def _seconds_since(marker: Optional[float]) -> float:
+        """-1 означает «ещё ни разу не было», иначе ноль был бы неотличим от свежего."""
+        if marker is None:
+            return -1.0
+        return max(0.0, time.monotonic() - marker)
+
+    def is_worker_alive(self) -> bool:
+        return self._task is not None and not self._task.done()
 
     def reset_stats(self) -> None:
         self._stats = self._new_stats()
@@ -176,7 +213,9 @@ class HistoryWriteBuffer:
     def start(self) -> None:
         if self._task is None or self._task.done():
             self._stopped = False
+            self._ever_started = True
             self._task = asyncio.create_task(self._worker(), name=f"HistoryWriteBuffer-{self._name}")
+            self._task.add_done_callback(self._on_worker_done)
             self._logger.info(
                 "HistoryWriteBuffer '%s' started (max_batch_size=%s, max_batch_interval_sec=%.3f, queue_max_size=%s, durability_mode=%s)",
                 self._name,
@@ -186,8 +225,91 @@ class HistoryWriteBuffer:
                 self._durability_mode,
             )
 
+    def _on_worker_done(self, task: "asyncio.Task") -> None:
+        """
+        Воркер не должен завершаться, пока буфер не остановлен. Раньше такое
+        завершение было полностью бесшумным: очередь переполнялась, и
+        единственным следом оставался поток «queue is full».
+        """
+        if self._stopped or task is not self._task:
+            return
+
+        if task.cancelled():
+            reason = "cancelled"
+            self._logger.critical(
+                "HistoryWriteBuffer '%s' worker was cancelled while buffer is running; restarting",
+                self._name,
+            )
+        else:
+            exc = task.exception()
+            if exc is None:
+                reason = "returned"
+                self._logger.critical(
+                    "HistoryWriteBuffer '%s' worker exited unexpectedly; restarting",
+                    self._name,
+                )
+            else:
+                reason = f"{type(exc).__name__}: {exc}"
+                self._logger.critical(
+                    "HistoryWriteBuffer '%s' worker died: %r; restarting",
+                    self._name,
+                    exc,
+                    exc_info=exc,
+                )
+
+        self._worker_exit_reason = reason
+        self._worker_restarts_total += 1
+        self._worker_restart_attempt += 1
+        delay = min(
+            self._worker_restart_max_backoff_sec,
+            float(2 ** min(self._worker_restart_attempt - 1, 16)),
+        )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._logger.error(
+                "HistoryWriteBuffer '%s' cannot schedule worker restart: no running loop",
+                self._name,
+            )
+            return
+
+        self._task = None
+        self._restart_handle = loop.call_later(delay, self._restart_worker)
+        self._logger.warning(
+            "HistoryWriteBuffer '%s' worker restart scheduled in %.1fs (restarts=%d)",
+            self._name,
+            delay,
+            self._worker_restarts_total,
+        )
+
+    def _restart_worker(self) -> None:
+        self._restart_handle = None
+        if self._stopped:
+            return
+        self.start()
+
+    def ensure_worker_running(self) -> None:
+        """Дешёвая проверка с пути записи: во время инцидента именно она замечает,
+        что воркер умер, раньше любого внешнего мониторинга.
+
+        Буфер, который ни разу не запускали, не поднимаем: это не авария, а
+        сознательный выбор вызывающего кода."""
+        if not self._ever_started or self._stopped or self.is_worker_alive():
+            return
+        if self._restart_handle is not None:
+            return
+        self._logger.critical(
+            "HistoryWriteBuffer '%s' worker is not running on enqueue path; starting it",
+            self._name,
+        )
+        self.start()
+
     async def stop(self) -> None:
         self._stopped = True
+        if self._restart_handle is not None:
+            self._restart_handle.cancel()
+            self._restart_handle = None
         if self._task:
             # Даем воркеру возможность дописать оставшиеся элементы
             try:
@@ -208,6 +330,8 @@ class HistoryWriteBuffer:
         future: Optional[asyncio.Future] = None
         sync_mode = sync or self._durability_mode == "sync"
         self._stats["enqueue_attempts_total"] += 1
+        self._last_enqueue_monotonic = time.monotonic()
+        self.ensure_worker_running()
 
         if sync_mode:
             loop = asyncio.get_running_loop()
@@ -224,13 +348,54 @@ class HistoryWriteBuffer:
             self._stats["enqueued_total"] += 1
         except asyncio.QueueFull:
             self._stats["dropped_total"] += 1
-            self._logger.error("HistoryWriteBuffer '%s' queue is full, dropping item in async mode", self._name)
+            self._log_drop()
             if future and not future.done():
                 future.set_exception(RuntimeError("HistoryWriteBuffer queue is full"))
             return
 
         if sync_mode and future is not None:
             await future
+
+    def _log_drop(self) -> None:
+        """
+        Отбрасывание логируется с ограничением частоты: при переполнении поток
+        сообщений идёт со скоростью записи и сам по себе становится проблемой
+        (в одном инциденте — 618 МБ логов). Точный счёт остаётся в dropped_total.
+        """
+        self._drops_since_last_log += 1
+        now = time.monotonic()
+        last = self._drop_log_last_monotonic
+
+        if (
+            last is not None
+            and self._drop_log_interval_sec > 0
+            and (now - last) < self._drop_log_interval_sec
+        ):
+            return
+
+        dropped_in_window = self._drops_since_last_log
+        self._drops_since_last_log = 0
+        self._drop_log_last_monotonic = now
+
+        if last is None:
+            self._logger.error(
+                "HistoryWriteBuffer '%s' queue is full (queue_max_size=%s), dropping items in async mode; "
+                "далее не чаще раза в %.0f с",
+                self._name,
+                self._queue.maxsize,
+                self._drop_log_interval_sec,
+            )
+        else:
+            self._logger.error(
+                "HistoryWriteBuffer '%s' queue is full: отброшено %d элементов за %.0f с "
+                "(dropped_total=%s, worker_alive=%s, seconds_since_last_flush=%.1f)",
+                self._name,
+                dropped_in_window,
+                now - last,
+                self._stats["dropped_total"],
+                self.is_worker_alive(),
+                self._seconds_since(self._last_flush_monotonic),
+            )
 
     async def _worker(self) -> None:
         """
@@ -239,36 +404,57 @@ class HistoryWriteBuffer:
         """
         pending: List[Any] = []
 
-        while not self._stopped or not self._queue.empty():
-            try:
-                if not pending:
-                    try:
-                        item = await asyncio.wait_for(self._queue.get(), timeout=self._max_batch_interval_sec)
-                    except asyncio.TimeoutError:
-                        continue
-                    pending.append(item)
+        try:
+            while not self._stopped or not self._queue.empty():
+                try:
+                    if not pending:
+                        try:
+                            item = await asyncio.wait_for(self._queue.get(), timeout=self._max_batch_interval_sec)
+                        except asyncio.TimeoutError:
+                            continue
+                        pending.append(item)
 
-                # Добираем пачку до max_batch_size без ожидания
-                while len(pending) < self._max_batch_size:
-                    try:
-                        pending.append(self._queue.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
+                    # Добираем пачку до max_batch_size без ожидания
+                    while len(pending) < self._max_batch_size:
+                        try:
+                            pending.append(self._queue.get_nowait())
+                        except asyncio.QueueEmpty:
+                            break
 
-                await self._flush_pending(pending)
-                pending.clear()
+                    await self._flush_pending(pending)
+                    pending.clear()
 
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self._logger.error("HistoryWriteBuffer '%s' worker error: %s", self._name, e, exc_info=True)
+                except asyncio.CancelledError:
+                    # Отмена незакрытого буфера — авария: очередь останется без слива
+                    if not self._stopped:
+                        self._worker_exit_reason = "cancelled"
+                        self._logger.critical(
+                            "HistoryWriteBuffer '%s' worker cancelled while running, %d items pending",
+                            self._name,
+                            len(pending) + self._queue.qsize(),
+                        )
+                    raise
+                except Exception as e:
+                    self._logger.error("HistoryWriteBuffer '%s' worker error: %s", self._name, e, exc_info=True)
 
-        # Финальный флаш оставшихся данных
-        if pending:
-            try:
-                await self._flush_pending(pending)
-            except Exception as e:
-                self._logger.error("HistoryWriteBuffer '%s' final flush error: %s", self._name, e, exc_info=True)
+            # Финальный флаш оставшихся данных
+            if pending:
+                try:
+                    await self._flush_pending(pending)
+                except Exception as e:
+                    self._logger.error("HistoryWriteBuffer '%s' final flush error: %s", self._name, e, exc_info=True)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:
+            # Без этого воркер умирал молча: никто не ждёт task, и трассировка теряется
+            self._worker_exit_reason = f"{type(e).__name__}: {e}"
+            self._logger.critical(
+                "HistoryWriteBuffer '%s' worker terminated by %r",
+                self._name,
+                e,
+                exc_info=True,
+            )
+            raise
 
     async def _flush_pending(self, batch: List[Any]) -> None:
         if not batch:
@@ -287,6 +473,9 @@ class HistoryWriteBuffer:
                 batch_size,
             )
             _observe_timing(self._stats["flush_duration"], duration_ms)
+            # Отметка успеха: по ней видно «данные не доезжают», даже когда воркер жив
+            self._last_flush_monotonic = time.monotonic()
+            self._worker_restart_attempt = 0
             # Уведомляем ожидающих о завершении
             now = time.time()
             for item in batch:
@@ -537,6 +726,8 @@ class HistoryTimescale(HistoryStorageInterface):
         history_metadata_cache_init_max_rows: int = 500000,
         db_query_timeout_sec: Optional[float] = 30.0,
         db_pool_close_timeout_sec: float = 5.0,
+        db_pool_create_timeout_sec: float = 30.0,
+        db_lock_wait_timeout_sec: float = 60.0,
         **kwargs
     ) -> None:
         """
@@ -583,6 +774,10 @@ class HistoryTimescale(HistoryStorageInterface):
             else float(db_query_timeout_sec)
         )
         self._db_pool_close_timeout_sec = max(0.1, float(db_pool_close_timeout_sec))
+        # Пересоздание пула держит оба замка: без этих границ любой flush,
+        # вошедший в _ensure_pool, ждёт его неограниченно долго.
+        self._db_pool_create_timeout_sec = max(1.0, float(db_pool_create_timeout_sec))
+        self._db_lock_wait_timeout_sec = max(1.0, float(db_lock_wait_timeout_sec))
         # Последнее время, когда мы писали агрегированное сообщение о длительной недоступности БД
         self._last_reconnect_outage_log_at = None
         self._failed_value_saves_counter = 0
@@ -814,6 +1009,7 @@ class HistoryTimescale(HistoryStorageInterface):
             "save_event_errors_total": 0,
             "db_operation_timeouts_total": 0,
             "db_reconnects_total": 0,
+            "db_pool_wait_timeouts_total": 0,
         }
 
     @staticmethod
@@ -882,6 +1078,7 @@ class HistoryTimescale(HistoryStorageInterface):
             "db": {
                 "timeouts_total": self._performance_counters["db_operation_timeouts_total"],
                 "reconnects_total": self._performance_counters["db_reconnects_total"],
+                "pool_wait_timeouts_total": self._performance_counters["db_pool_wait_timeouts_total"],
             },
             "retention": {
                 "per_variable_cleanup_enabled": False,
@@ -895,6 +1092,8 @@ class HistoryTimescale(HistoryStorageInterface):
                 "history_write_durability_mode": str(self._history_write_durability_mode),
                 "history_write_read_consistency_mode": str(self._history_write_read_consistency_mode),
                 "db_query_timeout_sec": self._db_query_timeout_sec,
+                "db_pool_create_timeout_sec": float(self._db_pool_create_timeout_sec),
+                "db_lock_wait_timeout_sec": float(self._db_lock_wait_timeout_sec),
             },
         }
 
@@ -917,6 +1116,12 @@ class HistoryTimescale(HistoryStorageInterface):
             "max_flush_duration_ms": 0.0,
             "avg_flush_duration_ms": 0.0,
             "total_flush_duration_ms": 0.0,
+            # Набор ключей обязан совпадать с get_stats(): по нему создаются узлы OPC UA
+            "worker_alive": False,
+            "worker_restarts_total": 0,
+            "last_worker_exit_reason": "",
+            "seconds_since_last_flush": -1.0,
+            "seconds_since_last_enqueue": -1.0,
         }
 
     def reset_performance_metrics(self) -> None:
@@ -1347,7 +1552,10 @@ class HistoryTimescale(HistoryStorageInterface):
             'host': self._conn_params['host'],
             'port': self._conn_params['port'],
             'min_size': self._min_size,
-            'max_size': self._max_size
+            'max_size': self._max_size,
+            # Ограничение установки каждого соединения; общий бюджет create_pool
+            # задаётся отдельно в _create_pool_with_timeout
+            'timeout': self._db_pool_create_timeout_sec,
         }
 
         exclude_params = {'user', 'password', 'database', 'host', 'port', 'min_size', 'max_size', 'sslmode', 'schema'}
@@ -1392,6 +1600,43 @@ class HistoryTimescale(HistoryStorageInterface):
         except Exception as e:
             self.logger.warning("Error closing PostgreSQL pool during %s: %r", reason, e, exc_info=True)
 
+    @asynccontextmanager
+    async def _bounded_lock(self, lock: asyncio.Lock, what: str):
+        """
+        Захват замка с ограничением по времени. Без него ожидание замка,
+        удерживаемого зависшим реконнектом, не заканчивается никогда, а наружу
+        это выглядит как «историзация молча перестала писать».
+        """
+        try:
+            async with asyncio.timeout(self._db_lock_wait_timeout_sec):
+                await lock.acquire()
+        except TimeoutError:
+            self._perf_inc("db_pool_wait_timeouts_total")
+            self.logger.error(
+                "Timed out after %.1fs waiting for %s; database operation aborted",
+                self._db_lock_wait_timeout_sec,
+                what,
+            )
+            raise
+        try:
+            yield
+        finally:
+            lock.release()
+
+    async def _create_pool_with_timeout(self, reason: str) -> asyncpg.Pool:
+        pool_params = self._build_pool_params()
+        try:
+            async with asyncio.timeout(self._db_pool_create_timeout_sec):
+                return await asyncpg.create_pool(**pool_params)
+        except TimeoutError:
+            self._perf_inc("db_pool_wait_timeouts_total")
+            self.logger.error(
+                "Timed out after %.1fs creating PostgreSQL pool during %s",
+                self._db_pool_create_timeout_sec,
+                reason,
+            )
+            raise
+
     async def _ensure_pool(self) -> None:
         """
         Гарантирует наличие рабочего пула соединений.
@@ -1403,15 +1648,14 @@ class HistoryTimescale(HistoryStorageInterface):
         if self._is_pool_open(self._pool):
             return
         if self._reconnect_lock.locked():
-            async with self._reconnect_lock:
+            async with self._bounded_lock(self._reconnect_lock, "reconnect lock"):
                 pass
             if self._is_pool_open(self._pool):
                 return
-        async with self._pool_lock:
+        async with self._bounded_lock(self._pool_lock, "pool lock"):
             if self._is_pool_open(self._pool):
                 return
-            pool_params = self._build_pool_params()
-            self._pool = await asyncpg.create_pool(**pool_params)
+            self._pool = await self._create_pool_with_timeout("ensure_pool")
             self.logger.info("Connection pool created")
 
     async def _is_pool_healthy(self) -> bool:
@@ -1830,11 +2074,11 @@ class HistoryTimescale(HistoryStorageInterface):
         Старый пул закрывается синхронно, чтобы избежать гонок состояний
         внутри asyncpg (ошибки вида «another operation is in progress»).
         """
-        async with self._reconnect_lock:
+        async with self._bounded_lock(self._reconnect_lock, "reconnect lock (force_reconnect)"):
             if self._stopping:
                 raise RuntimeError("HistoryTimescale is stopping")
             old_pool: Optional[asyncpg.Pool] = None
-            async with self._pool_lock:
+            async with self._bounded_lock(self._pool_lock, "pool lock (force_reconnect)"):
                 try:
                     if (
                         failed_pool is not None
@@ -1858,10 +2102,9 @@ class HistoryTimescale(HistoryStorageInterface):
 
             # Создаём новый пул под блокировкой, без использования _ensure_pool,
             # чтобы избежать рекурсивного захвата замка.
-            async with self._pool_lock:
+            async with self._bounded_lock(self._pool_lock, "pool lock (recreate)"):
                 try:
-                    pool_params = self._build_pool_params()
-                    self._pool = await asyncpg.create_pool(**pool_params)
+                    self._pool = await self._create_pool_with_timeout("force_reconnect")
                     self._perf_inc("db_reconnects_total")
                     self.logger.info("Connection pool recreated successfully after failure")
                 except Exception as e:
