@@ -10,6 +10,7 @@ import json
 import asyncio
 import random
 import logging
+import socket
 import time
 import importlib.metadata as importlib_metadata
 from contextlib import asynccontextmanager
@@ -94,6 +95,8 @@ def _empty_timing_stats() -> Dict[str, float]:
 
 DEFAULT_DROP_LOG_INTERVAL_SEC = 60.0
 DEFAULT_WORKER_RESTART_MAX_BACKOFF_SEC = 30.0
+DEFAULT_FLUSH_TIMEOUT_SEC = 120.0
+DEFAULT_WORKER_STALL_TIMEOUT_SEC = 300.0
 
 
 def _observe_timing(stats: Dict[str, float], duration_ms: float) -> None:
@@ -125,6 +128,8 @@ class HistoryWriteBuffer:
         flush_func: Callable[[List[Any]], Coroutine[Any, Any, None]],
         drop_log_interval_sec: float = DEFAULT_DROP_LOG_INTERVAL_SEC,
         worker_restart_max_backoff_sec: float = DEFAULT_WORKER_RESTART_MAX_BACKOFF_SEC,
+        flush_timeout_sec: float = DEFAULT_FLUSH_TIMEOUT_SEC,
+        stall_timeout_sec: float = DEFAULT_WORKER_STALL_TIMEOUT_SEC,
     ) -> None:
         self._name = name
         self._logger = logger.getChild(f"buffer.{name}") if logger else logging.getLogger(f"HistoryWriteBuffer.{name}")
@@ -146,6 +151,12 @@ class HistoryWriteBuffer:
         self._restart_handle: Optional[asyncio.TimerHandle] = None
         self._last_flush_monotonic: Optional[float] = None
         self._last_enqueue_monotonic: Optional[float] = None
+        # Ограничение и надзор за самим флашем: воркер может быть жив и при этом
+        # висеть в await к БД, и тогда обычной проверки task.done() недостаточно.
+        self._flush_timeout_sec = max(0.0, float(flush_timeout_sec))
+        self._stall_timeout_sec = max(0.0, float(stall_timeout_sec))
+        self._flush_started_monotonic: Optional[float] = None
+        self._worker_stall_restarts_total = 0
         # Ограничение частоты лога об отбрасывании
         self._drop_log_interval_sec = max(0.0, float(drop_log_interval_sec))
         self._drop_log_last_monotonic: Optional[float] = None
@@ -162,6 +173,7 @@ class HistoryWriteBuffer:
             "last_batch_size": 0,
             "max_batch_size_seen": 0,
             "flush_errors_total": 0,
+            "flush_timeouts_total": 0,
             "last_flush_error": "",
             "flush_duration": _empty_timing_stats(),
         }
@@ -183,6 +195,7 @@ class HistoryWriteBuffer:
             "last_batch_size": int(self._stats["last_batch_size"]),
             "max_batch_size_seen": int(self._stats["max_batch_size_seen"]),
             "flush_errors_total": int(self._stats["flush_errors_total"]),
+            "flush_timeouts_total": int(self._stats["flush_timeouts_total"]),
             "last_flush_error": str(self._stats["last_flush_error"]),
             "last_flush_duration_ms": float(flush_duration["last_ms"]),
             "max_flush_duration_ms": float(flush_duration["max_ms"]),
@@ -192,9 +205,11 @@ class HistoryWriteBuffer:
             # а seconds_since_last_flush — живого, но залипшего в ожидании БД.
             "worker_alive": self.is_worker_alive(),
             "worker_restarts_total": int(self._worker_restarts_total),
+            "worker_stall_restarts_total": int(self._worker_stall_restarts_total),
             "last_worker_exit_reason": str(self._worker_exit_reason),
             "seconds_since_last_flush": self._seconds_since(self._last_flush_monotonic),
             "seconds_since_last_enqueue": self._seconds_since(self._last_enqueue_monotonic),
+            "seconds_in_current_flush": self._seconds_since(self._flush_started_monotonic),
         }
 
     @staticmethod
@@ -295,7 +310,10 @@ class HistoryWriteBuffer:
 
         Буфер, который ни разу не запускали, не поднимаем: это не авария, а
         сознательный выбор вызывающего кода."""
-        if not self._ever_started or self._stopped or self.is_worker_alive():
+        if not self._ever_started or self._stopped:
+            return
+        if self.is_worker_alive():
+            self._restart_if_stalled()
             return
         if self._restart_handle is not None:
             return
@@ -303,6 +321,44 @@ class HistoryWriteBuffer:
             "HistoryWriteBuffer '%s' worker is not running on enqueue path; starting it",
             self._name,
         )
+        self.start()
+
+    def _restart_if_stalled(self) -> None:
+        """
+        Живой воркер, застрявший в await к БД, — отдельный класс отказа: task.done()
+        остаётся False, ошибок нет, а очередь тем временем переполняется. Единственный
+        надёжный признак — флаш, который идёт дольше любого разумного времени.
+
+        Отменяем задачу и сразу поднимаем новую, не дожидаясь завершения старой:
+        её cleanup может висеть на том же мёртвом сокете.
+        """
+        if self._stall_timeout_sec <= 0:
+            return
+        started = self._flush_started_monotonic
+        if started is None:
+            return
+        stuck_for = time.monotonic() - started
+        if stuck_for < self._stall_timeout_sec:
+            return
+
+        stalled_task = self._task
+        self._worker_stall_restarts_total += 1
+        self._worker_exit_reason = f"stalled in flush for {stuck_for:.0f}s"
+        self._logger.critical(
+            "HistoryWriteBuffer '%s' worker is stuck in flush for %.0fs (queue=%d); "
+            "cancelling and restarting it",
+            self._name,
+            stuck_for,
+            self._queue.qsize(),
+        )
+
+        self._flush_started_monotonic = None
+        self._task = None
+        if stalled_task is not None:
+            stalled_task.cancel()
+        if self._restart_handle is not None:
+            self._restart_handle.cancel()
+            self._restart_handle = None
         self.start()
 
     async def stop(self) -> None:
@@ -461,8 +517,13 @@ class HistoryWriteBuffer:
             return
 
         started_at = time.perf_counter()
+        self._flush_started_monotonic = time.monotonic()
         try:
-            await self._flush_func(batch)
+            if self._flush_timeout_sec > 0:
+                async with asyncio.timeout(self._flush_timeout_sec):
+                    await self._flush_func(batch)
+            else:
+                await self._flush_func(batch)
             duration_ms = (time.perf_counter() - started_at) * 1000.0
             batch_size = len(batch)
             self._stats["flush_batches_total"] += 1
@@ -485,6 +546,12 @@ class HistoryWriteBuffer:
         except Exception as e:
             duration_ms = (time.perf_counter() - started_at) * 1000.0
             batch_size = len(batch)
+            timed_out = isinstance(e, (asyncio.TimeoutError, TimeoutError))
+            if timed_out:
+                self._stats["flush_timeouts_total"] += 1
+                e = TimeoutError(
+                    f"flush timed out after {self._flush_timeout_sec:.0f}s"
+                )
             self._stats["flush_errors_total"] += 1
             self._stats["last_flush_error"] = str(e)
             self._stats["last_batch_size"] = batch_size
@@ -498,12 +565,14 @@ class HistoryWriteBuffer:
                 self._name,
                 len(batch),
                 e,
-                exc_info=True,
+                exc_info=not timed_out,
             )
             for item in batch:
                 fut: Optional[asyncio.Future] = getattr(item, "future", None)
                 if fut is not None and not fut.done():
                     fut.set_exception(e)
+        finally:
+            self._flush_started_monotonic = None
 
 try:
     from asyncua.common.events import get_event_properties_from_type_node
@@ -728,6 +797,13 @@ class HistoryTimescale(HistoryStorageInterface):
         db_pool_close_timeout_sec: float = 5.0,
         db_pool_create_timeout_sec: float = 30.0,
         db_lock_wait_timeout_sec: float = 60.0,
+        db_command_timeout_sec: Optional[float] = 60.0,
+        db_tcp_keepalive_idle_sec: int = 30,
+        db_tcp_keepalive_interval_sec: int = 10,
+        db_tcp_keepalive_count: int = 3,
+        db_tcp_user_timeout_sec: float = 60.0,
+        history_flush_timeout_sec: float = DEFAULT_FLUSH_TIMEOUT_SEC,
+        history_worker_stall_timeout_sec: float = DEFAULT_WORKER_STALL_TIMEOUT_SEC,
         **kwargs
     ) -> None:
         """
@@ -778,6 +854,19 @@ class HistoryTimescale(HistoryStorageInterface):
         # вошедший в _ensure_pool, ждёт его неограниченно долго.
         self._db_pool_create_timeout_sec = max(1.0, float(db_pool_create_timeout_sec))
         self._db_lock_wait_timeout_sec = max(1.0, float(db_lock_wait_timeout_sec))
+        # command_timeout действует внутри asyncpg и покрывает в том числе BEGIN,
+        # COMMIT и ROLLBACK, которые контекст транзакции шлёт без явного timeout.
+        self._db_command_timeout_sec = (
+            None
+            if db_command_timeout_sec is None or float(db_command_timeout_sec) <= 0
+            else float(db_command_timeout_sec)
+        )
+        self._db_tcp_keepalive_idle_sec = max(0, int(db_tcp_keepalive_idle_sec))
+        self._db_tcp_keepalive_interval_sec = max(1, int(db_tcp_keepalive_interval_sec))
+        self._db_tcp_keepalive_count = max(1, int(db_tcp_keepalive_count))
+        self._db_tcp_user_timeout_sec = max(0.0, float(db_tcp_user_timeout_sec))
+        self._history_flush_timeout_sec = max(0.0, float(history_flush_timeout_sec))
+        self._history_worker_stall_timeout_sec = max(0.0, float(history_worker_stall_timeout_sec))
         # Последнее время, когда мы писали агрегированное сообщение о длительной недоступности БД
         self._last_reconnect_outage_log_at = None
         self._failed_value_saves_counter = 0
@@ -1094,6 +1183,11 @@ class HistoryTimescale(HistoryStorageInterface):
                 "db_query_timeout_sec": self._db_query_timeout_sec,
                 "db_pool_create_timeout_sec": float(self._db_pool_create_timeout_sec),
                 "db_lock_wait_timeout_sec": float(self._db_lock_wait_timeout_sec),
+                "db_command_timeout_sec": self._db_command_timeout_sec,
+                "db_tcp_keepalive_idle_sec": int(self._db_tcp_keepalive_idle_sec),
+                "db_tcp_user_timeout_sec": float(self._db_tcp_user_timeout_sec),
+                "history_flush_timeout_sec": float(self._history_flush_timeout_sec),
+                "history_worker_stall_timeout_sec": float(self._history_worker_stall_timeout_sec),
             },
         }
 
@@ -1111,6 +1205,7 @@ class HistoryTimescale(HistoryStorageInterface):
             "last_batch_size": 0,
             "max_batch_size_seen": 0,
             "flush_errors_total": 0,
+            "flush_timeouts_total": 0,
             "last_flush_error": "",
             "last_flush_duration_ms": 0.0,
             "max_flush_duration_ms": 0.0,
@@ -1119,9 +1214,11 @@ class HistoryTimescale(HistoryStorageInterface):
             # Набор ключей обязан совпадать с get_stats(): по нему создаются узлы OPC UA
             "worker_alive": False,
             "worker_restarts_total": 0,
+            "worker_stall_restarts_total": 0,
             "last_worker_exit_reason": "",
             "seconds_since_last_flush": -1.0,
             "seconds_since_last_enqueue": -1.0,
+            "seconds_in_current_flush": -1.0,
         }
 
     def reset_performance_metrics(self) -> None:
@@ -1256,6 +1353,8 @@ class HistoryTimescale(HistoryStorageInterface):
                         queue_max_size=self._history_write_queue_max_size,
                         durability_mode=self._history_write_durability_mode,
                         flush_func=self._flush_variable_batch,
+                        flush_timeout_sec=self._history_flush_timeout_sec,
+                        stall_timeout_sec=self._history_worker_stall_timeout_sec,
                     )
                     self._value_write_buffer.start()
 
@@ -1268,6 +1367,8 @@ class HistoryTimescale(HistoryStorageInterface):
                         queue_max_size=self._history_write_queue_max_size,
                         durability_mode=self._history_write_durability_mode,
                         flush_func=self._flush_event_batch,
+                        flush_timeout_sec=self._history_flush_timeout_sec,
+                        stall_timeout_sec=self._history_worker_stall_timeout_sec,
                     )
                     self._event_write_buffer.start()
 
@@ -1556,6 +1657,8 @@ class HistoryTimescale(HistoryStorageInterface):
             # Ограничение установки каждого соединения; общий бюджет create_pool
             # задаётся отдельно в _create_pool_with_timeout
             'timeout': self._db_pool_create_timeout_sec,
+            'command_timeout': self._db_command_timeout_sec,
+            'init': self._configure_connection,
         }
 
         exclude_params = {'user', 'password', 'database', 'host', 'port', 'min_size', 'max_size', 'sslmode', 'schema'}
@@ -1569,6 +1672,45 @@ class HistoryTimescale(HistoryStorageInterface):
             pool_params['ssl'] = True
 
         return pool_params
+
+    async def _configure_connection(self, conn: asyncpg.Connection) -> None:
+        """
+        Включает TCP keepalive на сокете соединения.
+
+        Прикладных таймаутов недостаточно: если сокет к БД умер молча, отмена
+        зависшего запроса сама уходит в тот же мёртвый сокет (asyncpg шлёт ROLLBACK
+        при выходе из транзакции), и ожидание не заканчивается никогда. Обрыв должен
+        обнаруживаться на уровне ОС, а не приложения.
+        """
+        if self._db_tcp_keepalive_idle_sec <= 0:
+            return
+        try:
+            sock = conn._transport.get_extra_info("socket")
+            if sock is None or sock.family not in (socket.AF_INET, socket.AF_INET6):
+                return
+
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            for opt_name, value in (
+                ("TCP_KEEPIDLE", self._db_tcp_keepalive_idle_sec),
+                ("TCP_KEEPINTVL", self._db_tcp_keepalive_interval_sec),
+                ("TCP_KEEPCNT", self._db_tcp_keepalive_count),
+            ):
+                opt = getattr(socket, opt_name, None)
+                if opt is not None:
+                    sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+
+            # TCP_USER_TIMEOUT ограничивает время неподтверждённой отправки и потому
+            # ловит обрыв даже посреди активной записи, когда keepalive не работает.
+            user_timeout = getattr(socket, "TCP_USER_TIMEOUT", None)
+            if user_timeout is not None and self._db_tcp_user_timeout_sec > 0:
+                sock.setsockopt(
+                    socket.IPPROTO_TCP,
+                    user_timeout,
+                    int(self._db_tcp_user_timeout_sec * 1000),
+                )
+        except Exception as e:
+            # Настройка сокета не должна мешать работе с БД
+            self.logger.warning("Failed to set TCP keepalive on database socket: %r", e)
 
     @staticmethod
     def _is_pool_open(pool: Optional[asyncpg.Pool]) -> bool:
