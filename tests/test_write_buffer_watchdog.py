@@ -178,7 +178,9 @@ async def test_hanging_flush_times_out_and_worker_keeps_draining():
     stats = buffer.get_stats()
     assert stats["flush_timeouts_total"] == 1
     assert stats["flush_errors_total"] == 1
+    assert stats["flush_dropped_items_total"] == 1
     assert "timed out" in stats["last_flush_error"]
+    assert "after 120s" not in stats["last_flush_error"]
     assert stats["worker_alive"] is True
 
     # Воркер должен продолжить работу, а не остаться в зависшем флаше
@@ -239,16 +241,20 @@ async def test_seconds_in_current_flush_exposes_stuck_flush():
 @pytest.mark.asyncio
 async def test_pool_params_carry_command_timeout_and_socket_setup():
     """command_timeout в asyncpg покрывает BEGIN/COMMIT, у которых нет своего timeout."""
-    history = HistoryTimescale(db_command_timeout_sec=45.0)
+    history = HistoryTimescale(
+        db_command_timeout_sec=45.0,
+        history_flush_timeout_sec=45.0,
+    )
     params = history._build_pool_params()
 
     assert params["command_timeout"] == 45.0
     assert params["init"] == history._configure_connection
+    assert params["server_settings"]["application_name"] == "uapg-history"
 
 
 @pytest.mark.asyncio
 async def test_command_timeout_disabled_by_non_positive_value():
-    history = HistoryTimescale(db_command_timeout_sec=0)
+    history = HistoryTimescale(db_command_timeout_sec=0, history_flush_timeout_sec=0)
     assert history._build_pool_params()["command_timeout"] is None
 
 
@@ -286,3 +292,25 @@ async def test_configure_connection_survives_broken_socket():
     conn._transport.get_extra_info.side_effect = RuntimeError("no transport")
 
     await history._configure_connection(conn)
+
+
+@pytest.mark.asyncio
+async def test_flush_pending_keeps_inner_timeout_message():
+    async def fail_flush(batch):
+        raise TimeoutError("flush variable batch timed out after 30.0s (layer=flush)")
+
+    buffer = make_buffer(fail_flush)
+    await buffer._flush_pending([object(), object()])
+
+    stats = buffer.get_stats()
+    assert stats["flush_timeouts_total"] == 1
+    assert stats["flush_dropped_items_total"] == 2
+    assert stats["last_flush_error"] == "flush variable batch timed out after 30.0s (layer=flush)"
+    assert "after 120s" not in stats["last_flush_error"]
+
+
+@pytest.mark.asyncio
+async def test_command_timeout_is_at_least_flush_timeout():
+    history = HistoryTimescale(db_command_timeout_sec=60.0, history_flush_timeout_sec=120.0)
+    assert history._build_pool_params()["command_timeout"] == 120.0
+    assert history._buffer_flush_timeout_sec() == 300.0

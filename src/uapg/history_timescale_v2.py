@@ -159,47 +159,55 @@ class HistoryTimescaleV2(HistoryTimescale):
             await super()._flush_event_batch(items)
             return
 
+        flush_timeout = self._flush_op_timeout_sec()
         for attempt in (1, 2):
             await self._ensure_pool()
             failed_pool = self._pool
             try:
 
                 async def _op() -> None:
-                    async with failed_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
-                        async with conn.transaction():
-                            for it in items:
-                                # Always persist OPC payload via uapg_save_event_v2
-                                # (events_history.event_data + events_ts.legacy_row_id).
-                                # Mode=v2 previously inserted only into events_ts without
-                                # event_data → HistoryRead returned empty field values.
-                                typed_values = self._typed_values_from_json(it.event_data_json)
-                                table = self._typed_tables.get(it.event_type_id)
-                                if table is None and self._registry:
-                                    table = await self._registry.get_storage_table(it.event_type_id)
-                                schema_version = self._schema_versions.get(it.event_type_id, 1)
-                                gateway = ProcedureGateway(self._schema, conn, self.logger)
-                                store = EventStoreV2(
-                                    self._schema,
-                                    conn,
-                                    self._registry,
-                                    gateway,
-                                    self.logger,
-                                )
-                                await store.save_event_dual(
-                                    it.source_db_id,
-                                    it.event_type_id,
-                                    it.event_timestamp,
-                                    it.event_data_json,
-                                    typed_values,
-                                    table,
-                                    schema_version,
-                                )
+                    async with self._flush_on_connection(failed_pool) as conn:
+                        for it in items:
+                            # Always persist OPC payload via uapg_save_event_v2
+                            # (events_history.event_data + events_ts.legacy_row_id).
+                            # Mode=v2 previously inserted only into events_ts without
+                            # event_data → HistoryRead returned empty field values.
+                            typed_values = self._typed_values_from_json(it.event_data_json)
+                            table = self._typed_tables.get(it.event_type_id)
+                            if table is None and self._registry:
+                                table = await self._registry.get_storage_table(it.event_type_id)
+                            schema_version = self._schema_versions.get(it.event_type_id, 1)
+                            gateway = ProcedureGateway(self._schema, conn, self.logger)
+                            store = EventStoreV2(
+                                self._schema,
+                                conn,
+                                self._registry,
+                                gateway,
+                                self.logger,
+                            )
+                            await store.save_event_dual(
+                                it.source_db_id,
+                                it.event_type_id,
+                                it.event_timestamp,
+                                it.event_data_json,
+                                typed_values,
+                                table,
+                                schema_version,
+                            )
 
-                await self._run_db_operation(_op(), "flush event batch v2")
+                await self._run_db_operation(
+                    _op(),
+                    "flush event batch v2",
+                    timeout=flush_timeout,
+                    layer="flush",
+                )
                 return
             except Exception as e:
                 if attempt == 1:
-                    self.logger.error("Flush event batch v2 failed, reconnecting: %s", e)
+                    self.logger.error(
+                        "Flush event batch v2 failed, will reconnect and retry: %s",
+                        e,
+                    )
                     await self._force_reconnect(failed_pool)
                 else:
                     self.logger.error("Flush event batch v2 failed after reconnect: %s", e)
