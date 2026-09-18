@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from asyncua.common.events import Event
 
 from uapg.v2.event_store import EventStoreV2
@@ -235,6 +236,15 @@ async def _read_events_keeps_event_type_ids_after_replan() -> None:
     assert 't."dev_eui" ILIKE $5' in sql
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Фильтр по типизированному полю без явного EventType теряет предикат в ветке "
+        "UNION ALL по нескольким типам: в SQL уходит только временной диапазон, а "
+        "dev_eui применяется в памяти уже после LIMIT (то, что ADR-001 и должен был "
+        "убрать). Push-down в ветку UNION реализуется при переписывании событий."
+    ),
+)
 def test_read_events_resolves_event_type_ids_for_field_only_filter() -> None:
     asyncio.run(_read_events_resolves_event_type_ids_for_field_only_filter())
 

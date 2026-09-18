@@ -1,0 +1,1017 @@
+{
+  "constraints": {
+    "event_sources": [
+      "event_sources_pkey: PRIMARY KEY (id)",
+      "event_sources_source_id_key: UNIQUE (source_id)"
+    ],
+    "event_type_schema": [
+      "event_type_schema_event_type_id_schema_version_key: UNIQUE (event_type_id, schema_version)",
+      "event_type_schema_pkey: PRIMARY KEY (id)"
+    ],
+    "event_type_storage": [
+      "event_type_storage_pkey: PRIMARY KEY (event_type_id)"
+    ],
+    "event_types": [
+      "event_types_event_type_id_key: UNIQUE (event_type_id)",
+      "event_types_pkey: PRIMARY KEY (id)"
+    ],
+    "events_ts": [
+      "events_ts_pkey: PRIMARY KEY (source_id, event_timestamp, event_id)"
+    ],
+    "uapg_backfill_state": [
+      "uapg_backfill_state_pkey: PRIMARY KEY (domain)"
+    ],
+    "uapg_schema_migrations": [
+      "uapg_schema_migrations_pkey: PRIMARY KEY (version)"
+    ],
+    "variable_metadata": [
+      "variable_metadata_pkey: PRIMARY KEY (id)",
+      "variable_metadata_variable_id_key: UNIQUE (variable_id)"
+    ],
+    "variable_schema": [
+      "variable_schema_pkey: PRIMARY KEY (id)",
+      "variable_schema_variable_id_schema_version_key: UNIQUE (variable_id, schema_version)"
+    ],
+    "variables_last_value": [
+      "variables_last_value_pkey: PRIMARY KEY (variable_id)"
+    ],
+    "variables_ts": [
+      "variables_ts_pkey: PRIMARY KEY (variable_id, sourcetimestamp, value_id)"
+    ]
+  },
+  "indexes": {
+    "event_sources": [
+      "CREATE UNIQUE INDEX event_sources_pkey ON {schema}.event_sources USING btree (id)",
+      "CREATE UNIQUE INDEX event_sources_source_id_key ON {schema}.event_sources USING btree (source_id)",
+      "CREATE INDEX idx_event_sources_created ON {schema}.event_sources USING btree (created_at)",
+      "CREATE UNIQUE INDEX idx_event_sources_node_id ON {schema}.event_sources USING btree (source_node_id)",
+      "CREATE INDEX idx_event_sources_source_id ON {schema}.event_sources USING btree (source_id)"
+    ],
+    "event_type_schema": [
+      "CREATE UNIQUE INDEX event_type_schema_event_type_id_schema_version_key ON {schema}.event_type_schema USING btree (event_type_id, schema_version)",
+      "CREATE UNIQUE INDEX event_type_schema_pkey ON {schema}.event_type_schema USING btree (id)",
+      "CREATE INDEX idx_event_type_schema_type ON {schema}.event_type_schema USING btree (event_type_id, schema_version DESC)"
+    ],
+    "event_type_storage": [
+      "CREATE UNIQUE INDEX event_type_storage_pkey ON {schema}.event_type_storage USING btree (event_type_id)"
+    ],
+    "event_types": [
+      "CREATE UNIQUE INDEX event_types_event_type_id_key ON {schema}.event_types USING btree (event_type_id)",
+      "CREATE UNIQUE INDEX event_types_pkey ON {schema}.event_types USING btree (id)",
+      "CREATE INDEX idx_event_types_created ON {schema}.event_types USING btree (created_at)",
+      "CREATE INDEX idx_event_types_event_type_id ON {schema}.event_types USING btree (event_type_id)",
+      "CREATE UNIQUE INDEX idx_event_types_name ON {schema}.event_types USING btree (event_type_name)"
+    ],
+    "events_history": [
+      "CREATE INDEX idx_events_data_gin ON {schema}.events_history USING gin (event_data)",
+      "CREATE INDEX idx_events_event_type_id ON {schema}.events_history USING btree (event_type_id)",
+      "CREATE INDEX idx_events_history_event_type_source ON {schema}.events_history USING btree (event_type_id, source_id)",
+      "CREATE INDEX idx_events_history_source_timestamp ON {schema}.events_history USING btree (source_id, event_timestamp)",
+      "CREATE INDEX idx_events_history_type_source ON {schema}.events_history USING btree (event_type_id, source_id)",
+      "CREATE INDEX idx_events_source_id ON {schema}.events_history USING btree (source_id)",
+      "CREATE UNIQUE INDEX idx_events_sourceid_eventts ON {schema}.events_history USING btree (source_id, event_timestamp)",
+      "CREATE INDEX idx_events_timestamp ON {schema}.events_history USING btree (event_timestamp)"
+    ],
+    "events_ts": [
+      "CREATE INDEX events_ts_event_timestamp_idx ON {schema}.events_ts USING btree (event_timestamp DESC)",
+      "CREATE UNIQUE INDEX events_ts_pkey ON {schema}.events_ts USING btree (source_id, event_timestamp, event_id)",
+      "CREATE INDEX events_ts_source_id_event_timestamp_idx ON {schema}.events_ts USING btree (source_id, event_timestamp DESC)",
+      "CREATE INDEX idx_events_ts_legacy_row ON {schema}.events_ts USING btree (legacy_row_id) WHERE (legacy_row_id IS NOT NULL)",
+      "CREATE INDEX idx_events_ts_source_ts ON {schema}.events_ts USING btree (source_id, event_timestamp DESC, event_id DESC)",
+      "CREATE UNIQUE INDEX idx_events_ts_source_ts_uniq ON {schema}.events_ts USING btree (source_id, event_timestamp)",
+      "CREATE INDEX idx_events_ts_type_source ON {schema}.events_ts USING btree (event_type_id, source_id, event_timestamp DESC)"
+    ],
+    "uapg_backfill_state": [
+      "CREATE UNIQUE INDEX uapg_backfill_state_pkey ON {schema}.uapg_backfill_state USING btree (domain)"
+    ],
+    "uapg_schema_migrations": [
+      "CREATE UNIQUE INDEX uapg_schema_migrations_pkey ON {schema}.uapg_schema_migrations USING btree (version)"
+    ],
+    "variable_metadata": [
+      "CREATE INDEX idx_variable_metadata_created ON {schema}.variable_metadata USING btree (created_at)",
+      "CREATE UNIQUE INDEX idx_variable_metadata_node_id ON {schema}.variable_metadata USING btree (node_id)",
+      "CREATE INDEX idx_variable_metadata_variable_id ON {schema}.variable_metadata USING btree (variable_id)",
+      "CREATE UNIQUE INDEX variable_metadata_pkey ON {schema}.variable_metadata USING btree (id)",
+      "CREATE UNIQUE INDEX variable_metadata_variable_id_key ON {schema}.variable_metadata USING btree (variable_id)"
+    ],
+    "variable_schema": [
+      "CREATE UNIQUE INDEX variable_schema_pkey ON {schema}.variable_schema USING btree (id)",
+      "CREATE UNIQUE INDEX variable_schema_variable_id_schema_version_key ON {schema}.variable_schema USING btree (variable_id, schema_version)"
+    ],
+    "variables_history": [
+      "CREATE INDEX idx_variables_history_variable_id_timestamp ON {schema}.variables_history USING btree (variable_id, sourcetimestamp)",
+      "CREATE INDEX idx_variables_history_vid_ts_desc_covering ON {schema}.variables_history USING btree (variable_id, sourcetimestamp DESC) INCLUDE (statuscode, varianttype, servertimestamp)",
+      "CREATE INDEX idx_variables_server_timestamp ON {schema}.variables_history USING btree (servertimestamp)",
+      "CREATE INDEX idx_variables_timestamp ON {schema}.variables_history USING btree (sourcetimestamp)",
+      "CREATE INDEX idx_variables_variable_id ON {schema}.variables_history USING btree (variable_id)",
+      "CREATE UNIQUE INDEX idx_variables_varid_sourcets ON {schema}.variables_history USING btree (variable_id, sourcetimestamp)"
+    ],
+    "variables_last_value": [
+      "CREATE INDEX idx_variables_last_value_updated ON {schema}.variables_last_value USING btree (updated_at)",
+      "CREATE UNIQUE INDEX variables_last_value_pkey ON {schema}.variables_last_value USING btree (variable_id)"
+    ],
+    "variables_ts": [
+      "CREATE INDEX idx_variables_ts_var_ts ON {schema}.variables_ts USING btree (variable_id, sourcetimestamp DESC)",
+      "CREATE UNIQUE INDEX variables_ts_pkey ON {schema}.variables_ts USING btree (variable_id, sourcetimestamp, value_id)",
+      "CREATE INDEX variables_ts_sourcetimestamp_idx ON {schema}.variables_ts USING btree (sourcetimestamp DESC)",
+      "CREATE INDEX variables_ts_variable_id_sourcetimestamp_idx ON {schema}.variables_ts USING btree (variable_id, sourcetimestamp DESC)"
+    ]
+  },
+  "routines": {
+    "uapg_backfill_events_batch(IN p_batch_size integer, INOUT p_last_legacy_id bigint, INOUT p_rows_processed bigint)": {
+      "kind": "p",
+      "result": null,
+      "volatility": "v"
+    },
+    "uapg_explain_event_filter(p_source_id bigint, p_start timestamp with time zone, p_end timestamp with time zone, p_limit integer, p_order text, p_event_type_ids bigint[])": {
+      "kind": "f",
+      "result": "text",
+      "volatility": "s"
+    },
+    "uapg_read_events_v2(p_source_id bigint, p_start timestamp with time zone, p_end timestamp with time zone, p_limit integer, p_order text, p_event_type_ids bigint[], p_cursor_ts timestamp with time zone, p_cursor_event_id bigint)": {
+      "kind": "f",
+      "result": "TABLE(event_id bigint, event_timestamp timestamp with time zone, event_type_id bigint, legacy_row_id bigint, schema_version integer)",
+      "volatility": "s"
+    },
+    "uapg_read_variables_at_time_v2(p_variable_id bigint, p_timestamps timestamp with time zone[])": {
+      "kind": "f",
+      "result": "TABLE(requested_ts timestamp with time zone, value_id bigint, sourcetimestamp timestamp with time zone, value_double double precision, value_text text)",
+      "volatility": "s"
+    },
+    "uapg_read_variables_processed_v2(p_plan jsonb)": {
+      "kind": "f",
+      "result": "TABLE(bucket timestamp with time zone, variable_id bigint, aggregate_value double precision, sample_count bigint)",
+      "volatility": "s"
+    },
+    "uapg_read_variables_raw_v2(p_variable_id bigint, p_start timestamp with time zone, p_end timestamp with time zone, p_limit integer, p_order text, p_cursor_ts timestamp with time zone, p_cursor_value_id bigint)": {
+      "kind": "f",
+      "result": "TABLE(value_id bigint, sourcetimestamp timestamp with time zone, servertimestamp timestamp with time zone, statuscode integer, value_double double precision, value_int64 bigint, value_bool boolean, value_text text, legacy_row_id bigint)",
+      "volatility": "s"
+    },
+    "uapg_save_event_v2(p_source_id bigint, p_event_type_id bigint, p_event_timestamp timestamp with time zone, p_event_data jsonb, p_schema_version integer)": {
+      "kind": "f",
+      "result": "TABLE(legacy_row_id bigint, event_id bigint)",
+      "volatility": "v"
+    },
+    "uapg_sync_event_type_schema(IN p_event_type_id bigint, IN p_node_id text, IN p_parent_node_id text, IN p_fields jsonb, IN p_schema_version integer, IN p_physical_table text)": {
+      "kind": "p",
+      "result": null,
+      "volatility": "v"
+    }
+  },
+  "tables": {
+    "event_sources": [
+      {
+        "column": "id",
+        "default": "nextval('event_sources_id_seq'::regclass)",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "source_id",
+        "default": "id",
+        "generated": "s",
+        "identity": null,
+        "not_null": false,
+        "type": "bigint"
+      },
+      {
+        "column": "source_node_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "retention_period",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "interval"
+      },
+      {
+        "column": "max_records",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "integer"
+      },
+      {
+        "column": "created_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "updated_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      }
+    ],
+    "event_type_schema": [
+      {
+        "column": "id",
+        "default": "nextval('event_type_schema_id_seq'::regclass)",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "event_type_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "schema_version",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "integer"
+      },
+      {
+        "column": "node_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "parent_node_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "text"
+      },
+      {
+        "column": "fields",
+        "default": "'[]'::jsonb",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "jsonb"
+      },
+      {
+        "column": "effective_from",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      }
+    ],
+    "event_type_storage": [
+      {
+        "column": "event_type_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "physical_table",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "schema_version",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "integer"
+      },
+      {
+        "column": "updated_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      }
+    ],
+    "event_types": [
+      {
+        "column": "id",
+        "default": "nextval('event_types_id_seq'::regclass)",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "event_type_id",
+        "default": "id",
+        "generated": "s",
+        "identity": null,
+        "not_null": false,
+        "type": "bigint"
+      },
+      {
+        "column": "event_type_name",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "created_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "updated_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      }
+    ],
+    "events_history": [
+      {
+        "column": "id",
+        "default": "nextval('events_history_id_seq'::regclass)",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "source_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "event_type_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "event_timestamp",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "event_data",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "jsonb"
+      },
+      {
+        "column": "created_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      }
+    ],
+    "events_ts": [
+      {
+        "column": "event_id",
+        "default": "nextval('events_ts_event_id_seq'::regclass)",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "source_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "event_type_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "event_timestamp",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "schema_version",
+        "default": "1",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "integer"
+      },
+      {
+        "column": "legacy_row_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "bigint"
+      },
+      {
+        "column": "created_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      }
+    ],
+    "uapg_backfill_state": [
+      {
+        "column": "domain",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "last_legacy_id",
+        "default": "0",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "rows_processed",
+        "default": "0",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "updated_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      }
+    ],
+    "uapg_schema_migrations": [
+      {
+        "column": "version",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "applied_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      }
+    ],
+    "variable_metadata": [
+      {
+        "column": "id",
+        "default": "nextval('variable_metadata_id_seq'::regclass)",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "variable_id",
+        "default": "id",
+        "generated": "s",
+        "identity": null,
+        "not_null": false,
+        "type": "bigint"
+      },
+      {
+        "column": "node_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "data_type",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "text"
+      },
+      {
+        "column": "retention_period",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "interval"
+      },
+      {
+        "column": "max_records",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "integer"
+      },
+      {
+        "column": "created_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "updated_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      }
+    ],
+    "variable_schema": [
+      {
+        "column": "id",
+        "default": "nextval('variable_schema_id_seq'::regclass)",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "variable_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "schema_version",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "integer"
+      },
+      {
+        "column": "node_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "opc_datatype",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "text"
+      },
+      {
+        "column": "sql_type",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "text"
+      },
+      {
+        "column": "aggregate_eligible",
+        "default": "false",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "boolean"
+      },
+      {
+        "column": "effective_from",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      }
+    ],
+    "variables_history": [
+      {
+        "column": "id",
+        "default": "nextval('variables_history_id_seq'::regclass)",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "variable_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "servertimestamp",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "sourcetimestamp",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "statuscode",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "integer"
+      },
+      {
+        "column": "value",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "text"
+      },
+      {
+        "column": "varianttype",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "integer"
+      },
+      {
+        "column": "variantbinary",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "bytea"
+      },
+      {
+        "column": "created_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      }
+    ],
+    "variables_last_value": [
+      {
+        "column": "variable_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "sourcetimestamp",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "servertimestamp",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "statuscode",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "integer"
+      },
+      {
+        "column": "varianttype",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "integer"
+      },
+      {
+        "column": "variantbinary",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bytea"
+      },
+      {
+        "column": "updated_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "is_seed",
+        "default": "false",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "boolean"
+      }
+    ],
+    "variables_ts": [
+      {
+        "column": "value_id",
+        "default": "nextval('variables_ts_value_id_seq'::regclass)",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "variable_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "sourcetimestamp",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "servertimestamp",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "statuscode",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "integer"
+      },
+      {
+        "column": "schema_version",
+        "default": "1",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "integer"
+      },
+      {
+        "column": "legacy_row_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "bigint"
+      },
+      {
+        "column": "value_double",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "double precision"
+      },
+      {
+        "column": "value_int64",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "bigint"
+      },
+      {
+        "column": "value_bool",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "boolean"
+      },
+      {
+        "column": "value_text",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "text"
+      },
+      {
+        "column": "created_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      }
+    ]
+  },
+  "timescale": {
+    "available": true,
+    "continuous_aggregates": [
+      {
+        "compression_enabled": false,
+        "view": "uapg_events_hourly"
+      }
+    ],
+    "dimensions": [
+      {
+        "column": "event_timestamp",
+        "column_type": "timestamp with time zone",
+        "hypertable": "events_history",
+        "num_partitions": null,
+        "number": 1,
+        "time_interval": "7 days, 0:00:00",
+        "type": "Time"
+      },
+      {
+        "column": "source_id",
+        "column_type": "bigint",
+        "hypertable": "events_history",
+        "num_partitions": 64,
+        "number": 2,
+        "time_interval": null,
+        "type": "Space"
+      },
+      {
+        "column": "event_timestamp",
+        "column_type": "timestamp with time zone",
+        "hypertable": "events_ts",
+        "num_partitions": null,
+        "number": 1,
+        "time_interval": "7 days, 0:00:00",
+        "type": "Time"
+      },
+      {
+        "column": "source_id",
+        "column_type": "bigint",
+        "hypertable": "events_ts",
+        "num_partitions": 64,
+        "number": 2,
+        "time_interval": null,
+        "type": "Space"
+      },
+      {
+        "column": "sourcetimestamp",
+        "column_type": "timestamp with time zone",
+        "hypertable": "variables_history",
+        "num_partitions": null,
+        "number": 1,
+        "time_interval": "7 days, 0:00:00",
+        "type": "Time"
+      },
+      {
+        "column": "variable_id",
+        "column_type": "bigint",
+        "hypertable": "variables_history",
+        "num_partitions": 128,
+        "number": 2,
+        "time_interval": null,
+        "type": "Space"
+      },
+      {
+        "column": "sourcetimestamp",
+        "column_type": "timestamp with time zone",
+        "hypertable": "variables_ts",
+        "num_partitions": null,
+        "number": 1,
+        "time_interval": "7 days, 0:00:00",
+        "type": "Time"
+      },
+      {
+        "column": "variable_id",
+        "column_type": "bigint",
+        "hypertable": "variables_ts",
+        "num_partitions": 128,
+        "number": 2,
+        "time_interval": null,
+        "type": "Space"
+      }
+    ],
+    "hypertables": [
+      "events_history",
+      "events_ts",
+      "variables_history",
+      "variables_ts"
+    ],
+    "jobs": [
+      {
+        "config": {
+          "end_offset": "01:00:00",
+          "mat_hypertable_id": 4,
+          "start_offset": "03:00:00"
+        },
+        "hypertable": "uapg_events_hourly",
+        "proc": "policy_refresh_continuous_aggregate",
+        "schedule_interval": "1:00:00"
+      },
+      {
+        "config": {
+          "drop_after": "8760:00:00",
+          "hypertable_id": 2
+        },
+        "hypertable": "events_history",
+        "proc": "policy_retention",
+        "schedule_interval": "1 day, 0:00:00"
+      },
+      {
+        "config": {
+          "drop_after": "365 days",
+          "hypertable_id": 3
+        },
+        "hypertable": "events_ts",
+        "proc": "policy_retention",
+        "schedule_interval": "1 day, 0:00:00"
+      },
+      {
+        "config": {
+          "drop_after": "8760:00:00",
+          "hypertable_id": 1
+        },
+        "hypertable": "variables_history",
+        "proc": "policy_retention",
+        "schedule_interval": "1 day, 0:00:00"
+      }
+    ]
+  },
+  "views": {
+    "uapg_events_hourly": "v"
+  }
+}

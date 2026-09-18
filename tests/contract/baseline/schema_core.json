@@ -1,0 +1,490 @@
+{
+  "constraints": {
+    "event_sources": [
+      "event_sources_pkey: PRIMARY KEY (id)",
+      "event_sources_source_id_key: UNIQUE (source_id)"
+    ],
+    "event_types": [
+      "event_types_event_type_id_key: UNIQUE (event_type_id)",
+      "event_types_pkey: PRIMARY KEY (id)"
+    ],
+    "variable_metadata": [
+      "variable_metadata_pkey: PRIMARY KEY (id)",
+      "variable_metadata_variable_id_key: UNIQUE (variable_id)"
+    ],
+    "variables_last_value": [
+      "variables_last_value_pkey: PRIMARY KEY (variable_id)"
+    ]
+  },
+  "indexes": {
+    "event_sources": [
+      "CREATE UNIQUE INDEX event_sources_pkey ON {schema}.event_sources USING btree (id)",
+      "CREATE UNIQUE INDEX event_sources_source_id_key ON {schema}.event_sources USING btree (source_id)",
+      "CREATE INDEX idx_event_sources_created ON {schema}.event_sources USING btree (created_at)",
+      "CREATE UNIQUE INDEX idx_event_sources_node_id ON {schema}.event_sources USING btree (source_node_id)",
+      "CREATE INDEX idx_event_sources_source_id ON {schema}.event_sources USING btree (source_id)"
+    ],
+    "event_types": [
+      "CREATE UNIQUE INDEX event_types_event_type_id_key ON {schema}.event_types USING btree (event_type_id)",
+      "CREATE UNIQUE INDEX event_types_pkey ON {schema}.event_types USING btree (id)",
+      "CREATE INDEX idx_event_types_created ON {schema}.event_types USING btree (created_at)",
+      "CREATE INDEX idx_event_types_event_type_id ON {schema}.event_types USING btree (event_type_id)",
+      "CREATE UNIQUE INDEX idx_event_types_name ON {schema}.event_types USING btree (event_type_name)"
+    ],
+    "events_history": [
+      "CREATE INDEX idx_events_data_gin ON {schema}.events_history USING gin (event_data)",
+      "CREATE INDEX idx_events_event_type_id ON {schema}.events_history USING btree (event_type_id)",
+      "CREATE INDEX idx_events_history_event_type_source ON {schema}.events_history USING btree (event_type_id, source_id)",
+      "CREATE INDEX idx_events_history_source_timestamp ON {schema}.events_history USING btree (source_id, event_timestamp)",
+      "CREATE INDEX idx_events_history_type_source ON {schema}.events_history USING btree (event_type_id, source_id)",
+      "CREATE INDEX idx_events_source_id ON {schema}.events_history USING btree (source_id)",
+      "CREATE UNIQUE INDEX idx_events_sourceid_eventts ON {schema}.events_history USING btree (source_id, event_timestamp)",
+      "CREATE INDEX idx_events_timestamp ON {schema}.events_history USING btree (event_timestamp)"
+    ],
+    "variable_metadata": [
+      "CREATE INDEX idx_variable_metadata_created ON {schema}.variable_metadata USING btree (created_at)",
+      "CREATE UNIQUE INDEX idx_variable_metadata_node_id ON {schema}.variable_metadata USING btree (node_id)",
+      "CREATE INDEX idx_variable_metadata_variable_id ON {schema}.variable_metadata USING btree (variable_id)",
+      "CREATE UNIQUE INDEX variable_metadata_pkey ON {schema}.variable_metadata USING btree (id)",
+      "CREATE UNIQUE INDEX variable_metadata_variable_id_key ON {schema}.variable_metadata USING btree (variable_id)"
+    ],
+    "variables_history": [
+      "CREATE INDEX idx_variables_history_variable_id_timestamp ON {schema}.variables_history USING btree (variable_id, sourcetimestamp)",
+      "CREATE INDEX idx_variables_history_vid_ts_desc_covering ON {schema}.variables_history USING btree (variable_id, sourcetimestamp DESC) INCLUDE (statuscode, varianttype, servertimestamp)",
+      "CREATE INDEX idx_variables_server_timestamp ON {schema}.variables_history USING btree (servertimestamp)",
+      "CREATE INDEX idx_variables_timestamp ON {schema}.variables_history USING btree (sourcetimestamp)",
+      "CREATE INDEX idx_variables_variable_id ON {schema}.variables_history USING btree (variable_id)",
+      "CREATE UNIQUE INDEX idx_variables_varid_sourcets ON {schema}.variables_history USING btree (variable_id, sourcetimestamp)"
+    ],
+    "variables_last_value": [
+      "CREATE INDEX idx_variables_last_value_updated ON {schema}.variables_last_value USING btree (updated_at)",
+      "CREATE UNIQUE INDEX variables_last_value_pkey ON {schema}.variables_last_value USING btree (variable_id)"
+    ]
+  },
+  "routines": {},
+  "tables": {
+    "event_sources": [
+      {
+        "column": "id",
+        "default": "nextval('event_sources_id_seq'::regclass)",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "source_id",
+        "default": "id",
+        "generated": "s",
+        "identity": null,
+        "not_null": false,
+        "type": "bigint"
+      },
+      {
+        "column": "source_node_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "retention_period",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "interval"
+      },
+      {
+        "column": "max_records",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "integer"
+      },
+      {
+        "column": "created_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "updated_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      }
+    ],
+    "event_types": [
+      {
+        "column": "id",
+        "default": "nextval('event_types_id_seq'::regclass)",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "event_type_id",
+        "default": "id",
+        "generated": "s",
+        "identity": null,
+        "not_null": false,
+        "type": "bigint"
+      },
+      {
+        "column": "event_type_name",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "created_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "updated_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      }
+    ],
+    "events_history": [
+      {
+        "column": "id",
+        "default": "nextval('events_history_id_seq'::regclass)",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "source_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "event_type_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "event_timestamp",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "event_data",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "jsonb"
+      },
+      {
+        "column": "created_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      }
+    ],
+    "variable_metadata": [
+      {
+        "column": "id",
+        "default": "nextval('variable_metadata_id_seq'::regclass)",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "variable_id",
+        "default": "id",
+        "generated": "s",
+        "identity": null,
+        "not_null": false,
+        "type": "bigint"
+      },
+      {
+        "column": "node_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "data_type",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "text"
+      },
+      {
+        "column": "retention_period",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "interval"
+      },
+      {
+        "column": "max_records",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "integer"
+      },
+      {
+        "column": "created_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "updated_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      }
+    ],
+    "variables_history": [
+      {
+        "column": "id",
+        "default": "nextval('variables_history_id_seq'::regclass)",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "variable_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "servertimestamp",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "sourcetimestamp",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "statuscode",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "integer"
+      },
+      {
+        "column": "value",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "text"
+      },
+      {
+        "column": "varianttype",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "integer"
+      },
+      {
+        "column": "variantbinary",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "bytea"
+      },
+      {
+        "column": "created_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      }
+    ],
+    "variables_last_value": [
+      {
+        "column": "variable_id",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "sourcetimestamp",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "servertimestamp",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "statuscode",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "integer"
+      },
+      {
+        "column": "varianttype",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "integer"
+      },
+      {
+        "column": "variantbinary",
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "bytea"
+      },
+      {
+        "column": "updated_at",
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "not_null": false,
+        "type": "timestamp with time zone"
+      },
+      {
+        "column": "is_seed",
+        "default": "false",
+        "generated": null,
+        "identity": null,
+        "not_null": true,
+        "type": "boolean"
+      }
+    ]
+  },
+  "timescale": {
+    "available": true,
+    "continuous_aggregates": [],
+    "dimensions": [
+      {
+        "column": "event_timestamp",
+        "column_type": "timestamp with time zone",
+        "hypertable": "events_history",
+        "num_partitions": null,
+        "number": 1,
+        "time_interval": "7 days, 0:00:00",
+        "type": "Time"
+      },
+      {
+        "column": "source_id",
+        "column_type": "bigint",
+        "hypertable": "events_history",
+        "num_partitions": 64,
+        "number": 2,
+        "time_interval": null,
+        "type": "Space"
+      },
+      {
+        "column": "sourcetimestamp",
+        "column_type": "timestamp with time zone",
+        "hypertable": "variables_history",
+        "num_partitions": null,
+        "number": 1,
+        "time_interval": "7 days, 0:00:00",
+        "type": "Time"
+      },
+      {
+        "column": "variable_id",
+        "column_type": "bigint",
+        "hypertable": "variables_history",
+        "num_partitions": 128,
+        "number": 2,
+        "time_interval": null,
+        "type": "Space"
+      }
+    ],
+    "hypertables": [
+      "events_history",
+      "variables_history"
+    ],
+    "jobs": [
+      {
+        "config": {
+          "drop_after": "8760:00:00",
+          "hypertable_id": 2
+        },
+        "hypertable": "events_history",
+        "proc": "policy_retention",
+        "schedule_interval": "1 day, 0:00:00"
+      },
+      {
+        "config": {
+          "drop_after": "8760:00:00",
+          "hypertable_id": 1
+        },
+        "hypertable": "variables_history",
+        "proc": "policy_retention",
+        "schedule_interval": "1 day, 0:00:00"
+      }
+    ]
+  },
+  "views": {}
+}

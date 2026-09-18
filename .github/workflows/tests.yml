@@ -1,0 +1,50 @@
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      timescaledb:
+        image: timescale/timescaledb:latest-pg17
+        env:
+          POSTGRES_USER: uapg_test
+          POSTGRES_PASSWORD: uapg_test
+          POSTGRES_DB: uapg_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U uapg_test -d uapg_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" pytest-asyncio
+
+      - name: Unit and contract tests
+        run: pytest -m "not integration"
+
+      - name: Integration tests
+        env:
+          UAPG_TEST_DSN: postgresql://uapg_test:uapg_test@127.0.0.1:55432/uapg_test
+        run: pytest -m integration
+
+      - name: Type check
+        run: |
+          pip install mypy
+          mypy src/

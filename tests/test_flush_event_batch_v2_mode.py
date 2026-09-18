@@ -13,23 +13,22 @@ from uapg.history_timescale_v2 import HistoryTimescaleV2
 from uapg.v2.storage_mode import StorageMode
 
 
-class _FakeConnCM:
-    def __init__(self, conn):
-        self._conn = conn
+class _FakeTransaction:
+    """Транзакция, как её использует _flush_on_connection: start/commit/rollback."""
 
-    async def __aenter__(self):
-        return self._conn
+    def __init__(self):
+        self.started = False
+        self.committed = False
+        self.rolled_back = False
 
-    async def __aexit__(self, *args):
-        return False
+    async def start(self):
+        self.started = True
 
+    async def commit(self):
+        self.committed = True
 
-class _FakeTxCM:
-    async def __aenter__(self):
-        return None
-
-    async def __aexit__(self, *args):
-        return False
+    async def rollback(self):
+        self.rolled_back = True
 
 
 @pytest.mark.asyncio
@@ -50,14 +49,16 @@ async def test_flush_event_batch_v2_mode_calls_save_event_dual():
     history._db_query_timeout_sec = 5.0
     history._typed_values_from_json = MagicMock(return_value={"serial": "X"})
 
+    transaction = _FakeTransaction()
     conn = MagicMock()
-    conn.transaction = MagicMock(return_value=_FakeTxCM())
+    conn.transaction = MagicMock(return_value=transaction)
     pool = MagicMock()
-    pool.acquire = MagicMock(return_value=_FakeConnCM(conn))
+    pool.acquire = AsyncMock(return_value=conn)
+    pool.release = AsyncMock()
     history._pool = pool
     history._ensure_pool = AsyncMock()
 
-    async def _run(coro, _name):
+    async def _run(coro, _name, *, timeout=None, layer=None):
         return await coro
 
     history._run_db_operation = _run
@@ -84,3 +85,4 @@ async def test_flush_event_batch_v2_mode_calls_save_event_dual():
         assert args[1] == 7
         assert args[3] == item.event_data_json
         conn.execute.assert_not_called()
+        assert transaction.committed, "батч должен коммититься одной транзакцией"

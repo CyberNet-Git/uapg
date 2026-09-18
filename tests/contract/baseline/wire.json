@@ -1,0 +1,167 @@
+{
+  "event_data": {
+    "/2:CustomField": "base64:DAYAAABjdXN0b20=",
+    "Message": "base64:FQMCAAAAcnUOAAAA0KHQvtCx0YvRgtC40LU=",
+    "NoneField": "base64:AA==",
+    "Severity": "base64:BfQB",
+    "SourceName": "base64:DAgAAABTZW5zb3ItMQ==",
+    "Time": "base64:DQAgsxCcRt0B"
+  },
+  "event_data_legacy_passthrough": {
+    "NullField": null,
+    "PlainField": "plain value"
+  },
+  "status_code_values": {
+    "bad": 2147483648,
+    "bad_out_of_service": 2156724224,
+    "good": 0,
+    "uncertain": 1073741824
+  },
+  "variants": {
+    "array_double_empty": {
+      "value_text": "[]",
+      "variant_binary_b64": "iwAAAAA=",
+      "variant_type": 11
+    },
+    "array_int32": {
+      "value_text": "[1, 2, 3]",
+      "variant_binary_b64": "hgMAAAABAAAAAgAAAAMAAAA=",
+      "variant_type": 6
+    },
+    "array_string": {
+      "value_text": "['a', 'b']",
+      "variant_binary_b64": "jAIAAAABAAAAYQEAAABi",
+      "variant_type": 12
+    },
+    "bool_false": {
+      "value_text": "False",
+      "variant_binary_b64": "AQA=",
+      "variant_type": 1
+    },
+    "bool_true": {
+      "value_text": "True",
+      "variant_binary_b64": "AQE=",
+      "variant_type": 1
+    },
+    "byte_max": {
+      "value_text": "255",
+      "variant_binary_b64": "A/8=",
+      "variant_type": 3
+    },
+    "bytestring": {
+      "value_text": "b'\\x00\\x01\\xfe\\xff'",
+      "variant_binary_b64": "DwQAAAAAAf7/",
+      "variant_type": 15
+    },
+    "datetime": {
+      "value_text": "2026-09-17 12:30:45.123456+00:00",
+      "variant_binary_b64": "DQCfelygRt0B",
+      "variant_type": 13
+    },
+    "double_negative": {
+      "value_text": "-0.000123",
+      "variant_binary_b64": "C0bSbvQxHyC/",
+      "variant_type": 11
+    },
+    "double_simple": {
+      "value_text": "42.125",
+      "variant_binary_b64": "CwAAAAAAEEVA",
+      "variant_type": 11
+    },
+    "float_simple": {
+      "value_text": "1.5",
+      "variant_binary_b64": "CgAAwD8=",
+      "variant_type": 10
+    },
+    "guid": {
+      "value_text": "12345678-1234-5678-1234-567812345678",
+      "variant_binary_b64": "DnhWNBI0EnhWEjRWeBI0Vng=",
+      "variant_type": 14
+    },
+    "int16_min": {
+      "value_text": "-32768",
+      "variant_binary_b64": "BACA",
+      "variant_type": 4
+    },
+    "int32_min": {
+      "value_text": "-2147483648",
+      "variant_binary_b64": "BgAAAIA=",
+      "variant_type": 6
+    },
+    "int64_min": {
+      "value_text": "-9223372036854775808",
+      "variant_binary_b64": "CAAAAAAAAACA",
+      "variant_type": 8
+    },
+    "localized_text": {
+      "value_text": "LocalizedText(Locale='ru', Text='Сообщение')",
+      "variant_binary_b64": "FQMCAAAAcnUSAAAA0KHQvtC+0LHRidC10L3QuNC1",
+      "variant_type": 21
+    },
+    "nodeid_numeric": {
+      "value_text": "NodeId(Identifier=1234, NamespaceIndex=2, NodeIdType=<NodeIdType.FourByte: 1>)",
+      "variant_binary_b64": "EQEC0gQ=",
+      "variant_type": 17
+    },
+    "nodeid_string": {
+      "value_text": "NodeId(Identifier='MyVariable', NamespaceIndex=3, NodeIdType=<NodeIdType.String: 3>)",
+      "variant_binary_b64": "EQMDAAoAAABNeVZhcmlhYmxl",
+      "variant_type": 17
+    },
+    "null": {
+      "value_text": "None",
+      "variant_binary_b64": "AA==",
+      "variant_type": 0
+    },
+    "qualified_name": {
+      "value_text": "QualifiedName(NamespaceIndex=2, Name='Name')",
+      "variant_binary_b64": "FAIABAAAAE5hbWU=",
+      "variant_type": 20
+    },
+    "sbyte_min": {
+      "value_text": "-128",
+      "variant_binary_b64": "AoA=",
+      "variant_type": 2
+    },
+    "statuscode_bad": {
+      "value_text": "StatusCode(value=2147483648)",
+      "variant_binary_b64": "EwAAAIA=",
+      "variant_type": 19
+    },
+    "statuscode_good": {
+      "value_text": "StatusCode(value=0)",
+      "variant_binary_b64": "EwAAAAA=",
+      "variant_type": 19
+    },
+    "string_ascii": {
+      "value_text": "hello",
+      "variant_binary_b64": "DAUAAABoZWxsbw==",
+      "variant_type": 12
+    },
+    "string_empty": {
+      "value_text": "",
+      "variant_binary_b64": "DAAAAAA=",
+      "variant_type": 12
+    },
+    "string_unicode": {
+      "value_text": "привет мир",
+      "variant_binary_b64": "DBMAAADQv9GA0LjQstC10YIg0LzQuNGA",
+      "variant_type": 12
+    },
+    "uint16_max": {
+      "value_text": "65535",
+      "variant_binary_b64": "Bf//",
+      "variant_type": 5
+    },
+    "uint32_max": {
+      "value_text": "4294967295",
+      "variant_binary_b64": "B/////8=",
+      "variant_type": 7
+    },
+    "uint64_max": {
+      "value_text": "18446744073709551615",
+      "variant_binary_b64": "Cf//////////",
+      "variant_type": 9
+    }
+  }
+}

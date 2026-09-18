@@ -1,0 +1,38 @@
+# Одноразовая TimescaleDB для интеграционных тестов uapg.
+#
+#     docker compose -f docker-compose.test.yml up -d
+#     pytest -m integration
+#     docker compose -f docker-compose.test.yml down -v
+#
+# Порт намеренно нестандартный (55432) и данные лежат в tmpfs: контейнер
+# не должен пересекаться ни с одной рабочей базой на той же машине.
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg17
+    container_name: uapg-test-db
+    environment:
+      POSTGRES_USER: uapg_test
+      POSTGRES_PASSWORD: uapg_test
+      POSTGRES_DB: uapg_test
+    ports:
+      - "127.0.0.1:55432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=timescaledb
+      - -c
+      - max_connections=200
+      - -c
+      - fsync=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U uapg_test -d uapg_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
