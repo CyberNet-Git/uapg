@@ -62,12 +62,13 @@ def make_datavalue(
     server_timestamp: Any = None,
 ) -> ua.DataValue:
     """Создать DataValue независимо от версии asyncua."""
-    return ua.DataValue(
-        Value=value,
-        SourceTimestamp=source_timestamp,
-        ServerTimestamp=server_timestamp,
-        **{_STATUS_KWARG: status},
-    )
+    kwargs: dict[str, Any] = {
+        "Value": value,
+        "SourceTimestamp": source_timestamp,
+        "ServerTimestamp": server_timestamp,
+        _STATUS_KWARG: status,
+    }
+    return ua.DataValue(**kwargs)
 
 
 def row_to_datavalue(row: Mapping[str, Any]) -> ua.DataValue:
