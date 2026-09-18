@@ -276,7 +276,7 @@ class TestLastValues:
     async def test_seed_creates_placeholder(self, repo: VariableRepository) -> None:
         variable_id = await repo.ensure_metadata("ns=2;i=1")
         created = await repo.seed_last_values([(variable_id, ua.DataValue(Value=ua.Variant(None)))])
-        assert created == 1
+        assert created == [variable_id]
 
         last = await repo.read_last_value(variable_id)
         assert last is not None and last.Value.Value is None

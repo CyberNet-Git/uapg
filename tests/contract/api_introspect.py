@@ -50,6 +50,22 @@ def metric_paths(value: Any, prefix: str = "") -> List[str]:
     return paths
 
 
+def metric_types(value: Any, prefix: str = "") -> Dict[str, str]:
+    """Тип значения каждой метрики.
+
+    По нему выбирается тип данных узла OPC UA (int → Int64, float → Double,
+    остальное → String). Узел создаётся один раз, и значение другого типа в
+    него потом не записывается — молча.
+    """
+    if not isinstance(value, dict):
+        return {prefix: type(value).__name__}
+    types: Dict[str, str] = {}
+    for key in sorted(value):
+        child = f"{prefix}.{key}" if prefix else str(key)
+        types.update(metric_types(value[key], child))
+    return types
+
+
 def api_snapshot() -> Dict[str, Any]:
     """Собрать снимок публичного API из установленного пакета uapg."""
     import uapg
@@ -77,6 +93,7 @@ def api_snapshot() -> Dict[str, Any]:
         },
         "metric_paths": metric_paths(storage.get_performance_metrics()),
         "metric_paths_v2": metric_paths(storage_v2.get_performance_metrics()),
+        "metric_types": metric_types(storage.get_performance_metrics()),
         "cache_stat_keys": sorted(storage.get_cache_stats()),
         "connection_info_keys": sorted(storage.get_connection_info()),
     }

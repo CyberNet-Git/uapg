@@ -97,6 +97,7 @@ class Database:
         self._pool_lock = asyncio.Lock()
         self._reconnect_lock = asyncio.Lock()
         self._stopping = False
+        self._background: set = set()
 
     # ------------------------------------------------------------------ жизненный цикл
 
@@ -105,6 +106,8 @@ class Database:
         await self._ensure_pool()
 
     async def stop(self) -> None:
+        if self._background:
+            await asyncio.wait(list(self._background), timeout=self._timeouts.pool_close_sec)
         self._stopping = True
         async with self._pool_lock:
             pool, self._pool = self._pool, None
@@ -301,10 +304,38 @@ class Database:
                     self._terminate(conn)
 
     def _terminate(self, conn: Any) -> None:
+        """Оборвать соединение и снять его backend на стороне сервера.
+
+        Обрыв сокета освобождает только клиента: PostgreSQL замечает ушедшего
+        клиента лишь при следующем обмене и до тех пор продолжает выполнять
+        запрос и держать блокировки — те самые «хвосты», которые раньше
+        приходилось снимать при следующем старте. Поэтому backend завершается
+        явно, отдельным соединением и в фоне, чтобы не задерживать запись.
+        """
+        pid: Optional[int] = None
+        try:
+            pid = conn.get_server_pid()
+        except Exception:
+            pid = None
         try:
             conn.terminate()
         except Exception as exc:
             self.logger.warning("Соединение не удалось закрыть принудительно: %r", exc)
+        if pid:
+            task = asyncio.get_running_loop().create_task(self._kill_backend(pid))
+            self._background.add(task)
+            task.add_done_callback(self._background.discard)
+
+    async def _kill_backend(self, pid: int) -> None:
+        try:
+            handle = await self._ensure_pool()
+            async with handle.pool.acquire(timeout=self._timeouts.query_sec) as conn:
+                await conn.execute(
+                    "SELECT pg_terminate_backend($1)", pid, timeout=self._timeouts.query_sec
+                )
+        except Exception as exc:
+            # Не удалось сейчас — снимется при следующем старте по application_name.
+            self.logger.debug("Backend %s не снят: %r", pid, exc)
 
     async def _with_timeout(
         self,

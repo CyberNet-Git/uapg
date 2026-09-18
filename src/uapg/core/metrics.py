@@ -46,7 +46,7 @@ class Timing:
 
     def as_dict(self, prefix: str) -> Dict[str, float]:
         return {
-            f"{prefix}_count": float(self.count),
+            f"{prefix}_count": int(self.count),
             f"{prefix}_total_ms": round(self.total_ms, 3),
             f"{prefix}_last_ms": round(self.last_ms, 3),
             f"{prefix}_max_ms": round(self.max_ms, 3),
@@ -75,11 +75,12 @@ class BufferStats:
     flush_errors_total: int = 0
     flush_timeouts_total: int = 0
     flush_dropped_items_total: int = 0
-    last_flush_error: Optional[str] = None
+    # Пустая строка, а не None: по типу значения выбирается тип узла OPC UA.
+    last_flush_error: str = ""
     worker_alive: bool = False
     worker_restarts_total: int = 0
     worker_stall_restarts_total: int = 0
-    last_worker_exit_reason: Optional[str] = None
+    last_worker_exit_reason: str = ""
     flush_duration: Timing = field(default_factory=Timing)
 
     _last_flush_at: Optional[float] = None
@@ -131,10 +132,10 @@ class BufferStats:
         self.flush_errors_total = 0
         self.flush_timeouts_total = 0
         self.flush_dropped_items_total = 0
-        self.last_flush_error = None
+        self.last_flush_error = ""
         self.worker_restarts_total = 0
         self.worker_stall_restarts_total = 0
-        self.last_worker_exit_reason = None
+        self.last_worker_exit_reason = ""
         self.flush_duration.reset()
 
     def as_dict(self) -> Dict[str, Any]:
@@ -155,7 +156,7 @@ class BufferStats:
             "flush_errors_total": self.flush_errors_total,
             "flush_timeouts_total": self.flush_timeouts_total,
             "flush_dropped_items_total": self.flush_dropped_items_total,
-            "last_flush_error": self.last_flush_error,
+            "last_flush_error": str(self.last_flush_error),
             "last_flush_duration_ms": round(self.flush_duration.last_ms, 3),
             "max_flush_duration_ms": round(self.flush_duration.max_ms, 3),
             "avg_flush_duration_ms": round(self.flush_duration.avg_ms, 3),
@@ -163,7 +164,7 @@ class BufferStats:
             "worker_alive": self.worker_alive,
             "worker_restarts_total": self.worker_restarts_total,
             "worker_stall_restarts_total": self.worker_stall_restarts_total,
-            "last_worker_exit_reason": self.last_worker_exit_reason,
+            "last_worker_exit_reason": str(self.last_worker_exit_reason),
             "seconds_since_last_flush": round(_seconds_since(self._last_flush_at), 3),
             "seconds_since_last_enqueue": round(_seconds_since(self._last_enqueue_at), 3),
             # Длительность текущего незавершённого флаша отличает залипание от простоя.
@@ -257,7 +258,9 @@ class CacheStats:
         self._counters: Dict[str, int] = {key: 0 for key in self.KEYS}
 
     def hit(self, key: str, amount: int = 1) -> None:
-        self._counters[key] += amount
+        # Необязательные счётчики (например, пропущенные фоллбэки по истории)
+        # появляются в снимке только после первого срабатывания, как в 0.2.15.
+        self._counters[key] = self._counters.get(key, 0) + amount
 
     def reset(self) -> None:
         for key in self._counters:

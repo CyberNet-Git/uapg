@@ -139,10 +139,14 @@ class VariableRepository:
         """Записать одно значение без батчинга."""
         await self.flush([item])
 
-    async def seed_last_values(self, items: Sequence[Tuple[int, ua.DataValue]]) -> int:
-        """Создать строки-заглушки для переменных, у которых значения ещё не было."""
+    async def seed_last_values(self, items: Sequence[Tuple[int, ua.DataValue]]) -> List[int]:
+        """Создать строки-заглушки; вернуть переменные, для которых строка создана.
+
+        Существующие строки не трогаются: заглушка не должна перетереть реальное
+        последнее значение.
+        """
         if not items:
-            return 0
+            return []
 
         empty = encode_variant(ua.Variant(None))
         now = datetime.now(tz=None).astimezone()
@@ -164,7 +168,7 @@ class VariableRepository:
             variant_types.append(int(variant.VariantType) if variant is not None else 0)
             payloads.append(encode_variant(variant) if variant is not None else empty)
 
-        result = await self._db.execute(
+        rows = await self._db.fetch(
             self._sql["seed_last_values"],
             variable_ids,
             source_ts,
@@ -173,7 +177,7 @@ class VariableRepository:
             variant_types,
             payloads,
         )
-        return _affected_rows(result)
+        return [int(row["variable_id"]) for row in rows]
 
     async def delete_history(
         self,
@@ -226,17 +230,23 @@ class VariableRepository:
         row = await self._db.fetchrow(self._sql["read_latest_from_history"], variable_id)
         return row_to_datavalue(row) if row is not None else None
 
-    async def iter_last_values(self, batch_size: int) -> Dict[int, ua.DataValue]:
+    async def iter_last_values(
+        self,
+        batch_size: int,
+        max_bytes: Optional[int] = None,
+    ) -> Dict[int, ua.DataValue]:
         """Загрузить кэш последних значений постранично.
 
         Постранично, а не одним запросом: на крупных инсталляциях строк сотни
-        тысяч, и единичный fetch занимает и память, и соединение.
+        тысяч, и единичный fetch занимает и память, и соединение. Загрузка
+        прекращается, когда грубая оценка занятой памяти достигает max_bytes.
         """
         values: Dict[int, ua.DataValue] = {}
         last_id = 0
+        approx_bytes = 0
         while True:
             rows = await self._db.fetch(
-                self._sql["load_last_values_page"], last_id, batch_size
+                self._sql["load_last_values_page"], last_id, max(1, batch_size)
             )
             if not rows:
                 break
@@ -244,7 +254,50 @@ class VariableRepository:
                 variable_id = int(row["variable_id"])
                 values[variable_id] = row_to_datavalue(row)
                 last_id = variable_id
+                approx_bytes += len(row["variantbinary"] or b"") + 128
+                if max_bytes is not None and approx_bytes >= max_bytes:
+                    self.logger.warning(
+                        "Кэш последних значений упёрся в лимит %.1f МБ, загружено %d значений",
+                        approx_bytes / (1024 * 1024),
+                        len(values),
+                    )
+                    return values
         return values
+
+    async def latest_from_history_many(
+        self,
+        variable_ids: Sequence[int],
+        since: Optional[datetime] = None,
+    ) -> List[asyncpg.Record]:
+        if not variable_ids:
+            return []
+        return await self._db.fetch(
+            self._sql["latest_from_history_many"], [int(i) for i in variable_ids], since
+        )
+
+    async def upsert_last_values_rows(self, rows: Sequence[Any]) -> None:
+        """Записать найденные в истории значения в кэш последних значений."""
+        if not rows:
+            return
+        await self._db.execute(
+            self._sql["upsert_last_values_many"],
+            [int(r["variable_id"]) for r in rows],
+            [r["sourcetimestamp"] for r in rows],
+            [r["servertimestamp"] for r in rows],
+            [int(r["statuscode"]) for r in rows],
+            [int(r["varianttype"]) for r in rows],
+            [r["variantbinary"] for r in rows],
+        )
+
+    async def seed_candidates(self) -> List[asyncpg.Record]:
+        return await self._db.fetch(self._sql["seed_candidates"])
+
+    async def confirm_seeds(self, variable_ids: Sequence[int]) -> None:
+        if variable_ids:
+            await self._db.execute(self._sql["confirm_seeds"], [int(i) for i in variable_ids])
+
+    async def update_data_type(self, variable_id: int, data_type: str) -> None:
+        await self._db.execute(self._sql["update_data_type"], int(variable_id), data_type)
 
 
 def _status_for_column(code: int) -> int:

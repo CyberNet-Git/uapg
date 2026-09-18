@@ -207,7 +207,7 @@ class TestWorkerSupervision:
             with caplog.at_level(logging.CRITICAL, logger="test.buffer"):
                 buffer._task.cancel()  # type: ignore[union-attr]
                 await asyncio.sleep(0.05)
-                assert stats.last_worker_exit_reason is not None
+                assert stats.last_worker_exit_reason
                 await _wait_for(buffer.is_worker_alive)
 
             await buffer.enqueue(Item(7))

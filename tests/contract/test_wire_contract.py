@@ -16,10 +16,9 @@ BASELINE = Path(__file__).parent / "baseline" / "wire.json"
 
 
 def _current_snapshot() -> Dict[str, Any]:
-    from uapg.history_timescale import HistoryTimescale
+    from uapg.codec import decode_event_data, encode_event_fields
 
-    storage = HistoryTimescale()
-    return wire_snapshot(storage._event_to_binary_map, storage._binary_map_to_event_values)
+    return wire_snapshot(encode_event_fields, decode_event_data)
 
 
 def _diff(baseline: Any, current: Any, path: str = "") -> List[str]:

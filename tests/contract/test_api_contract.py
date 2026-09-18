@@ -57,6 +57,7 @@ def diff_api(baseline: Dict[str, Any], current: Dict[str, Any]) -> List[str]:
     )
     for key in ("metric_paths", "metric_paths_v2", "cache_stat_keys", "connection_info_keys"):
         diffs += _diff_sequence(key, baseline[key], current[key])
+    diffs += _diff_mapping("metric_type", baseline["metric_types"], current["metric_types"])
     return diffs
 
 

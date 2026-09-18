@@ -1,795 +1,115 @@
-"""
-Модуль историзации OPC UA с использованием TimescaleDB
+"""Бэкенд историзации OPC UA на PostgreSQL/TimescaleDB.
 
-Новая архитектура: единые таблицы для всех переменных и событий вместо
-создания отдельных таблиц для каждой переменной. Данные размещаются в
-настраиваемой схеме с поддержкой TimescaleDB для временных рядов.
+``HistoryTimescale`` — реализация ``HistoryStorageInterface`` из asyncua и
+единственная точка входа пакета. Сам класс ничего не хранит и не знает SQL: он
+разбирает вызовы OPC UA и раскладывает их по слоям — соединение и его надзор
+(core), хранение (storage), кодирование значений (codec), семантика чтения и
+публикация узлов (opcua).
+
+Публичная поверхность — конструктор, методы и ключи метрик — совпадает с
+0.2.15, и это проверяется контрактными тестами против замороженного эталона:
+на неё опирается opc-vibro-iot-server.
 """
 
-import json
 import asyncio
-import random
-import logging
-import socket
-import time
 import importlib.metadata as importlib_metadata
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+import json
+import logging
+import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, List, Optional, Tuple, Union, Dict, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Dict, Iterable, List, Optional, Tuple, Union
 
-import asyncpg
 from asyncua import ua
+from asyncua.common.events import Event, get_event_properties_from_type_node
 from asyncua.server.history import HistoryStorageInterface
-from asyncua.ua.ua_binary import variant_from_binary, variant_to_binary
 
-# Импорт для работы с зашифрованной конфигурацией
-from .db_manager import DatabaseManager
-
-# Правильный буфер для побайтного чтения в variant_from_binary
-class Buffer:
-    def __init__(self, data: bytes) -> None:
-        self._data = data
-        self._pos = 0
-    
-    def read(self, n: int) -> bytes:
-        chunk = self._data[self._pos:self._pos + n]
-        self._pos += n
-        return chunk
-    
-    def copy(self, *args, **kwargs) -> 'Buffer':
-        return Buffer(self._data[self._pos:])
-    
-    def skip(self, n: int) -> None:
-        self._pos += n
-
-# Импорт для работы с событиями
-from asyncua.common.events import Event
-
-# Импорт фильтрации событий
+from .codec import encode_event_fields, encode_variant, status_code_value, value_text
+from .codec.node_id import coerce_node_id, data_type_name, format_node_id, group_key
+from .codec.variant import row_to_datavalue
+from .core.buffer import HistoryWriteBuffer
+from .core.config import (
+    DEFAULT_DB_APPLICATION_NAME,
+    DEFAULT_FLUSH_TIMEOUT_SEC,
+    DEFAULT_WORKER_STALL_TIMEOUT_SEC,
+    CacheSettings,
+    ConnectionSettings,
+    Keepalive,
+    StorageSettings,
+    Timeouts,
+    WriteSettings,
+)
+from .core.database import Database
+from .core.metrics import MetricsRegistry
+from .core.secrets import load_connection_config
+from .core.sql import validate_identifier
+from .core.supervisor import ConnectionSupervisor
 from .event_filter import apply_event_filter
+from .opcua import nodes as opc_nodes
+from .opcua.reads import continuation_point, resolve_window
+from .storage.bootstrap import SchemaBootstrap
+from .storage.cache import Caches
+from .storage.event_search import EventSearchStore
+from .storage.events import EventRepository, decode_payload
+from .storage.events_config import EventsV2Config
+from .storage.items import EventWriteItem, VariableWriteItem
+from .storage.migrations import SqlMigrator
+from .storage.typed_events import EventSchemaRegistry, TypedEventTables
+from .storage.variables import VariableRepository
+from .v2.storage_mode import StorageMode, should_read_v2, should_write_v2
 
+__all__ = [
+    "HistoryTimescale",
+    "HistoryWriteBuffer",
+    "VariableWriteItem",
+    "EventWriteItem",
+    "validate_table_name",
+    "DEFAULT_FLUSH_TIMEOUT_SEC",
+    "DEFAULT_WORKER_STALL_TIMEOUT_SEC",
+    "DEFAULT_DB_APPLICATION_NAME",
+]
 
-@dataclass
-class VariableWriteItem:
-    """
-    Элемент очереди на запись значения переменной.
-    Используется HistoryWriteBuffer для батчевой записи.
-    """
-    variable_id: int
-    node_id_str: str
-    source_timestamp: datetime
-    server_timestamp: datetime
-    status_code: int
-    value_str: str
-    variant_type: int
-    variant_binary: bytes
-    group_key: str
-    datavalue: ua.DataValue
-    future: Optional[asyncio.Future] = None
+# Сколько после начала недоступности БД писать каждую неудачную запись
+# подробно; дальше — сводкой, чтобы не утопить лог.
+DETAILED_FAILURE_LOG_WINDOW = timedelta(minutes=10)
+AGGREGATED_FAILURE_LOG_INTERVAL = timedelta(seconds=10)
 
-
-@dataclass
-class EventWriteItem:
-    """
-    Элемент очереди на запись события.
-    Используется HistoryWriteBuffer для батчевой записи.
-    """
-    source_db_id: int
-    event_type_id: int
-    event_timestamp: datetime
-    event_data_json: str
-    group_key: str
-    future: Optional[asyncio.Future] = None
-
-
-def _empty_timing_stats() -> Dict[str, float]:
-    return {
-        "count": 0,
-        "total_ms": 0.0,
-        "last_ms": 0.0,
-        "max_ms": 0.0,
-        "avg_ms": 0.0,
-    }
-
-
-DEFAULT_DROP_LOG_INTERVAL_SEC = 60.0
-DEFAULT_WORKER_RESTART_MAX_BACKOFF_SEC = 30.0
-DEFAULT_FLUSH_TIMEOUT_SEC = 120.0
-DEFAULT_WORKER_STALL_TIMEOUT_SEC = 300.0
-DEFAULT_DB_APPLICATION_NAME = "uapg-history"
-
-
-def _observe_timing(stats: Dict[str, float], duration_ms: float) -> None:
-    count = int(stats.get("count", 0)) + 1
-    total = float(stats.get("total_ms", 0.0)) + duration_ms
-    stats["count"] = count
-    stats["total_ms"] = total
-    stats["last_ms"] = duration_ms
-    stats["max_ms"] = max(float(stats.get("max_ms", 0.0)), duration_ms)
-    stats["avg_ms"] = total / count if count else 0.0
-
-
-class HistoryWriteBuffer:
-    """
-    Универсальный буфер для батчевой записи значений в БД.
-
-    Не знает о структуре таблиц — только управляет очередью, пакетированием
-    и вызовом переданной функции flush_func.
-    """
-
-    def __init__(
-        self,
-        name: str,
-        logger: logging.Logger,
-        max_batch_size: int,
-        max_batch_interval_sec: float,
-        queue_max_size: int,
-        durability_mode: str,
-        flush_func: Callable[[List[Any]], Coroutine[Any, Any, None]],
-        drop_log_interval_sec: float = DEFAULT_DROP_LOG_INTERVAL_SEC,
-        worker_restart_max_backoff_sec: float = DEFAULT_WORKER_RESTART_MAX_BACKOFF_SEC,
-        flush_timeout_sec: float = DEFAULT_FLUSH_TIMEOUT_SEC,
-        stall_timeout_sec: float = DEFAULT_WORKER_STALL_TIMEOUT_SEC,
-    ) -> None:
-        self._name = name
-        self._logger = logger.getChild(f"buffer.{name}") if logger else logging.getLogger(f"HistoryWriteBuffer.{name}")
-        self._max_batch_size = max(1, int(max_batch_size))
-        self._max_batch_interval_sec = max(0.01, float(max_batch_interval_sec))
-        self._durability_mode = durability_mode or "async"
-        self._flush_func = flush_func
-        # maxsize=0 означает неограниченную очередь
-        self._queue: "asyncio.Queue[Any]" = asyncio.Queue(maxsize=max(0, int(queue_max_size)))
-        self._task: Optional[asyncio.Task] = None
-        self._stopped = False
-        self._stats: Dict[str, Any] = self._new_stats()
-        # Надзор за воркером
-        self._ever_started = False
-        self._worker_exit_reason: str = ""
-        self._worker_restarts_total = 0
-        self._worker_restart_attempt = 0
-        self._worker_restart_max_backoff_sec = max(1.0, float(worker_restart_max_backoff_sec))
-        self._restart_handle: Optional[asyncio.TimerHandle] = None
-        self._last_flush_monotonic: Optional[float] = None
-        self._last_enqueue_monotonic: Optional[float] = None
-        # Ограничение и надзор за самим флашем: воркер может быть жив и при этом
-        # висеть в await к БД, и тогда обычной проверки task.done() недостаточно.
-        self._flush_timeout_sec = max(0.0, float(flush_timeout_sec))
-        self._stall_timeout_sec = max(0.0, float(stall_timeout_sec))
-        self._flush_started_monotonic: Optional[float] = None
-        self._worker_stall_restarts_total = 0
-        # Ограничение частоты лога об отбрасывании
-        self._drop_log_interval_sec = max(0.0, float(drop_log_interval_sec))
-        self._drop_log_last_monotonic: Optional[float] = None
-        self._drops_since_last_log = 0
-
-    @staticmethod
-    def _new_stats() -> Dict[str, Any]:
-        return {
-            "enqueue_attempts_total": 0,
-            "enqueued_total": 0,
-            "dropped_total": 0,
-            "flushed_items_total": 0,
-            "flush_batches_total": 0,
-            "last_batch_size": 0,
-            "max_batch_size_seen": 0,
-            "flush_errors_total": 0,
-            "flush_timeouts_total": 0,
-            "flush_dropped_items_total": 0,
-            "last_flush_error": "",
-            "flush_duration": _empty_timing_stats(),
-        }
-
-    def get_stats(self) -> Dict[str, Any]:
-        queue_size = self._queue.qsize()
-        queue_max_size = self._queue.maxsize
-        fill_ratio = (queue_size / queue_max_size) if queue_max_size > 0 else 0.0
-        flush_duration = dict(self._stats["flush_duration"])
-        return {
-            "queue_size": queue_size,
-            "queue_max_size": queue_max_size,
-            "queue_fill_ratio": fill_ratio,
-            "enqueue_attempts_total": int(self._stats["enqueue_attempts_total"]),
-            "enqueued_total": int(self._stats["enqueued_total"]),
-            "dropped_total": int(self._stats["dropped_total"]),
-            "flushed_items_total": int(self._stats["flushed_items_total"]),
-            "flush_batches_total": int(self._stats["flush_batches_total"]),
-            "last_batch_size": int(self._stats["last_batch_size"]),
-            "max_batch_size_seen": int(self._stats["max_batch_size_seen"]),
-            "flush_errors_total": int(self._stats["flush_errors_total"]),
-            "flush_timeouts_total": int(self._stats["flush_timeouts_total"]),
-            "flush_dropped_items_total": int(self._stats["flush_dropped_items_total"]),
-            "last_flush_error": str(self._stats["last_flush_error"]),
-            "last_flush_duration_ms": float(flush_duration["last_ms"]),
-            "max_flush_duration_ms": float(flush_duration["max_ms"]),
-            "avg_flush_duration_ms": float(flush_duration["avg_ms"]),
-            "total_flush_duration_ms": float(flush_duration["total_ms"]),
-            # Надзор за воркером: worker_alive отличает мёртвый воркер от живого,
-            # а seconds_since_last_flush — живого, но залипшего в ожидании БД.
-            "worker_alive": self.is_worker_alive(),
-            "worker_restarts_total": int(self._worker_restarts_total),
-            "worker_stall_restarts_total": int(self._worker_stall_restarts_total),
-            "last_worker_exit_reason": str(self._worker_exit_reason),
-            "seconds_since_last_flush": self._seconds_since(self._last_flush_monotonic),
-            "seconds_since_last_enqueue": self._seconds_since(self._last_enqueue_monotonic),
-            "seconds_in_current_flush": self._seconds_since(self._flush_started_monotonic),
-        }
-
-    @staticmethod
-    def _seconds_since(marker: Optional[float]) -> float:
-        """-1 означает «ещё ни разу не было», иначе ноль был бы неотличим от свежего."""
-        if marker is None:
-            return -1.0
-        return max(0.0, time.monotonic() - marker)
-
-    def is_worker_alive(self) -> bool:
-        return self._task is not None and not self._task.done()
-
-    def reset_stats(self) -> None:
-        self._stats = self._new_stats()
-
-    def start(self) -> None:
-        if self._task is None or self._task.done():
-            self._stopped = False
-            self._ever_started = True
-            self._task = asyncio.create_task(self._worker(), name=f"HistoryWriteBuffer-{self._name}")
-            self._task.add_done_callback(self._on_worker_done)
-            self._logger.info(
-                "HistoryWriteBuffer '%s' started (max_batch_size=%s, max_batch_interval_sec=%.3f, queue_max_size=%s, durability_mode=%s)",
-                self._name,
-                self._max_batch_size,
-                self._max_batch_interval_sec,
-                self._queue.maxsize,
-                self._durability_mode,
-            )
-
-    def _on_worker_done(self, task: "asyncio.Task") -> None:
-        """
-        Воркер не должен завершаться, пока буфер не остановлен. Раньше такое
-        завершение было полностью бесшумным: очередь переполнялась, и
-        единственным следом оставался поток «queue is full».
-        """
-        if self._stopped or task is not self._task:
-            return
-
-        if task.cancelled():
-            reason = "cancelled"
-            self._logger.critical(
-                "HistoryWriteBuffer '%s' worker was cancelled while buffer is running; restarting",
-                self._name,
-            )
-        else:
-            exc = task.exception()
-            if exc is None:
-                reason = "returned"
-                self._logger.critical(
-                    "HistoryWriteBuffer '%s' worker exited unexpectedly; restarting",
-                    self._name,
-                )
-            else:
-                reason = f"{type(exc).__name__}: {exc}"
-                self._logger.critical(
-                    "HistoryWriteBuffer '%s' worker died: %r; restarting",
-                    self._name,
-                    exc,
-                    exc_info=exc,
-                )
-
-        self._worker_exit_reason = reason
-        self._worker_restarts_total += 1
-        self._worker_restart_attempt += 1
-        delay = min(
-            self._worker_restart_max_backoff_sec,
-            float(2 ** min(self._worker_restart_attempt - 1, 16)),
-        )
-
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._logger.error(
-                "HistoryWriteBuffer '%s' cannot schedule worker restart: no running loop",
-                self._name,
-            )
-            return
-
-        self._task = None
-        self._restart_handle = loop.call_later(delay, self._restart_worker)
-        self._logger.warning(
-            "HistoryWriteBuffer '%s' worker restart scheduled in %.1fs (restarts=%d)",
-            self._name,
-            delay,
-            self._worker_restarts_total,
-        )
-
-    def _restart_worker(self) -> None:
-        self._restart_handle = None
-        if self._stopped:
-            return
-        self.start()
-
-    def ensure_worker_running(self) -> None:
-        """Дешёвая проверка с пути записи: во время инцидента именно она замечает,
-        что воркер умер, раньше любого внешнего мониторинга.
-
-        Буфер, который ни разу не запускали, не поднимаем: это не авария, а
-        сознательный выбор вызывающего кода."""
-        if not self._ever_started or self._stopped:
-            return
-        if self.is_worker_alive():
-            self._restart_if_stalled()
-            return
-        if self._restart_handle is not None:
-            return
-        self._logger.critical(
-            "HistoryWriteBuffer '%s' worker is not running on enqueue path; starting it",
-            self._name,
-        )
-        self.start()
-
-    def _restart_if_stalled(self) -> None:
-        """
-        Живой воркер, застрявший в await к БД, — отдельный класс отказа: task.done()
-        остаётся False, ошибок нет, а очередь тем временем переполняется. Единственный
-        надёжный признак — флаш, который идёт дольше любого разумного времени.
-
-        Отменяем задачу и сразу поднимаем новую, не дожидаясь завершения старой:
-        её cleanup может висеть на том же мёртвом сокете.
-        """
-        if self._stall_timeout_sec <= 0:
-            return
-        started = self._flush_started_monotonic
-        if started is None:
-            return
-        stuck_for = time.monotonic() - started
-        if stuck_for < self._stall_timeout_sec:
-            return
-
-        stalled_task = self._task
-        self._worker_stall_restarts_total += 1
-        self._worker_exit_reason = f"stalled in flush for {stuck_for:.0f}s"
-        self._logger.critical(
-            "HistoryWriteBuffer '%s' worker is stuck in flush for %.0fs (queue=%d); "
-            "cancelling and restarting it",
-            self._name,
-            stuck_for,
-            self._queue.qsize(),
-        )
-
-        self._flush_started_monotonic = None
-        self._task = None
-        if stalled_task is not None:
-            stalled_task.cancel()
-        if self._restart_handle is not None:
-            self._restart_handle.cancel()
-            self._restart_handle = None
-        self.start()
-
-    async def stop(self) -> None:
-        self._stopped = True
-        if self._restart_handle is not None:
-            self._restart_handle.cancel()
-            self._restart_handle = None
-        if self._task:
-            # Даем воркеру возможность дописать оставшиеся элементы
-            try:
-                await asyncio.wait_for(self._task, timeout=self._max_batch_interval_sec * 2)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                self._task.cancel()
-                try:
-                    await self._task
-                except asyncio.CancelledError:
-                    pass
-
-    async def enqueue(self, item: Any, sync: bool = False) -> None:
-        """
-        Добавление элемента в очередь.
-
-        Если sync=True или durability_mode == 'sync', вызывающий ожидает завершения флаша.
-        """
-        future: Optional[asyncio.Future] = None
-        sync_mode = sync or self._durability_mode == "sync"
-        self._stats["enqueue_attempts_total"] += 1
-        self._last_enqueue_monotonic = time.monotonic()
-        self.ensure_worker_running()
-
-        if sync_mode:
-            loop = asyncio.get_running_loop()
-            future = loop.create_future()
-            # Ожидается, что элемент поддерживает атрибут future
-            setattr(item, "future", future)
-
-        try:
-            if sync_mode:
-                await self._queue.put(item)
-            else:
-                # В async-режиме не блокируемся, при переполнении просто логируем и отбрасываем
-                self._queue.put_nowait(item)
-            self._stats["enqueued_total"] += 1
-        except asyncio.QueueFull:
-            self._stats["dropped_total"] += 1
-            self._log_drop()
-            if future and not future.done():
-                future.set_exception(RuntimeError("HistoryWriteBuffer queue is full"))
-            return
-
-        if sync_mode and future is not None:
-            await future
-
-    def _log_drop(self) -> None:
-        """
-        Отбрасывание логируется с ограничением частоты: при переполнении поток
-        сообщений идёт со скоростью записи и сам по себе становится проблемой
-        (в одном инциденте — 618 МБ логов). Точный счёт остаётся в dropped_total.
-        """
-        self._drops_since_last_log += 1
-        now = time.monotonic()
-        last = self._drop_log_last_monotonic
-
-        if (
-            last is not None
-            and self._drop_log_interval_sec > 0
-            and (now - last) < self._drop_log_interval_sec
-        ):
-            return
-
-        dropped_in_window = self._drops_since_last_log
-        self._drops_since_last_log = 0
-        self._drop_log_last_monotonic = now
-
-        if last is None:
-            self._logger.error(
-                "HistoryWriteBuffer '%s' queue is full (queue_max_size=%s), dropping items in async mode; "
-                "далее не чаще раза в %.0f с",
-                self._name,
-                self._queue.maxsize,
-                self._drop_log_interval_sec,
-            )
-        else:
-            self._logger.error(
-                "HistoryWriteBuffer '%s' queue is full: отброшено %d элементов за %.0f с "
-                "(dropped_total=%s, worker_alive=%s, seconds_since_last_flush=%.1f)",
-                self._name,
-                dropped_in_window,
-                now - last,
-                self._stats["dropped_total"],
-                self.is_worker_alive(),
-                self._seconds_since(self._last_flush_monotonic),
-            )
-
-    async def _worker(self) -> None:
-        """
-        Основной цикл фонового воркера.
-        Собирает пачки из очереди и передает их в flush_func.
-        """
-        pending: List[Any] = []
-
-        try:
-            while not self._stopped or not self._queue.empty():
-                try:
-                    if not pending:
-                        try:
-                            item = await asyncio.wait_for(self._queue.get(), timeout=self._max_batch_interval_sec)
-                        except asyncio.TimeoutError:
-                            continue
-                        pending.append(item)
-
-                    # Добираем пачку до max_batch_size без ожидания
-                    while len(pending) < self._max_batch_size:
-                        try:
-                            pending.append(self._queue.get_nowait())
-                        except asyncio.QueueEmpty:
-                            break
-
-                    await self._flush_pending(pending)
-                    pending.clear()
-
-                except asyncio.CancelledError:
-                    # Отмена незакрытого буфера — авария: очередь останется без слива
-                    if not self._stopped:
-                        self._worker_exit_reason = "cancelled"
-                        self._logger.critical(
-                            "HistoryWriteBuffer '%s' worker cancelled while running, %d items pending",
-                            self._name,
-                            len(pending) + self._queue.qsize(),
-                        )
-                    raise
-                except Exception as e:
-                    self._logger.error("HistoryWriteBuffer '%s' worker error: %s", self._name, e, exc_info=True)
-
-            # Финальный флаш оставшихся данных
-            if pending:
-                try:
-                    await self._flush_pending(pending)
-                except Exception as e:
-                    self._logger.error("HistoryWriteBuffer '%s' final flush error: %s", self._name, e, exc_info=True)
-        except asyncio.CancelledError:
-            raise
-        except BaseException as e:
-            # Без этого воркер умирал молча: никто не ждёт task, и трассировка теряется
-            self._worker_exit_reason = f"{type(e).__name__}: {e}"
-            self._logger.critical(
-                "HistoryWriteBuffer '%s' worker terminated by %r",
-                self._name,
-                e,
-                exc_info=True,
-            )
-            raise
-
-    async def _flush_pending(self, batch: List[Any]) -> None:
-        if not batch:
-            return
-
-        started_at = time.perf_counter()
-        self._flush_started_monotonic = time.monotonic()
-        try:
-            if self._flush_timeout_sec > 0:
-                async with asyncio.timeout(self._flush_timeout_sec):
-                    await self._flush_func(batch)
-            else:
-                await self._flush_func(batch)
-            duration_ms = (time.perf_counter() - started_at) * 1000.0
-            batch_size = len(batch)
-            self._stats["flush_batches_total"] += 1
-            self._stats["flushed_items_total"] += batch_size
-            self._stats["last_batch_size"] = batch_size
-            self._stats["max_batch_size_seen"] = max(
-                int(self._stats["max_batch_size_seen"]),
-                batch_size,
-            )
-            _observe_timing(self._stats["flush_duration"], duration_ms)
-            # Отметка успеха: по ней видно «данные не доезжают», даже когда воркер жив
-            self._last_flush_monotonic = time.monotonic()
-            self._worker_restart_attempt = 0
-            # Уведомляем ожидающих о завершении
-            now = time.time()
-            for item in batch:
-                fut: Optional[asyncio.Future] = getattr(item, "future", None)
-                if fut is not None and not fut.done():
-                    fut.set_result(now)
-        except Exception as e:
-            duration_ms = (time.perf_counter() - started_at) * 1000.0
-            duration_sec = duration_ms / 1000.0
-            batch_size = len(batch)
-            timed_out = isinstance(e, (asyncio.TimeoutError, TimeoutError))
-            if timed_out:
-                self._stats["flush_timeouts_total"] += 1
-                # Не подменять текст внутреннего таймаута (query/flush/command)
-                # ярлыком внешнего бюджета буфера: иначе в логе «120s» при срабатывании 30 с.
-                if not str(e).strip():
-                    e = TimeoutError(
-                        f"flush timed out after {duration_sec:.1f}s (layer=buffer)"
-                    )
-            self._stats["flush_errors_total"] += 1
-            self._stats["flush_dropped_items_total"] += batch_size
-            self._stats["last_flush_error"] = str(e)
-            self._stats["last_batch_size"] = batch_size
-            self._stats["max_batch_size_seen"] = max(
-                int(self._stats["max_batch_size_seen"]),
-                batch_size,
-            )
-            _observe_timing(self._stats["flush_duration"], duration_ms)
-            self._logger.error(
-                "HistoryWriteBuffer '%s' flush failed for %d items after %.1fs: %s",
-                self._name,
-                len(batch),
-                duration_sec,
-                e,
-                exc_info=not timed_out,
-            )
-            for item in batch:
-                fut: Optional[asyncio.Future] = getattr(item, "future", None)
-                if fut is not None and not fut.done():
-                    fut.set_exception(e)
-        finally:
-            self._flush_started_monotonic = None
-
-try:
-    from asyncua.common.events import get_event_properties_from_type_node
-except ImportError:
-    # Fallback для старых версий asyncua
-    async def get_event_properties_from_type_node(event_type):
-        """Получение свойств события из типа узла"""
-        return []
 
 def validate_table_name(name: str) -> None:
-    """
-    Валидация имени таблицы для предотвращения SQL инъекций.
-    
-    Args:
-        name: Имя таблицы для проверки
-        
-    Raises:
-        ValueError: Если имя таблицы содержит недопустимые символы
-    """
-    import re
-    if not re.match(r'^[\w\-]+$', name):
+    """Проверить имя таблицы перед подстановкой в SQL."""
+    if not re.match(r"^[\w\-]+$", name):
         raise ValueError(f"Invalid table name: {name}")
 
 
-from .opc_node_id import coerce_node_id as _coerce_node_id
+class HistoryTimescale(HistoryStorageInterface):  # type: ignore[misc]
+    """Хранение истории OPC UA в PostgreSQL с TimescaleDB.
 
+    Переменные пишутся в ``variables_history``, события — в ``events_history``;
+    обе таблицы — гипертаблицы TimescaleDB. Запись идёт пачками через
+    ограниченный буфер, последние значения переменных держатся в памяти и в
+    ``variables_last_value``.
 
-class HistoryTimescale(HistoryStorageInterface):
-    """
-    Backend для хранения исторических данных OPC UA в PostgreSQL с TimescaleDB.
-    
-    Новая архитектура использует единые таблицы:
-    - variables_history: для всех переменных
-    - events_history: для всех событий
-    - variable_metadata: метаданные переменных
-    - event_sources: источники событий (с периодом хранения)
-    - event_types: типы событий (с расширенными полями)
-    
-    Особенности:
-    - Единая таблица для всех переменных с полем variable_id
-    - Единая таблица для всех событий с полями source_id и event_type_id
-    - Настраиваемая схема (по умолчанию 'public')
-    - TimescaleDB hypertables для оптимизации временных рядов
-    - Дополнительное партиционирование по source_id (TimescaleDB 2+)
-    - Период хранения и max_records устанавливается для источника событий
-    
-    Attributes:
-        max_history_data_response_size (int): Максимальный размер ответа с историческими данными
-        logger (logging.Logger): Логгер для записи событий
-        _datachanges_period (dict): Словарь периодов хранения данных по узлам
-        _conn_params (dict): Параметры подключения к базе данных
-        _event_fields (dict): Словарь полей событий по источникам
-        _pool (asyncpg.Pool): Пул соединений с базой данных
-        _min_size (int): Минимальное количество соединений в пуле
-        _max_size (int): Максимальное количество соединений в пуле
-        _initialized (bool): Флаг инициализации таблиц
-        _schema (str): Имя схемы для размещения таблиц истории
+    Типизированный поиск событий (слой v2) включается подклассом
+    ``HistoryTimescaleV2``; у этого класса он выключен, как и в 0.2.15.
     """
 
-    def _build_group_key_from_node_id(self, node_id_str: str) -> str:
-        """
-        Простая эвристика для группировки переменных по «вышестоящему узлу».
-
-        По сути, используем префикс NodeId до последней точки, если она есть.
-        Это позволяет группировать переменные, имена которых имеют иерархический формат.
-        """
-        try:
-            if "." in node_id_str:
-                return node_id_str.rsplit(".", 1)[0]
-            return node_id_str
-        except Exception:
-            return node_id_str or "default"
-
-    def _format_node_id(self, node_id: ua.NodeId) -> str:
-        """
-        Формирует стандартное имя узла OPC UA в формате ns=X;t=Y.
-        
-        Args:
-            node_id: OPC UA NodeId или совместимый объект (Node, Variant)
-            
-        Returns:
-            str: Строка в формате "ns=X;t=Y"
-        """
-        # Приведение к ua.NodeId при необходимости
-        try:
-            # Случай: asyncua Node
-            if hasattr(node_id, 'nodeid'):
-                node_id = node_id.nodeid
-            # Случай: Variant с Value=NodeId
-            if hasattr(node_id, 'Value') and isinstance(node_id.Value, ua.NodeId):
-                node_id = node_id.Value
-        except Exception:
-            pass
-        
-        # Если после приведения это строка вида ns=..;t=.. — вернуть как есть
-        if isinstance(node_id, str) and node_id.startswith('ns=') and ';' in node_id:
-            return node_id
-        
-        # Если это уже ua.NodeId — собрать каноническую строку
-        try:
-            node_id_type_map = {
-                ua.NodeIdType.TwoByte: 'i',
-                ua.NodeIdType.FourByte: 'i', 
-                ua.NodeIdType.Numeric: 'i',
-                ua.NodeIdType.String: 's',
-                ua.NodeIdType.Guid: 'g',
-                ua.NodeIdType.ByteString: 'b'
-            }
-            type_key = getattr(node_id, 'NodeIdType', None)
-            ns = getattr(node_id, 'NamespaceIndex', None)
-            ident = getattr(node_id, 'Identifier', None)
-            if type_key is not None and ns is not None and ident is not None:
-                tchar = node_id_type_map.get(type_key, 'x')
-                return f"ns={ns};{tchar}={ident}"
-        except Exception:
-            pass
-        
-        # Фоллбэк: строковое представление
-        return str(node_id)
-
-    def _normalize_event_type_name(self, name: str) -> str:
-        """
-        Нормализует имя типа события: убирает префикс вида 'ns=..;s=' если он присутствует.
-        """
-        if name.startswith('ns=') and ';s=' in name:
-            try:
-                return name.split(';s=', 1)[1]
-            except Exception:
-                return name
-        return name
-
-    def _get_node_data_type(self, node_id: ua.NodeId, datavalue: Optional[ua.DataValue] = None) -> str:
-        """
-        Определяет тип данных переменной на основе DataValue или контекста.
-        
-        Args:
-            node_id: OPC UA NodeId переменной
-            datavalue: DataValue переменной (опционально)
-            
-        Returns:
-            str: Строковое представление типа данных переменной
-        """
-        # Если передан DataValue, определяем тип по нему
-        if datavalue and hasattr(datavalue, 'Value') and datavalue.Value is not None:
-            variant_type = datavalue.Value.VariantType
-            if variant_type:
-                # Маппинг типов OPC UA VariantType на читаемые названия
-                variant_type_map = {
-                    ua.VariantType.Boolean: 'Boolean',
-                    ua.VariantType.SByte: 'SByte',
-                    ua.VariantType.Byte: 'Byte',
-                    ua.VariantType.Int16: 'Int16',
-                    ua.VariantType.UInt16: 'UInt16',
-                    ua.VariantType.Int32: 'Int32',
-                    ua.VariantType.UInt32: 'UInt32',
-                    ua.VariantType.Int64: 'Int64',
-                    ua.VariantType.UInt64: 'UInt64',
-                    ua.VariantType.Float: 'Float',
-                    ua.VariantType.Double: 'Double',
-                    ua.VariantType.String: 'String',
-                    ua.VariantType.DateTime: 'DateTime',
-                    ua.VariantType.Guid: 'Guid',
-                    ua.VariantType.ByteString: 'ByteString',
-                    ua.VariantType.XmlElement: 'XmlElement',
-                    ua.VariantType.NodeId: 'NodeId',
-                    ua.VariantType.ExpandedNodeId: 'ExpandedNodeId',
-                    ua.VariantType.StatusCode: 'StatusCode',
-                    ua.VariantType.QualifiedName: 'QualifiedName',
-                    ua.VariantType.LocalizedText: 'LocalizedText',
-                    ua.VariantType.ExtensionObject: 'ExtensionObject',
-                    ua.VariantType.DataValue: 'DataValue',
-                    ua.VariantType.Variant: 'Variant',
-                    ua.VariantType.DiagnosticInfo: 'DiagnosticInfo',
-                }
-                return variant_type_map.get(variant_type, str(variant_type))
-        
-        # Если DataValue не передан, пытаемся определить по контексту NodeId
-        # Это может быть полезно для предварительной регистрации переменных
-        # Например, если знаем, что переменная с определенным NodeId всегда Double
-        
-        # Маппинг известных переменных по их NodeId
-        known_variables = {
-            # Пример: если знаем, что переменная с NodeId i=2 всегда Double
-            # Можно расширить этот маппинг на основе специфики приложения
-        }
-        
-        # Формируем ключ для поиска
-        node_key = f"ns={node_id.NamespaceIndex};i={node_id.Identifier}"
-        
-        # Возвращаем известный тип или "Unknown" если не определен
-        return known_variables.get(node_key, "Unknown")
+    # Публикуются ли узлы возможностей слоя поиска событий (EventsStorage*).
+    _publish_event_capabilities = False
 
     def __init__(
-        self, 
-        user: str = 'postgres', 
-        password: str = 'postmaster', 
-        database: str = 'opcua', 
-        host: str = 'localhost', 
+        self,
+        user: str = "postgres",
+        password: str = "postmaster",
+        database: str = "opcua",
+        host: str = "localhost",
         port: int = 5432,
         min_size: int = 1,
         max_size: int = 10,
-        schema: str = 'public',
+        schema: str = "public",
         sslmode: Optional[str] = None,
         config_file: Optional[str] = None,
         encrypted_config: Optional[str] = None,
         master_password: Optional[str] = None,
         global_retention_period: Optional[timedelta] = None,
-        # Параметры оптимизации записи истории и кэшей
         history_write_batch_enabled: bool = True,
         history_write_max_batch_size: int = 500,
         history_write_max_batch_interval_sec: float = 1.0,
@@ -814,438 +134,129 @@ class HistoryTimescale(HistoryStorageInterface):
         history_flush_timeout_sec: float = DEFAULT_FLUSH_TIMEOUT_SEC,
         history_worker_stall_timeout_sec: float = DEFAULT_WORKER_STALL_TIMEOUT_SEC,
         db_application_name: str = DEFAULT_DB_APPLICATION_NAME,
-        **kwargs
+        **kwargs: Any,
     ) -> None:
-        """
-        Инициализация HistoryTimescale.
-        
-        Args:
-            user: Имя пользователя базы данных
-            password: Пароль пользователя
-            database: Имя базы данных
-            host: Хост базы данных
-            port: Порт базы данных
-            min_size: Минимальное количество соединений в пуле
-            max_size: Максимальное количество соединений в пуле
-            schema: Имя схемы для размещения таблиц истории (по умолчанию 'public')
-            sslmode: Режим SSL подключения ('disable', 'require', 'verify-ca', 'verify-full')
-            config_file: Путь к файлу зашифрованной конфигурации
-            encrypted_config: Зашифрованная конфигурация в виде строки
-            master_password: Главный пароль для расшифровки конфигурации
-            global_retention_period: Глобальная максимальная глубина хранения (TimescaleDB retention policy) для таблиц *history.
-                Если None — глобальная политика не настраивается (поведение как раньше).
-        """
         self.max_history_data_response_size = 1000
-        self.logger = logging.getLogger('uapg.history_timescale')
-        self._datachanges_period = {}
-        self._event_fields = {}
-        self._pool = None
-        self._min_size = min_size
-        self._max_size = max_size
-        self._initialized = False
-        self._schema = schema
-        self._pool_lock = asyncio.Lock()
-        self._reconnect_lock = asyncio.Lock()
-        self._stop_event = asyncio.Event()
-        self._reconnect_task = None
-        self._stopping = False
-        self._reconnect_min_delay = 1.0
-        self._reconnect_max_delay = 30.0
-        self._was_healthy = True
-        self._db_unavailable_since = None
-        self._last_throttled_log_at = None
-        self._db_query_timeout_sec = (
-            None
-            if db_query_timeout_sec is None or float(db_query_timeout_sec) <= 0
-            else float(db_query_timeout_sec)
-        )
-        self._db_pool_close_timeout_sec = max(0.1, float(db_pool_close_timeout_sec))
-        # Пересоздание пула держит оба замка: без этих границ любой flush,
-        # вошедший в _ensure_pool, ждёт его неограниченно долго.
-        self._db_pool_create_timeout_sec = max(1.0, float(db_pool_create_timeout_sec))
-        self._db_lock_wait_timeout_sec = max(1.0, float(db_lock_wait_timeout_sec))
-        # command_timeout действует внутри asyncpg и покрывает в том числе BEGIN,
-        # COMMIT и ROLLBACK, которые контекст транзакции шлёт без явного timeout.
-        self._db_command_timeout_sec = (
-            None
-            if db_command_timeout_sec is None or float(db_command_timeout_sec) <= 0
-            else float(db_command_timeout_sec)
-        )
-        self._db_tcp_keepalive_idle_sec = max(0, int(db_tcp_keepalive_idle_sec))
-        self._db_tcp_keepalive_interval_sec = max(1, int(db_tcp_keepalive_interval_sec))
-        self._db_tcp_keepalive_count = max(1, int(db_tcp_keepalive_count))
-        self._db_tcp_user_timeout_sec = max(0.0, float(db_tcp_user_timeout_sec))
-        self._history_flush_timeout_sec = max(0.0, float(history_flush_timeout_sec))
-        self._history_worker_stall_timeout_sec = max(0.0, float(history_worker_stall_timeout_sec))
-        self._db_application_name = str(db_application_name or "").strip() or DEFAULT_DB_APPLICATION_NAME
-        # Последнее время, когда мы писали агрегированное сообщение о длительной недоступности БД
-        self._last_reconnect_outage_log_at = None
-        self._failed_value_saves_counter = 0
-        self._failed_event_saves_counter = 0
-
-        # Глобальная политика хранения на уровне hypertable (TimescaleDB).
-        # Используется как верхняя граница для per-node retention_period.
-        self._global_retention_period: Optional[timedelta] = global_retention_period
-
-        # OPC UA nodes для экспонирования текущих настроек хранения истории (только Timescale).
-        # Заполняется через expose_history_settings_nodes().
-        self._opcua_history_settings_nodes: Dict[str, Any] = {}
-        self._opcua_history_settings_namespace_index: Optional[int] = None
-        self._opcua_history_settings_parent: Any = None
-
-        # Параметры оптимизации записи истории
-        self._history_write_batch_enabled = history_write_batch_enabled
-        self._history_write_max_batch_size = int(history_write_max_batch_size)
-        self._history_write_max_batch_interval_sec = float(history_write_max_batch_interval_sec)
-        self._history_write_queue_max_size = int(history_write_queue_max_size)
-        self._history_write_durability_mode = history_write_durability_mode
-        self._history_write_read_consistency_mode = history_write_read_consistency_mode
-        self._history_cache_enabled = history_cache_enabled
-
-        # Параметры и структуры кэша последних значений
-        self._history_last_values_cache_enabled = history_last_values_cache_enabled
-        self._history_last_values_cache_max_size_mb = int(history_last_values_cache_max_size_mb)
-        self._history_last_values_init_batch_size = int(history_last_values_init_batch_size)
-        # variable_id -> DataValue
-        self._last_values_cache: Dict[int, ua.DataValue] = {}
-
-        # Кэши метаданных (node_id / event_type -> внутренние идентификаторы)
-        # Используются для снижения количества обращений к variable_metadata / event_sources / event_types.
-        self._variable_metadata_cache: Dict[str, int] = {}
-        self._event_source_cache: Dict[str, int] = {}
-        self._event_type_cache: Dict[str, int] = {}
-
-        # Параметры кэша метаданных
-        self._history_metadata_cache_enabled = history_metadata_cache_enabled
-        self._history_metadata_cache_init_max_rows = int(history_metadata_cache_init_max_rows)
-
-        # Статистика эффективности кэшей (минимальный накладной расход — простые счётчики)
-        # Значения увеличиваются только монотонно; сброс возможен через публичный метод.
-        self._cache_stats: Dict[str, int] = {
-            # In-memory кэш последних значений (variable_id -> DataValue)
-            "last_values_memory_hits": 0,
-            "last_values_memory_misses": 0,
-            # Таблица variables_last_value как кэш в БД
-            "last_values_table_hits": 0,
-            "last_values_table_misses": 0,
-            # Fallback к основной таблице истории (variables_history)
-            "last_values_history_fallbacks": 0,
-            # Кэш метаданных переменных (node_id -> variable_id)
-            "variable_metadata_hits": 0,
-            "variable_metadata_misses": 0,
-            # Кэш источников событий (source_node_id -> source_id)
-            "event_source_hits": 0,
-            "event_source_misses": 0,
-            # Кэш типов событий (event_type_name -> event_type_id)
-            "event_type_hits": 0,
-            "event_type_misses": 0,
-        }
-
-        # Метрики производительности записи/БД. Чтение не обращается к БД.
-        self._performance_counters: Dict[str, int] = self._new_performance_counters()
-        self._performance_timings: Dict[str, Dict[str, float]] = self._new_performance_timings()
-
-        # Подавление первого уведомления datachange после подписки
+        self.logger = logging.getLogger("uapg.history_timescale")
+        # Первое уведомление после подписки несёт значение, которое уже лежит в
+        # базе: записывать его повторно — значит перетирать историю.
         self.suppress_initial_datachange = True
-        self._pending_initial_datachange_skip: Dict[str, bool] = {}
 
-        # Буферы для батчевой записи истории
-        self._value_write_buffer: Optional[HistoryWriteBuffer] = None
-        self._event_write_buffer: Optional[HistoryWriteBuffer] = None
-
-        # OPC UA nodes для экспонирования текущих метрик производительности.
-        self._opcua_history_metrics_nodes: Dict[str, Any] = {}
-        self._opcua_history_metrics_namespace_index: Optional[int] = None
-        self._opcua_history_metrics_parent: Any = None
-
-        # Инициализация параметров подключения
-        self._conn_params = self._init_connection_params(
-            user, password, database, host, port,
-            sslmode, config_file, encrypted_config, master_password, **kwargs
+        connection = ConnectionSettings.build(
+            user=user,
+            password=password,
+            database=database,
+            host=host,
+            port=port,
+            min_size=min_size,
+            max_size=max_size,
+            schema=schema,
+            sslmode=sslmode,
+            application_name=db_application_name,
+            extra=kwargs,
         )
-    
-    def _init_connection_params(
-        self,
-        user: str,
-        password: str,
-        database: str,
-        host: str,
-        port: int,
-        sslmode: Optional[str] = None,
-        config_file: Optional[str] = None,
-        encrypted_config: Optional[str] = None,
-        master_password: Optional[str] = None,
-        **kwargs
-    ) -> dict:
-        """
-        Инициализация параметров подключения с поддержкой зашифрованной конфигурации.
-        
-        Args:
-            user: Имя пользователя базы данных
-            password: Пароль пользователя
-            database: Имя базы данных
-            host: Хост базы данных
-            port: Порт базы данных
-            sslmode: Режим SSL подключения ('disable', 'require', 'verify-ca', 'verify-full')
-            config_file: Путь к файлу зашифрованной конфигурации
-            encrypted_config: Зашифрованная конфигурация в виде строки
-            master_password: Главный пароль для расшифровки конфигурации
-            
-        Returns:
-            Словарь с параметрами подключения
-        """
-        # Приоритет: зашифрованная конфигурация > файл конфигурации > прямые параметры
-        if encrypted_config and master_password:
-            try:
-                # Создаем временный DatabaseManager для расшифровки
-                temp_manager = DatabaseManager(master_password)
-                # Расшифровываем конфигурацию из строки
-                decrypted_config = temp_manager._decrypt_config(encrypted_config.encode())
-                self.logger.info("Using encrypted configuration from string")
-                config_params = {
-                    'user': decrypted_config.get('user', user),
-                    'password': decrypted_config.get('password', password),
-                    'database': decrypted_config.get('database', database),
-                    'host': decrypted_config.get('host', host),
-                    'port': decrypted_config.get('port', port),
-                    'schema': decrypted_config.get('schema', self._schema),
-                    'sslmode': decrypted_config.get('sslmode', sslmode)
-                }
-                # Обновляем схему если она указана в конфигурации
-                if 'schema' in decrypted_config:
-                    self._schema = decrypted_config['schema']
-                # Добавляем дополнительные параметры из kwargs
-                config_params.update(kwargs)
-                return config_params
-            except Exception as e:
-                self.logger.warning(f"Failed to decrypt configuration string: {e}, using direct parameters")
-        
-        elif config_file and master_password:
-            try:
-                # Создаем DatabaseManager для загрузки конфигурации из файла
-                temp_manager = DatabaseManager(master_password, config_file)
-                if temp_manager.config:
-                    self.logger.info(f"Using configuration from file: {config_file}")
-                    config_params = {
-                        'user': temp_manager.config.get('user', user),
-                        'password': temp_manager.config.get('password', password),
-                        'database': temp_manager.config.get('database', database),
-                        'host': temp_manager.config.get('host', host),
-                        'port': temp_manager.config.get('port', port),
-                        'schema': temp_manager.config.get('schema', self._schema),
-                        'sslmode': temp_manager.config.get('sslmode', sslmode)
-                    }
-                    # Обновляем схему если она указана в конфигурации
-                    if 'schema' in temp_manager.config:
-                        self._schema = temp_manager.config['schema']
-                    # Добавляем дополнительные параметры из kwargs
-                    config_params.update(kwargs)
-                    return config_params
-                else:
-                    self.logger.warning(f"Configuration file {config_file} is empty or invalid, using direct parameters")
-            except Exception as e:
-                self.logger.warning(f"Failed to load configuration from file {config_file}: {e}, using direct parameters")
-        
-        # Используем прямые параметры как fallback
-        self.logger.info("Using direct connection parameters")
-        base_params = {
-            'user': user,
-            'password': password,
-            'database': database,
-            'host': host,
-            'port': port,
-            'schema': self._schema
-        }
-        # Добавляем sslmode если он указан
-        if sslmode is not None:
-            base_params['sslmode'] = sslmode
-        # Добавляем дополнительные параметры из kwargs
-        base_params.update(kwargs)
-        return base_params
-
-    def get_connection_info(self) -> dict:
-        """
-        Получение информации о текущих параметрах подключения.
-        
-        Returns:
-            Словарь с информацией о подключении
-        """
-        return {
-            'user': self._conn_params['user'],
-            'host': self._conn_params['host'],
-            'port': self._conn_params['port'],
-            'database': self._conn_params['database'],
-            'schema': self._schema,
-            'min_size': self._min_size,
-            'max_size': self._max_size,
-            'initialized': self._initialized
-        }
-
-    def get_cache_stats(self) -> dict:
-        """
-        Получение текущей статистики эффективности кэшей модуля истории.
-
-        Возвращаются только числовые счётчики, инкрементируемые при обращениях к кэшу.
-        Метод не выполняет обращений к БД и имеет минимальный накладной расход.
-        """
-        # Возвращаем копию, чтобы внешний код не мог повлиять на внутренние счётчики.
-        return dict(self._cache_stats)
-
-    def reset_cache_stats(self) -> None:
-        """
-        Сброс статистики эффективности кэшей.
-
-        Полезно при длительной работе сервера или перед началом измерений.
-        """
-        for key in self._cache_stats:
-            self._cache_stats[key] = 0
-
-    @staticmethod
-    def _new_performance_counters() -> Dict[str, int]:
-        return {
-            "save_node_value_calls_total": 0,
-            "save_node_value_errors_total": 0,
-            "save_event_calls_total": 0,
-            "save_event_errors_total": 0,
-            "db_operation_timeouts_total": 0,
-            "db_reconnects_total": 0,
-            "db_reconnect_skipped_total": 0,
-            "db_pool_wait_timeouts_total": 0,
-        }
-
-    @staticmethod
-    def _new_performance_timings() -> Dict[str, Dict[str, float]]:
-        return {
-            "variable_flush_total": _empty_timing_stats(),
-            "variable_insert_history": _empty_timing_stats(),
-            "variable_upsert_last_value": _empty_timing_stats(),
-            "event_flush_total": _empty_timing_stats(),
-            "event_insert_history": _empty_timing_stats(),
-        }
-
-    def _perf_inc(self, key: str, amount: int = 1) -> None:
-        self._performance_counters[key] = self._performance_counters.get(key, 0) + amount
-
-    def _perf_observe_ms(self, key: str, duration_ms: float) -> None:
-        stats = self._performance_timings.setdefault(key, _empty_timing_stats())
-        _observe_timing(stats, duration_ms)
-
-    @staticmethod
-    def _format_timing_metrics(prefix: str, stats: Dict[str, float]) -> Dict[str, float]:
-        return {
-            f"{prefix}_count": int(stats.get("count", 0)),
-            f"{prefix}_total_ms": float(stats.get("total_ms", 0.0)),
-            f"{prefix}_last_ms": float(stats.get("last_ms", 0.0)),
-            f"{prefix}_max_ms": float(stats.get("max_ms", 0.0)),
-            f"{prefix}_avg_ms": float(stats.get("avg_ms", 0.0)),
-        }
-
-    def get_performance_metrics(self) -> dict:
-        """
-        Возвращает снимок метрик производительности без обращений к БД.
-        """
-        variable_buffer = (
-            self._value_write_buffer.get_stats()
-            if self._value_write_buffer is not None
-            else self._empty_buffer_metrics()
+        decrypted = load_connection_config(
+            config_file=config_file,
+            encrypted_config=encrypted_config,
+            master_password=master_password,
         )
-        event_buffer = (
-            self._event_write_buffer.get_stats()
-            if self._event_write_buffer is not None
-            else self._empty_buffer_metrics()
+        if decrypted:
+            connection = connection.with_overrides(decrypted)
+
+        self._settings = StorageSettings(
+            connection=connection,
+            timeouts=Timeouts.build(
+                query_sec=db_query_timeout_sec,
+                command_sec=db_command_timeout_sec,
+                pool_close_sec=db_pool_close_timeout_sec,
+                pool_create_sec=db_pool_create_timeout_sec,
+                lock_wait_sec=db_lock_wait_timeout_sec,
+                flush_sec=history_flush_timeout_sec,
+                worker_stall_sec=history_worker_stall_timeout_sec,
+            ),
+            keepalive=Keepalive.build(
+                idle_sec=db_tcp_keepalive_idle_sec,
+                interval_sec=db_tcp_keepalive_interval_sec,
+                count=db_tcp_keepalive_count,
+                user_timeout_sec=db_tcp_user_timeout_sec,
+            ),
+            write=WriteSettings.build(
+                batch_enabled=history_write_batch_enabled,
+                max_batch_size=history_write_max_batch_size,
+                max_batch_interval_sec=history_write_max_batch_interval_sec,
+                queue_max_size=history_write_queue_max_size,
+                durability_mode=history_write_durability_mode,
+                read_consistency_mode=history_write_read_consistency_mode,
+            ),
+            cache=CacheSettings.build(
+                enabled=history_cache_enabled,
+                last_values_enabled=history_last_values_cache_enabled,
+                last_values_max_size_mb=history_last_values_cache_max_size_mb,
+                last_values_init_batch_size=history_last_values_init_batch_size,
+                metadata_enabled=history_metadata_cache_enabled,
+                metadata_init_max_rows=history_metadata_cache_init_max_rows,
+            ),
+            global_retention_period=global_retention_period,
         )
+        self._build_components()
 
-        variable_metrics: Dict[str, Any] = {
-            "save_node_value_calls_total": self._performance_counters["save_node_value_calls_total"],
-            "save_node_value_errors_total": self._performance_counters["save_node_value_errors_total"],
-            **variable_buffer,
-            **self._format_timing_metrics("flush", self._performance_timings["variable_flush_total"]),
-            **self._format_timing_metrics("insert_history", self._performance_timings["variable_insert_history"]),
-            **self._format_timing_metrics("upsert_last_value", self._performance_timings["variable_upsert_last_value"]),
-        }
-        event_metrics: Dict[str, Any] = {
-            "save_event_calls_total": self._performance_counters["save_event_calls_total"],
-            "save_event_errors_total": self._performance_counters["save_event_errors_total"],
-            **event_buffer,
-            **self._format_timing_metrics("flush", self._performance_timings["event_flush_total"]),
-            **self._format_timing_metrics("insert_history", self._performance_timings["event_insert_history"]),
-        }
+        self._events_mode = StorageMode.LEGACY
+        self._events_config = EventsV2Config()
+        self._v2_ready = False
+        self._event_tables: Optional[TypedEventTables] = None
+        self._event_registry: Optional[EventSchemaRegistry] = None
+        self._event_search: Optional[EventSearchStore] = None
 
-        return {
-            "write": {
-                "variables": variable_metrics,
-                "events": event_metrics,
-            },
-            "db": {
-                "timeouts_total": self._performance_counters["db_operation_timeouts_total"],
-                "reconnects_total": self._performance_counters["db_reconnects_total"],
-                "reconnects_skipped_total": self._performance_counters["db_reconnect_skipped_total"],
-                "pool_wait_timeouts_total": self._performance_counters["db_pool_wait_timeouts_total"],
-            },
-            "retention": {
-                "per_variable_cleanup_enabled": False,
-                "per_event_cleanup_enabled": False,
-            },
-            "config": {
-                "history_write_batch_enabled": bool(self._history_write_batch_enabled),
-                "history_write_max_batch_size": int(self._history_write_max_batch_size),
-                "history_write_max_batch_interval_sec": float(self._history_write_max_batch_interval_sec),
-                "history_write_queue_max_size": int(self._history_write_queue_max_size),
-                "history_write_durability_mode": str(self._history_write_durability_mode),
-                "history_write_read_consistency_mode": str(self._history_write_read_consistency_mode),
-                "db_query_timeout_sec": self._db_query_timeout_sec,
-                "db_pool_create_timeout_sec": float(self._db_pool_create_timeout_sec),
-                "db_lock_wait_timeout_sec": float(self._db_lock_wait_timeout_sec),
-                "db_command_timeout_sec": self._db_command_timeout_sec,
-                "db_tcp_keepalive_idle_sec": int(self._db_tcp_keepalive_idle_sec),
-                "db_tcp_user_timeout_sec": float(self._db_tcp_user_timeout_sec),
-                "history_flush_timeout_sec": float(self._history_flush_timeout_sec),
-                "history_worker_stall_timeout_sec": float(self._history_worker_stall_timeout_sec),
-                "db_application_name": str(self._db_application_name),
-            },
-        }
+    def _build_components(self) -> None:
+        """Собрать слои по текущим настройкам (при создании и смене конфигурации)."""
+        schema = validate_identifier(self._settings.schema)
+        self._metrics = MetricsRegistry()
+        self._caches = Caches(
+            self._metrics.cache, last_values_enabled=self._settings.cache.last_values_enabled
+        )
+        self._db = Database(
+            self._settings.connection,
+            self._settings.timeouts,
+            self._settings.keepalive,
+            self._metrics.database,
+            logger=self.logger,
+        )
+        self._supervisor = ConnectionSupervisor(self._db, logger=self.logger)
+        self._bootstrap = SchemaBootstrap(self._db, schema, logger=self.logger)
+        self._variables = VariableRepository(
+            self._db, schema, self._metrics.variables, logger=self.logger
+        )
+        self._events = EventRepository(self._db, schema, self._metrics.events, logger=self.logger)
 
-    @staticmethod
-    def _empty_buffer_metrics() -> Dict[str, Any]:
-        return {
-            "queue_size": 0,
-            "queue_max_size": 0,
-            "queue_fill_ratio": 0.0,
-            "enqueue_attempts_total": 0,
-            "enqueued_total": 0,
-            "dropped_total": 0,
-            "flushed_items_total": 0,
-            "flush_batches_total": 0,
-            "last_batch_size": 0,
-            "max_batch_size_seen": 0,
-            "flush_errors_total": 0,
-            "flush_timeouts_total": 0,
-            "flush_dropped_items_total": 0,
-            "last_flush_error": "",
-            "last_flush_duration_ms": 0.0,
-            "max_flush_duration_ms": 0.0,
-            "avg_flush_duration_ms": 0.0,
-            "total_flush_duration_ms": 0.0,
-            # Набор ключей обязан совпадать с get_stats(): по нему создаются узлы OPC UA
-            "worker_alive": False,
-            "worker_restarts_total": 0,
-            "worker_stall_restarts_total": 0,
-            "last_worker_exit_reason": "",
-            "seconds_since_last_flush": -1.0,
-            "seconds_since_last_enqueue": -1.0,
-            "seconds_in_current_flush": -1.0,
-        }
+        self._initialized = False
+        # Узел -> variable_id; источник -> (source_id, {тип события: event_type_id}).
+        self._variable_ids: Dict[Any, int] = {}
+        self._event_source_ids: Dict[Any, Tuple[int, Dict[Any, int]]] = {}
+        self._event_fields: Dict[Any, List[str]] = {}
+        self._known_data_types: Dict[int, str] = {}
+        self._pending_initial_skip: Dict[str, bool] = {}
 
-    def reset_performance_metrics(self) -> None:
-        """
-        Сбрасывает метрики производительности и статистику буферов записи.
-        """
-        self._performance_counters = self._new_performance_counters()
-        self._performance_timings = self._new_performance_timings()
-        if self._value_write_buffer is not None:
-            self._value_write_buffer.reset_stats()
-        if self._event_write_buffer is not None:
-            self._event_write_buffer.reset_stats()
+        self._value_buffer: Optional[HistoryWriteBuffer[VariableWriteItem]] = None
+        self._event_buffer: Optional[HistoryWriteBuffer[EventWriteItem]] = None
+
+        self._settings_nodes: Dict[str, Any] = {}
+        self._metrics_nodes: Dict[str, Any] = {}
+
+        self._failure_since: Optional[datetime] = None
+        self._failure_log_at: Optional[datetime] = None
+        self._failed_saves: Dict[str, int] = {"value": 0, "event": 0}
+
+    def _configure_events(
+        self, mode: StorageMode, config: Optional[EventsV2Config] = None
+    ) -> None:
+        self._events_mode = mode
+        self._events_config = config or EventsV2Config()
+
+    @property
+    def _schema(self) -> str:
+        return self._settings.schema
+
+    # ================================================================== конфигурация
 
     @classmethod
     def from_config_file(
@@ -1253,2588 +264,625 @@ class HistoryTimescale(HistoryStorageInterface):
         config_file: str,
         master_password: str,
         min_size: int = 1,
-        max_size: int = 10
-    ) -> 'HistoryTimescale':
-        """
-        Создание экземпляра из файла зашифрованной конфигурации.
-        
-        Args:
-            config_file: Путь к файлу зашифрованной конфигурации
-            master_password: Главный пароль для расшифровки
-            min_size: Минимальное количество соединений в пуле
-            max_size: Максимальное количество соединений в пуле
-            
-        Returns:
-            Экземпляр HistoryTimescale с загруженной конфигурацией
-        """
+        max_size: int = 10,
+    ) -> "HistoryTimescale":
+        """Создать бэкенд из зашифрованного файла конфигурации."""
         return cls(
             config_file=config_file,
             master_password=master_password,
             min_size=min_size,
-            max_size=max_size
+            max_size=max_size,
         )
-    
+
     @classmethod
     def from_encrypted_config(
         cls,
         encrypted_config: str,
         master_password: str,
         min_size: int = 1,
-        max_size: int = 10
-    ) -> 'HistoryTimescale':
-        """
-        Создание экземпляра из зашифрованной конфигурации в виде строки.
-        
-        Args:
-            encrypted_config: Зашифрованная конфигурация в виде строки
-            master_password: Главный пароль для расшифровки
-            min_size: Минимальное количество соединений в пуле
-            max_size: Максимальное количество соединений в пуле
-            
-        Returns:
-            Экземпляр HistoryTimescale с расшифрованной конфигурацией
-        """
+        max_size: int = 10,
+    ) -> "HistoryTimescale":
+        """Создать бэкенд из зашифрованной строки конфигурации."""
         return cls(
             encrypted_config=encrypted_config,
             master_password=master_password,
             min_size=min_size,
-            max_size=max_size
+            max_size=max_size,
         )
 
     def update_config(
         self,
         config_file: Optional[str] = None,
         encrypted_config: Optional[str] = None,
-        master_password: Optional[str] = None
+        master_password: Optional[str] = None,
     ) -> bool:
+        """Применить зашифрованную конфигурацию подключения.
+
+        Работает только на остановленном бэкенде: менять параметры под живым пулом
+        нельзя. В 0.2.15 метод передавал аргументы не в те позиции и не работал.
         """
-        Обновление конфигурации подключения.
-        
-        Args:
-            config_file: Путь к файлу зашифрованной конфигурации
-            encrypted_config: Зашифрованная конфигурация в виде строки
-            master_password: Главный пароль для расшифровки конфигурации
-            
-        Returns:
-            True если конфигурация обновлена успешно
-        """
-        if self._pool:
-            self.logger.warning("Cannot update config while pool is active. Call stop() first.")
+        if self._db.is_connected:
+            self.logger.warning("Конфигурацию нельзя менять при активном пуле: сначала stop()")
             return False
-        
-        try:
-            # Сбрасываем флаг инициализации
-            self._initialized = False
-            
-            # Обновляем параметры подключения
-            self._conn_params = self._init_connection_params(
-                self._conn_params.get('user', 'postgres'),
-                self._conn_params.get('password', 'postmaster'),
-                self._conn_params.get('database', 'opcua'),
-                self._conn_params.get('host', 'localhost'),
-                self._conn_params.get('port', 5432),
-                config_file, encrypted_config, master_password
-            )
-            
-            self.logger.info("Configuration updated successfully")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to update configuration: {e}")
+        decrypted = load_connection_config(
+            config_file=config_file,
+            encrypted_config=encrypted_config,
+            master_password=master_password,
+        )
+        if not decrypted:
+            self.logger.error("Конфигурация не обновлена: расшифровать её не удалось")
             return False
-
-    async def init(self) -> None:
-        """Инициализация подключения к базе данных и создание таблиц метаданных."""
         try:
-            self._stopping = False
-            await self._ensure_pool()
-
-            if not self._initialized:
-                await self._terminate_stale_backends()
-                await self._create_metadata_tables()
-                self._initialized = True
-
-            # Инициализируем кэш метаданных переменных после готовности схемы/таблиц
-            if self._history_metadata_cache_enabled:
-                await self._init_metadata_cache()
-
-            # Инициализируем буферы записи истории при первом запуске
-            if self._history_write_batch_enabled:
-                if self._value_write_buffer is None:
-                    self._value_write_buffer = HistoryWriteBuffer(
-                        name="variables",
-                        logger=self.logger,
-                        max_batch_size=self._history_write_max_batch_size,
-                        max_batch_interval_sec=self._history_write_max_batch_interval_sec,
-                        queue_max_size=self._history_write_queue_max_size,
-                        durability_mode=self._history_write_durability_mode,
-                        flush_func=self._flush_variable_batch,
-                        flush_timeout_sec=self._buffer_flush_timeout_sec(),
-                        stall_timeout_sec=self._history_worker_stall_timeout_sec,
-                    )
-                    self._value_write_buffer.start()
-
-                if self._event_write_buffer is None:
-                    self._event_write_buffer = HistoryWriteBuffer(
-                        name="events",
-                        logger=self.logger,
-                        max_batch_size=self._history_write_max_batch_size,
-                        max_batch_interval_sec=self._history_write_max_batch_interval_sec,
-                        queue_max_size=self._history_write_queue_max_size,
-                        durability_mode=self._history_write_durability_mode,
-                        flush_func=self._flush_event_batch,
-                        flush_timeout_sec=self._buffer_flush_timeout_sec(),
-                        stall_timeout_sec=self._history_worker_stall_timeout_sec,
-                    )
-                    self._event_write_buffer.start()
-
-            # Инициализируем in-memory кэш последних значений из таблицы variables_last_value
-            if self._history_last_values_cache_enabled:
-                await self._init_last_values_cache()
-
-            if self._reconnect_task is None or self._reconnect_task.done():
-                self._stop_event.clear()
-                self._reconnect_task = asyncio.create_task(self._reconnect_monitor())
-                self.logger.info("Reconnect monitor started")
-
-            # Если OPC UA узлы настроек уже экспонированы — обновим их значениями
-            await self.refresh_history_settings_nodes()
-
-            self.logger.info("HistoryTimescale initialized successfully")
-        except Exception as e:
-            self.logger.error(f"Failed to initialize HistoryTimescale: {e}")
-            raise
-
-    async def expose_history_settings_nodes(
-        self,
-        server: Any,
-        namespace_index: int,
-        *,
-        parent: Any = None,
-    ) -> None:
-        """
-        Экспортирует read-only переменные с настройками хранения истории в адресное пространство OPC UA.
-
-        Размещение по умолчанию: под `0:Server` (внутри `0:Objects`).
-
-        Args:
-            server: экземпляр asyncua.Server
-            namespace_index: индекс namespace, в котором создавать пользовательские узлы
-            parent: опционально, явный родительский узел. Если не задан — используется `0:Server`.
-        """
-        if server is None:
-            raise ValueError("server is required")
-
-        idx = int(namespace_index)
-
-        async def _get_server_parent() -> Any:
-            if parent is not None:
-                return parent
-            # Пытаемся использовать server.nodes.server, если доступно
-            try:
-                srv_node = getattr(getattr(server, "nodes", None), "server", None)
-                if srv_node is not None:
-                    return srv_node
-            except Exception:
-                pass
-            # Fallback: ищем 0:Server под 0:Objects
-            return await server.nodes.objects.get_child(["0:Server"])
-
-        async def _get_or_add_object(parent_node: Any, name: str) -> Any:
-            qn = f"{idx}:{name}"
-            try:
-                return await parent_node.get_child([qn])
-            except Exception:
-                return await parent_node.add_object(idx, name)
-
-        async def _get_or_add_variable(parent_node: Any, name: str, initial_value: ua.Variant) -> Any:
-            qn = f"{idx}:{name}"
-            try:
-                return await parent_node.get_child([qn])
-            except Exception:
-                # В asyncua переменные по умолчанию read-only, поэтому set_writable() не вызываем
-                return await parent_node.add_variable(idx, name, initial_value)
-
-        server_parent = await _get_server_parent()
-        history_obj = await _get_or_add_object(server_parent, "History")
-        settings_obj = await _get_or_add_object(history_obj, "HistorySettings")
-
-        nodes: Dict[str, Any] = {}
-        nodes["UapgVersion"] = await _get_or_add_variable(
-            settings_obj, "UapgVersion", ua.Variant("unknown", ua.VariantType.String)
-        )
-        nodes["StorageType"] = await _get_or_add_variable(
-            settings_obj, "StorageType", ua.Variant("timescale", ua.VariantType.String)
-        )
-        nodes["Schema"] = await _get_or_add_variable(
-            settings_obj, "Schema", ua.Variant(str(self._schema), ua.VariantType.String)
-        )
-        nodes["GlobalRetentionSeconds"] = await _get_or_add_variable(
-            settings_obj, "GlobalRetentionSeconds", ua.Variant(-1, ua.VariantType.Int64)
-        )
-        nodes["WriteBatchEnabled"] = await _get_or_add_variable(
-            settings_obj, "WriteBatchEnabled", ua.Variant(bool(self._history_write_batch_enabled), ua.VariantType.Boolean)
-        )
-        nodes["WriteMaxBatchSize"] = await _get_or_add_variable(
-            settings_obj, "WriteMaxBatchSize", ua.Variant(int(self._history_write_max_batch_size), ua.VariantType.Int32)
-        )
-        nodes["WriteMaxBatchIntervalSec"] = await _get_or_add_variable(
-            settings_obj, "WriteMaxBatchIntervalSec", ua.Variant(float(self._history_write_max_batch_interval_sec), ua.VariantType.Double)
-        )
-        nodes["WriteQueueMaxSize"] = await _get_or_add_variable(
-            settings_obj, "WriteQueueMaxSize", ua.Variant(int(self._history_write_queue_max_size), ua.VariantType.Int32)
-        )
-        nodes["WriteDurabilityMode"] = await _get_or_add_variable(
-            settings_obj, "WriteDurabilityMode", ua.Variant(str(self._history_write_durability_mode), ua.VariantType.String)
-        )
-        nodes["WriteReadConsistencyMode"] = await _get_or_add_variable(
-            settings_obj, "WriteReadConsistencyMode", ua.Variant(str(self._history_write_read_consistency_mode), ua.VariantType.String)
-        )
-        nodes["TimescaleExtensionAvailable"] = await _get_or_add_variable(
-            settings_obj, "TimescaleExtensionAvailable", ua.Variant(False, ua.VariantType.Boolean)
-        )
-
-        self._opcua_history_settings_nodes = nodes
-        self._opcua_history_settings_namespace_index = idx
-        self._opcua_history_settings_parent = server_parent
-
-        await self.refresh_history_settings_nodes()
-
-    async def refresh_history_settings_nodes(self) -> None:
-        """
-        Обновляет значения OPC UA переменных (если они были экспонированы).
-
-        No-op если expose_history_settings_nodes() ещё не вызывался.
-        """
-        if not self._opcua_history_settings_nodes:
-            return
-
-        try:
-            try:
-                uapg_version = importlib_metadata.version("uapg")
-            except Exception:
-                uapg_version = "unknown"
-
-            retention = self._global_retention_period
-            retention_sec = int(retention.total_seconds()) if retention is not None else -1
-
-            ext_available = await self._timescaledb_available()
-
-            values: Dict[str, ua.Variant] = {
-                "UapgVersion": ua.Variant(str(uapg_version), ua.VariantType.String),
-                "StorageType": ua.Variant("timescale", ua.VariantType.String),
-                "Schema": ua.Variant(str(self._schema), ua.VariantType.String),
-                "GlobalRetentionSeconds": ua.Variant(retention_sec, ua.VariantType.Int64),
-                "WriteBatchEnabled": ua.Variant(bool(self._history_write_batch_enabled), ua.VariantType.Boolean),
-                "WriteMaxBatchSize": ua.Variant(int(self._history_write_max_batch_size), ua.VariantType.Int32),
-                "WriteMaxBatchIntervalSec": ua.Variant(float(self._history_write_max_batch_interval_sec), ua.VariantType.Double),
-                "WriteQueueMaxSize": ua.Variant(int(self._history_write_queue_max_size), ua.VariantType.Int32),
-                "WriteDurabilityMode": ua.Variant(str(self._history_write_durability_mode), ua.VariantType.String),
-                "WriteReadConsistencyMode": ua.Variant(str(self._history_write_read_consistency_mode), ua.VariantType.String),
-                "TimescaleExtensionAvailable": ua.Variant(bool(ext_available), ua.VariantType.Boolean),
-            }
-
-            for k, v in values.items():
-                node = self._opcua_history_settings_nodes.get(k)
-                if node is None:
-                    continue
-                try:
-                    await node.write_value(v)
-                except Exception:
-                    # Если узел удалён/недоступен — просто пропускаем обновление
-                    continue
-        except Exception:
-            # Никогда не ломаем основную функциональность истории из-за OPC UA витрины настроек
-            return
-
-    @staticmethod
-    def _metric_node_name(metric_path: str) -> str:
-        parts: List[str] = []
-        for path_part in metric_path.split("."):
-            for word in path_part.split("_"):
-                if word:
-                    parts.append(word[:1].upper() + word[1:])
-        return "".join(parts)
-
-    @staticmethod
-    def _flatten_metrics(metrics: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
-        flattened: Dict[str, Any] = {}
-        for key, value in metrics.items():
-            path = f"{prefix}.{key}" if prefix else str(key)
-            if isinstance(value, dict):
-                flattened.update(HistoryTimescale._flatten_metrics(value, path))
-            else:
-                flattened[path] = value
-        return flattened
-
-    @staticmethod
-    def _metric_variant(value: Any) -> ua.Variant:
-        if isinstance(value, bool):
-            return ua.Variant(value, ua.VariantType.Boolean)
-        if isinstance(value, int):
-            return ua.Variant(value, ua.VariantType.Int64)
-        if isinstance(value, float):
-            return ua.Variant(value, ua.VariantType.Double)
-        if value is None:
-            return ua.Variant("", ua.VariantType.String)
-        return ua.Variant(str(value), ua.VariantType.String)
-
-    async def expose_history_metrics_nodes(
-        self,
-        server: Any,
-        namespace_index: int,
-        *,
-        parent: Any = None,
-    ) -> None:
-        """
-        Экспортирует read-only переменные с метриками производительности в OPC UA.
-
-        Метрики размещаются в `History/HistoryMetrics` и обновляются только
-        явным вызовом `refresh_history_metrics_nodes()`.
-        """
-        if server is None:
-            raise ValueError("server is required")
-
-        idx = int(namespace_index)
-
-        async def _get_server_parent() -> Any:
-            if parent is not None:
-                return parent
-            try:
-                srv_node = getattr(getattr(server, "nodes", None), "server", None)
-                if srv_node is not None:
-                    return srv_node
-            except Exception:
-                pass
-            return await server.nodes.objects.get_child(["0:Server"])
-
-        async def _get_or_add_object(parent_node: Any, name: str) -> Any:
-            qn = f"{idx}:{name}"
-            try:
-                return await parent_node.get_child([qn])
-            except Exception:
-                return await parent_node.add_object(idx, name)
-
-        async def _get_or_add_variable(parent_node: Any, name: str, initial_value: ua.Variant) -> Any:
-            qn = f"{idx}:{name}"
-            try:
-                return await parent_node.get_child([qn])
-            except Exception:
-                return await parent_node.add_variable(idx, name, initial_value)
-
-        server_parent = await _get_server_parent()
-        history_obj = await _get_or_add_object(server_parent, "History")
-        metrics_obj = await _get_or_add_object(history_obj, "HistoryMetrics")
-
-        nodes: Dict[str, Any] = {}
-        for metric_path, value in self._flatten_metrics(self.get_performance_metrics()).items():
-            node_name = self._metric_node_name(metric_path)
-            nodes[metric_path] = await _get_or_add_variable(
-                metrics_obj,
-                node_name,
-                self._metric_variant(value),
+            self._settings = StorageSettings(
+                connection=self._settings.connection.with_overrides(decrypted),
+                timeouts=self._settings.timeouts,
+                keepalive=self._settings.keepalive,
+                write=self._settings.write,
+                cache=self._settings.cache,
+                global_retention_period=self._settings.global_retention_period,
             )
+            self._build_components()
+        except Exception as exc:
+            self.logger.error("Конфигурация не обновлена: %s", exc)
+            return False
+        self.logger.info("Конфигурация подключения обновлена")
+        return True
 
-        self._opcua_history_metrics_nodes = nodes
-        self._opcua_history_metrics_namespace_index = idx
-        self._opcua_history_metrics_parent = server_parent
-
-        await self.refresh_history_metrics_nodes()
-
-    async def refresh_history_metrics_nodes(self) -> None:
-        """
-        Обновляет OPC UA переменные метрик, если они были экспонированы.
-        """
-        if not self._opcua_history_metrics_nodes:
-            return
-
-        try:
-            flattened = self._flatten_metrics(self.get_performance_metrics())
-            for metric_path, value in flattened.items():
-                node = self._opcua_history_metrics_nodes.get(metric_path)
-                if node is None:
-                    continue
-                try:
-                    await node.write_value(self._metric_variant(value))
-                except Exception:
-                    continue
-        except Exception:
-            return
-
-    def _build_pool_params(self) -> dict:
-        pool_params = {
-            'user': self._conn_params['user'],
-            'password': self._conn_params['password'],
-            'database': self._conn_params['database'],
-            'host': self._conn_params['host'],
-            'port': self._conn_params['port'],
-            'min_size': self._min_size,
-            'max_size': self._max_size,
-            # Ограничение установки каждого соединения; общий бюджет create_pool
-            # задаётся отдельно в _create_pool_with_timeout
-            'timeout': self._db_pool_create_timeout_sec,
-            'command_timeout': self._effective_command_timeout_sec(),
-            'init': self._configure_connection,
+    def get_connection_info(self) -> dict:
+        connection = self._settings.connection
+        return {
+            "user": connection.user,
+            "host": connection.host,
+            "port": connection.port,
+            "database": connection.database,
+            "schema": connection.schema,
+            "min_size": connection.min_size,
+            "max_size": connection.max_size,
+            "initialized": self._initialized,
         }
 
-        exclude_params = {'user', 'password', 'database', 'host', 'port', 'min_size', 'max_size', 'sslmode', 'schema'}
-        for key, value in self._conn_params.items():
-            if key not in exclude_params:
-                pool_params[key] = value
+    # ================================================================== жизненный цикл
 
-        if self._conn_params.get('sslmode') == 'disable':
-            pool_params['ssl'] = False
-        elif self._conn_params.get('sslmode') in ('require', 'verify-ca', 'verify-full'):
-            pool_params['ssl'] = True
-
-        server_settings = dict(pool_params.get('server_settings') or {})
-        if self._db_application_name:
-            server_settings['application_name'] = self._db_application_name
-        if server_settings:
-            pool_params['server_settings'] = server_settings
-
-        return pool_params
-
-    async def _configure_connection(self, conn: asyncpg.Connection) -> None:
-        """
-        Включает TCP keepalive на сокете соединения.
-
-        Прикладных таймаутов недостаточно: если сокет к БД умер молча, отмена
-        зависшего запроса сама уходит в тот же мёртвый сокет (asyncpg шлёт ROLLBACK
-        при выходе из транзакции), и ожидание не заканчивается никогда. Обрыв должен
-        обнаруживаться на уровне ОС, а не приложения.
-        """
-        if self._db_tcp_keepalive_idle_sec <= 0:
-            return
+    async def init(self) -> None:
+        """Подключиться к БД, привести схему к нужному виду, запустить запись."""
         try:
-            sock = conn._transport.get_extra_info("socket")
-            if sock is None or sock.family not in (socket.AF_INET, socket.AF_INET6):
-                return
+            await self._db.start()
+            if not self._initialized:
+                await self._terminate_stale_backends()
+                await self._bootstrap.ensure_core_schema(self._settings.global_retention_period)
+                self._initialized = True
 
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            for opt_name, value in (
-                ("TCP_KEEPIDLE", self._db_tcp_keepalive_idle_sec),
-                ("TCP_KEEPINTVL", self._db_tcp_keepalive_interval_sec),
-                ("TCP_KEEPCNT", self._db_tcp_keepalive_count),
-            ):
-                opt = getattr(socket, opt_name, None)
-                if opt is not None:
-                    sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+            if self._events_mode != StorageMode.LEGACY:
+                await self._init_event_search()
 
-            # TCP_USER_TIMEOUT ограничивает время неподтверждённой отправки и потому
-            # ловит обрыв даже посреди активной записи, когда keepalive не работает.
-            user_timeout = getattr(socket, "TCP_USER_TIMEOUT", None)
-            if user_timeout is not None and self._db_tcp_user_timeout_sec > 0:
-                sock.setsockopt(
-                    socket.IPPROTO_TCP,
-                    user_timeout,
-                    int(self._db_tcp_user_timeout_sec * 1000),
-                )
-        except Exception as e:
-            # Настройка сокета не должна мешать работе с БД
-            self.logger.warning("Failed to set TCP keepalive on database socket: %r", e)
+            if self._settings.cache.metadata_enabled:
+                await self._load_metadata_cache()
 
-    @staticmethod
-    def _is_pool_open(pool: Optional[asyncpg.Pool]) -> bool:
-        return pool is not None and not pool._closed and not getattr(pool, "_closing", False)
+            if self._settings.write.batch_enabled:
+                self._start_buffers()
 
-    def _effective_command_timeout_sec(self) -> Optional[float]:
-        """
-        command_timeout пула не должен быть короче бюджета флаша: иначе asyncpg
-        оборвёт INSERT раньше прикладного history_flush_timeout_sec.
-        """
-        candidates = [
-            value
-            for value in (self._db_command_timeout_sec, self._history_flush_timeout_sec)
-            if value is not None and float(value) > 0
-        ]
-        return max(candidates) if candidates else None
+            if self._settings.cache.last_values_enabled:
+                await self._load_last_values_cache()
 
-    def _flush_op_timeout_sec(self) -> Optional[float]:
-        if self._history_flush_timeout_sec > 0:
-            return float(self._history_flush_timeout_sec)
-        return self._db_query_timeout_sec
-
-    def _buffer_flush_timeout_sec(self) -> float:
-        """Внешний потолок буфера: две попытки флаша плюс ожидание замка реконнекта."""
-        flush = self._history_flush_timeout_sec
-        if flush <= 0:
-            return 0.0
-        return 2.0 * flush + float(self._db_lock_wait_timeout_sec)
-
-    def _terminate_connection(self, conn: Any) -> None:
-        if conn is None:
-            return
-        try:
-            conn.terminate()
-        except Exception as e:
-            self.logger.warning("Failed to terminate PostgreSQL connection after failed flush: %r", e)
-
-    @asynccontextmanager
-    async def _flush_on_connection(self, pool: asyncpg.Pool):
-        """
-        Соединение для флаша: при таймауте/отмене рвём сокет, а не ждём ROLLBACK
-        на уже закрытом коннекте (asyncpg: cannot call Transaction.__aexit__).
-        """
-        timeout = self._flush_op_timeout_sec()
-        conn = await pool.acquire(timeout=timeout)
-        terminated = False
-        transaction = conn.transaction()
-        try:
-            await transaction.start()
-            try:
-                yield conn
-                await transaction.commit()
-            except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError):
-                terminated = True
-                self._terminate_connection(conn)
-                raise
-            except Exception:
-                try:
-                    await transaction.rollback()
-                except Exception as rollback_err:
-                    self.logger.warning(
-                        "Rollback after failed flush failed: %r; terminating connection",
-                        rollback_err,
-                    )
-                    terminated = True
-                    self._terminate_connection(conn)
-                raise
-        finally:
-            if not terminated:
-                try:
-                    await pool.release(conn)
-                except Exception as e:
-                    self.logger.warning("Failed to release PostgreSQL connection after flush: %r", e)
-                    self._terminate_connection(conn)
-
-    async def _run_db_operation(
-        self,
-        awaitable: Any,
-        operation: str,
-        *,
-        timeout: Optional[float] = None,
-        layer: str = "query",
-    ) -> Any:
-        if timeout is None:
-            timeout = self._db_query_timeout_sec
-        try:
-            if timeout is None or timeout <= 0:
-                return await awaitable
-            return await asyncio.wait_for(awaitable, timeout=timeout)
-        except asyncio.TimeoutError as e:
-            self._perf_inc("db_operation_timeouts_total")
-            if str(e).strip():
-                self.logger.error("PostgreSQL %s timed out: %s", operation, e)
-                raise
-            self.logger.error(
-                "PostgreSQL %s timed out after %.1f seconds (layer=%s)",
-                operation,
-                timeout,
-                layer,
-            )
-            raise TimeoutError(
-                f"{operation} timed out after {timeout:.1f}s (layer={layer})"
-            ) from None
-
-    async def _close_pool_with_timeout(self, pool: Optional[asyncpg.Pool], reason: str) -> None:
-        if pool is None:
-            return
-        try:
-            await asyncio.wait_for(pool.close(), timeout=self._db_pool_close_timeout_sec)
-        except asyncio.TimeoutError:
-            self.logger.warning(
-                "Timed out closing PostgreSQL pool during %s after %.1f seconds; terminating connections",
-                reason,
-                self._db_pool_close_timeout_sec,
-            )
-            pool.terminate()
-        except Exception as e:
-            self.logger.warning("Error closing PostgreSQL pool during %s: %r", reason, e, exc_info=True)
-
-    @asynccontextmanager
-    async def _bounded_lock(self, lock: asyncio.Lock, what: str):
-        """
-        Захват замка с ограничением по времени. Без него ожидание замка,
-        удерживаемого зависшим реконнектом, не заканчивается никогда, а наружу
-        это выглядит как «историзация молча перестала писать».
-        """
-        try:
-            async with asyncio.timeout(self._db_lock_wait_timeout_sec):
-                await lock.acquire()
-        except TimeoutError:
-            self._perf_inc("db_pool_wait_timeouts_total")
-            self.logger.error(
-                "Timed out after %.1fs waiting for %s; database operation aborted",
-                self._db_lock_wait_timeout_sec,
-                what,
-            )
-            raise
-        try:
-            yield
-        finally:
-            lock.release()
-
-    async def _create_pool_with_timeout(self, reason: str) -> asyncpg.Pool:
-        pool_params = self._build_pool_params()
-        try:
-            async with asyncio.timeout(self._db_pool_create_timeout_sec):
-                return await asyncpg.create_pool(**pool_params)
-        except TimeoutError:
-            self._perf_inc("db_pool_wait_timeouts_total")
-            self.logger.error(
-                "Timed out after %.1fs creating PostgreSQL pool during %s",
-                self._db_pool_create_timeout_sec,
-                reason,
-            )
+            self._supervisor.start()
+            await self.refresh_history_settings_nodes()
+            self.logger.info("Историзация запущена (схема %s)", self._schema)
+        except Exception as exc:
+            self.logger.error("Историзация не запущена: %s", exc)
             raise
 
-    async def _ensure_pool(self) -> None:
-        """
-        Гарантирует наличие рабочего пула соединений.
-
-        Пул считается непригодным, если он закрыт или находится в процессе закрытия.
-        """
-        if self._stopping:
-            raise RuntimeError("HistoryTimescale is stopping")
-        if self._is_pool_open(self._pool):
+    async def _init_event_search(self) -> None:
+        migrator = SqlMigrator(self._db, self._schema, logger=self.logger)
+        await migrator.apply_all()
+        self._v2_ready = await migrator.detect_v2_ready()
+        if not self._v2_ready:
+            self.logger.warning("Слой поиска событий не готов: события пишутся по-старому")
             return
-        if self._reconnect_lock.locked():
-            async with self._bounded_lock(self._reconnect_lock, "reconnect lock"):
-                pass
-            if self._is_pool_open(self._pool):
-                return
-        async with self._bounded_lock(self._pool_lock, "pool lock"):
-            if self._is_pool_open(self._pool):
-                return
-            self._pool = await self._create_pool_with_timeout("ensure_pool")
-            self.logger.info("Connection pool created")
+        self._event_tables = TypedEventTables(
+            self._db, self._schema, self._events_config, logger=self.logger
+        )
+        self._event_registry = EventSchemaRegistry(
+            self._db, self._schema, self._event_tables, logger=self.logger
+        )
+        self._event_search = EventSearchStore(
+            self._db,
+            self._schema,
+            self._events,
+            self._event_tables,
+            self._event_registry,
+            logger=self.logger,
+        )
+        self.logger.info("Поиск событий включён (режим %s)", self._events_mode.value)
 
-    async def _is_pool_healthy(self) -> bool:
-        try:
-            await self._ensure_pool()
-            async def _op() -> Any:
-                async with self._pool.acquire(timeout=self._db_query_timeout_sec) as conn:
-                    return await conn.fetchval('SELECT 1', timeout=self._db_query_timeout_sec)
-            val = await self._run_db_operation(_op(), "healthcheck")
-            return val == 1
-        except Exception as e:
-            # Логируем технические детали неудачной проверки соединения с PostgreSQL
-            conn_params = getattr(self, "_conn_params", {}) or {}
-            self.logger.debug(
-                "PostgreSQL healthcheck failed (db=%s, user=%s, host=%s, port=%s): %r",
-                conn_params.get("database"),
-                conn_params.get("user"),
-                conn_params.get("host"),
-                conn_params.get("port"),
-                e,
+    def _start_buffers(self) -> None:
+        write = self._settings.write
+        timeouts = self._settings.timeouts
+        if self._value_buffer is None:
+            self._value_buffer = HistoryWriteBuffer(
+                "variables",
+                self._flush_values,
+                self._metrics.variables.buffer,
+                max_batch_size=write.max_batch_size,
+                max_batch_interval_sec=write.max_batch_interval_sec,
+                queue_max_size=write.queue_max_size,
+                durability_mode=write.durability_mode,
+                flush_timeout_sec=timeouts.buffer_flush_sec,
+                stall_timeout_sec=timeouts.worker_stall_sec,
+                logger=self.logger,
             )
-            return False
+            self._value_buffer.start()
+        if self._event_buffer is None:
+            self._event_buffer = HistoryWriteBuffer(
+                "events",
+                self._flush_events,
+                self._metrics.events.buffer,
+                max_batch_size=write.max_batch_size,
+                max_batch_interval_sec=write.max_batch_interval_sec,
+                queue_max_size=write.queue_max_size,
+                durability_mode=write.durability_mode,
+                flush_timeout_sec=timeouts.buffer_flush_sec,
+                stall_timeout_sec=timeouts.worker_stall_sec,
+                logger=self.logger,
+            )
+            self._event_buffer.start()
 
-    async def _reconnect_monitor(self) -> None:
-        """
-        Фоновый монитор состояния подключения к PostgreSQL.
-
-        Периодически выполняет healthcheck и при необходимости вызывает _force_reconnect.
-        Все неожиданные ошибки внутри цикла логируются, чтобы корутина не «исчезала» тихо.
-        """
-        delay = self._reconnect_min_delay
-        while not self._stop_event.is_set():
+    async def _stop_buffers(self) -> None:
+        for buffer in (self._value_buffer, self._event_buffer):
+            if buffer is None:
+                continue
             try:
-                healthy = await self._is_pool_healthy()
-                if healthy:
-                    if not self._was_healthy:
-                        # Соединение с PostgreSQL восстановлено
-                        now = datetime.now(timezone.utc)
-                        conn_params = getattr(self, "_conn_params", {}) or {}
-                        if self._db_unavailable_since is not None:
-                            outage = now - self._db_unavailable_since
-                            self.logger.info(
-                                "PostgreSQL connection restored (db=%s, user=%s, host=%s, port=%s) "
-                                "after %.1f seconds of unavailability",
-                                conn_params.get("database"),
-                                conn_params.get("user"),
-                                conn_params.get("host"),
-                                conn_params.get("port"),
-                                outage.total_seconds(),
-                            )
-                        else:
-                            self.logger.info(
-                                "PostgreSQL connection restored (db=%s, user=%s, host=%s, port=%s)",
-                                conn_params.get("database"),
-                                conn_params.get("user"),
-                                conn_params.get("host"),
-                                conn_params.get("port"),
-                            )
-                        self._was_healthy = True
-                        self._reset_outage_stats()
-                        # Сбрасываем таймер аггрегированного логирования реконнекта
-                        self._last_reconnect_outage_log_at = None
-                    delay = self._reconnect_min_delay
-                    try:
-                        await asyncio.wait_for(self._stop_event.wait(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        pass
-                    continue
-
-                # Соединение нездорово — начинаем или продолжаем попытки реконнекта
-                now = datetime.now(timezone.utc)
-                conn_params = getattr(self, "_conn_params", {}) or {}
-                # Фиксируем момент начала недоступности, если ещё не зафиксирован
-                if self._db_unavailable_since is None:
-                    self._db_unavailable_since = now
-
-                if self._was_healthy:
-                    # Первый переход в состояние недоступности
-                    self.logger.error(
-                        "PostgreSQL became unreachable (db=%s, user=%s, host=%s, port=%s). "
-                        "Starting reconnect attempts.",
-                        conn_params.get("database"),
-                        conn_params.get("user"),
-                        conn_params.get("host"),
-                        conn_params.get("port"),
-                    )
-                else:
-                    self.logger.warning(
-                        "PostgreSQL is still unhealthy, will continue reconnect attempts "
-                        "(db=%s, host=%s, port=%s).",
-                        conn_params.get("database"),
-                        conn_params.get("host"),
-                        conn_params.get("port"),
-                    )
-                self._was_healthy = False
-                # Периодическое агрегированное сообщение о длительной недоступности PostgreSQL
-                if self._db_unavailable_since is not None:
-                    outage = now - self._db_unavailable_since
-                    if outage >= timedelta(minutes=1):
-                        if (
-                            self._last_reconnect_outage_log_at is None
-                            or (now - self._last_reconnect_outage_log_at) >= timedelta(minutes=1)
-                        ):
-                            self._last_reconnect_outage_log_at = now
-                            self.logger.error(
-                                "PostgreSQL has been unreachable for %.1f seconds "
-                                "(db=%s, user=%s, host=%s, port=%s). Reconnect attempts continue.",
-                                outage.total_seconds(),
-                                conn_params.get("database"),
-                                conn_params.get("user"),
-                                conn_params.get("host"),
-                                conn_params.get("port"),
-                            )
-
-                try:
-                    await self._force_reconnect(self._pool)
-                    self.logger.info("Reconnected to database successfully")
-                    delay = self._reconnect_min_delay
-                except Exception as e:
-                    # _force_reconnect уже залогировал critical, здесь фиксируем, что монитор продолжает попытки
-                    self.logger.error(f"Reconnect attempt failed in monitor: {e}")
-                    jitter = random.uniform(0, 0.3 * delay)
-                    await asyncio.sleep(delay + jitter)
-                    delay = min(delay * 2, self._reconnect_max_delay)
-            except asyncio.CancelledError:
-                # Нормальное завершение по stop()
-                break
-            except Exception as e:
-                # Любая неожиданная ошибка внутри монитора — логируем и продолжаем,
-                # чтобы корутина не завершилась тихо.
-                self.logger.error("Reconnect monitor unexpected error: %r", e, exc_info=True)
-                jitter = random.uniform(0, 0.3 * delay)
-                await asyncio.sleep(delay + jitter)
-
-    def _log_connection_restored_if_needed(self) -> None:
-        """
-        Фиксирует в логе восстановление подключения к PostgreSQL,
-        если ранее оно считалось недоступным.
-
-        Этот метод вызывается на пути успешного выполнения произвольного SQL‑запроса,
-        чтобы гарантировать появление сообщения «соединение восстановлено» даже
-        если это произошло не через фоновый монитор реконнекта.
-        """
-        if self._was_healthy:
-            return
-
-        now = datetime.now(timezone.utc)
-        conn_params = getattr(self, "_conn_params", {}) or {}
-
-        if self._db_unavailable_since is not None:
-            outage = now - self._db_unavailable_since
-            self.logger.info(
-                "PostgreSQL connection restored via successful query "
-                "(db=%s, user=%s, host=%s, port=%s) after %.1f seconds of unavailability",
-                conn_params.get("database"),
-                conn_params.get("user"),
-                conn_params.get("host"),
-                conn_params.get("port"),
-                outage.total_seconds(),
-            )
-        else:
-            self.logger.info(
-                "PostgreSQL connection restored via successful query "
-                "(db=%s, user=%s, host=%s, port=%s)",
-                conn_params.get("database"),
-                conn_params.get("user"),
-                conn_params.get("host"),
-                conn_params.get("port"),
-            )
-
-        self._was_healthy = True
-        self._reset_outage_stats()
-
-    def _reset_outage_stats(self) -> None:
-        if self._failed_value_saves_counter or self._failed_event_saves_counter:
-            self.logger.info(
-                f"During outage suppressed failures: values={self._failed_value_saves_counter}, events={self._failed_event_saves_counter}"
-            )
-        self._db_unavailable_since = None
-        self._last_throttled_log_at = None
-        self._last_reconnect_outage_log_at = None
-        self._failed_value_saves_counter = 0
-        self._failed_event_saves_counter = 0
-
-    def _log_save_failure_throttled(self, kind: str, node_repr: str, error: Exception, datavalue_repr: str = None) -> None:
-        now = datetime.now(timezone.utc)
-        if self._db_unavailable_since is None:
-            self._db_unavailable_since = now
-        if kind == 'value':
-            self._failed_value_saves_counter += 1
-            count = self._failed_value_saves_counter
-        else:
-            self._failed_event_saves_counter += 1
-            count = self._failed_event_saves_counter
-
-        elapsed = now - self._db_unavailable_since
-        if elapsed < timedelta(minutes=10):
-            # Полная детализация в первые 10 минут
-            if datavalue_repr is not None:
-                self.logger.error(f"Failed to save {kind} for {node_repr}: {error} \n {datavalue_repr}")
-            else:
-                self.logger.error(f"Failed to save {kind} for {node_repr}: {error}")
-            return
-
-        # После 10 минут — не чаще 1 раза в 10 секунд, с агрегацией
-        if self._last_throttled_log_at is None or (now - self._last_throttled_log_at) >= timedelta(seconds=10):
-            self._last_throttled_log_at = now
-            self.logger.error(
-                f"Database still unavailable. Aggregated {kind} save failures: {count}. Latest error: {error}"
-            )
-            # Сбрасываем только соответствующий счётчик, чтобы считать новый интервал
-            if kind == 'value':
-                self._failed_value_saves_counter = 0
-            else:
-                self._failed_event_saves_counter = 0
+                await buffer.stop()
+            except Exception as exc:
+                self.logger.warning("Буфер записи остановлен с ошибкой: %r", exc)
+        self._value_buffer = None
+        self._event_buffer = None
 
     async def stop(self) -> None:
-        """Остановка и закрытие пула соединений."""
-        self._stop_event.set()
-        for buffer in (self._value_write_buffer, self._event_write_buffer):
-            if buffer is not None:
-                try:
-                    await buffer.stop()
-                except Exception as e:
-                    self.logger.warning("Error stopping history write buffer: %r", e, exc_info=True)
-        self._value_write_buffer = None
-        self._event_write_buffer = None
-        self._stopping = True
+        """Дописать очереди, остановить надзор и закрыть пул."""
+        await self._stop_buffers()
+        await self._supervisor.stop()
+        await self._db.stop()
+        self.logger.info("Историзация остановлена")
 
-        if self._reconnect_task and not self._reconnect_task.done():
-            try:
-                await asyncio.wait_for(self._reconnect_task, timeout=self._db_pool_close_timeout_sec)
-            except asyncio.TimeoutError:
-                self.logger.warning(
-                    "Timed out stopping PostgreSQL reconnect monitor after %.1f seconds; cancelling it",
-                    self._db_pool_close_timeout_sec,
-                )
-                self._reconnect_task.cancel()
-                try:
-                    await self._reconnect_task
-                except asyncio.CancelledError:
-                    pass
-            except Exception:
-                pass
-        self._reconnect_task = None
-        if self._pool:
-            pool = self._pool
-            self._pool = None
-            await self._close_pool_with_timeout(pool, "stop")
-        self.logger.info("HistoryTimescale stopped")
-
-    async def _execute(self, query: str, *args) -> Any:
-        """
-        Выполнение SQL запроса.
-        
-        Args:
-            query: SQL запрос
-            *args: Аргументы для запроса
-            
-        Returns:
-            Результат выполнения запроса
-        """
-        await self._ensure_pool()
-        failed_pool = self._pool
-        try:
-            async def _op() -> Any:
-                async with failed_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
-                    return await conn.execute(query, *args, timeout=self._db_query_timeout_sec)
-            result = await self._run_db_operation(_op(), "execute")
-            self._log_connection_restored_if_needed()
-            return result
-        except Exception as e:
-            if isinstance(e, asyncio.TimeoutError):
-                self.logger.error(f"Execute timed out, will reconnect without retrying: {e}")
-                await self._force_reconnect(failed_pool)
-                raise
-            # Ошибка выполнения запроса или проблемы с соединением — логируем как error
-            self.logger.error(f"Execute failed, will try to reconnect and retry: {e}")
-            # Попытка принудительного переподключения; при неудаче _force_reconnect сам залогирует critical и выбросит исключение
-            await self._force_reconnect(failed_pool)
-            # Вторая попытка выполнения запроса
-            try:
-                retry_pool = self._pool
-                async def _op_retry() -> Any:
-                    async with retry_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
-                        return await conn.execute(query, *args, timeout=self._db_query_timeout_sec)
-                result = await self._run_db_operation(_op_retry(), "execute retry")
-                self._log_connection_restored_if_needed()
-                return result
-            except Exception as e2:
-                # Ошибка выполнения SQL после переподключения — тоже error
-                self.logger.error(f"Execute failed after reconnect: {e2}")
-                raise
-
-    async def _fetch(self, query: str, *args) -> List[asyncpg.Record]:
-        """
-        Выполнение SQL запроса с возвратом результатов.
-        
-        Args:
-            query: SQL запрос
-            *args: Аргументы для запроса
-            
-        Returns:
-            Список записей
-        """
-        await self._ensure_pool()
-        failed_pool = self._pool
-        try:
-            async def _op() -> Any:
-                async with failed_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
-                    return await conn.fetch(query, *args, timeout=self._db_query_timeout_sec)
-            rows = await self._run_db_operation(_op(), "fetch")
-            self._log_connection_restored_if_needed()
-            return rows
-        except Exception as e:
-            if isinstance(e, asyncio.TimeoutError):
-                self.logger.error(f"Fetch timed out, will reconnect without retrying: {e}")
-                await self._force_reconnect(failed_pool)
-                raise
-            self.logger.error(f"Fetch failed, will try to reconnect and retry: {e}")
-            await self._force_reconnect(failed_pool)
-            try:
-                retry_pool = self._pool
-                async def _op_retry() -> Any:
-                    async with retry_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
-                        return await conn.fetch(query, *args, timeout=self._db_query_timeout_sec)
-                rows = await self._run_db_operation(_op_retry(), "fetch retry")
-                self._log_connection_restored_if_needed()
-                return rows
-            except Exception as e2:
-                self.logger.error(f"Fetch failed after reconnect: {e2}")
-                raise
-
-    async def _fetchval(self, query: str, *args) -> Any:
-        """
-        Выполнение SQL запроса с возвратом одного значения.
-        
-        Args:
-            query: SQL запрос
-            *args: Аргументы для запроса
-            
-        Returns:
-            Значение
-        """
-        await self._ensure_pool()
-        failed_pool = self._pool
-        try:
-            async def _op() -> Any:
-                async with failed_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
-                    return await conn.fetchval(query, *args, timeout=self._db_query_timeout_sec)
-            value = await self._run_db_operation(_op(), "fetchval")
-            self._log_connection_restored_if_needed()
-            return value
-        except Exception as e:
-            if isinstance(e, asyncio.TimeoutError):
-                self.logger.error(f"Fetchval timed out, will reconnect without retrying: {e}")
-                await self._force_reconnect(failed_pool)
-                raise
-            self.logger.error(f"Fetchval failed, will try to reconnect and retry: {e}")
-            await self._force_reconnect(failed_pool)
-            try:
-                retry_pool = self._pool
-                async def _op_retry() -> Any:
-                    async with retry_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
-                        return await conn.fetchval(query, *args, timeout=self._db_query_timeout_sec)
-                value = await self._run_db_operation(_op_retry(), "fetchval retry")
-                self._log_connection_restored_if_needed()
-                return value
-            except Exception as e2:
-                self.logger.error(f"Fetchval failed after reconnect: {e2}")
-                raise
-
-    async def _fetchrow(self, query: str, *args) -> Optional[asyncpg.Record]:
-        """
-        Выполнение SQL запроса с возвратом одной строки.
-        
-        Args:
-            query: SQL запрос
-            *args: Аргументы для запроса
-            
-        Returns:
-            Одна строка из результата запроса или None
-        """
-        await self._ensure_pool()
-        failed_pool = self._pool
-        try:
-            async def _op() -> Any:
-                async with failed_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
-                    return await conn.fetchrow(query, *args, timeout=self._db_query_timeout_sec)
-            row = await self._run_db_operation(_op(), "fetchrow")
-            self._log_connection_restored_if_needed()
-            return row
-        except Exception as e:
-            if isinstance(e, asyncio.TimeoutError):
-                self.logger.error(f"Fetchrow timed out, will reconnect without retrying: {e}")
-                await self._force_reconnect(failed_pool)
-                raise
-            self.logger.error(f"Fetchrow failed, will try to reconnect and retry: {e}")
-            await self._force_reconnect(failed_pool)
-            try:
-                retry_pool = self._pool
-                async def _op_retry() -> Any:
-                    async with retry_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
-                        return await conn.fetchrow(query, *args, timeout=self._db_query_timeout_sec)
-                row = await self._run_db_operation(_op_retry(), "fetchrow retry")
-                self._log_connection_restored_if_needed()
-                return row
-            except Exception as e2:
-                self.logger.error(f"Fetchrow failed after reconnect: {e2}")
-                raise
-
-    async def _force_reconnect(self, failed_pool: Optional[asyncpg.Pool] = None) -> None:
-        """
-        Полное пересоздание пула соединений.
-
-        Старый пул закрывается синхронно, чтобы избежать гонок состояний
-        внутри asyncpg (ошибки вида «another operation is in progress»).
-        """
-        async with self._bounded_lock(self._reconnect_lock, "reconnect lock (force_reconnect)"):
-            if self._stopping:
-                raise RuntimeError("HistoryTimescale is stopping")
-            old_pool: Optional[asyncpg.Pool] = None
-            async with self._bounded_lock(self._pool_lock, "pool lock (force_reconnect)"):
-                try:
-                    if (
-                        failed_pool is not None
-                        and self._pool is not failed_pool
-                        and self._is_pool_open(self._pool)
-                    ):
-                        self._perf_inc("db_reconnect_skipped_total")
-                        self.logger.warning(
-                            "Skipping PostgreSQL reconnect: pool was already replaced"
-                        )
-                        return
-                    if self._pool:
-                        old_pool = self._pool
-                    # Обнуляем ссылку на пул: новые операции дождутся завершения реконнекта
-                    # в _ensure_pool и не создадут конкурирующий пул.
-                    self._pool = None
-                except Exception as e:
-                    self.logger.error("Error while preparing to recreate pool: %r", e, exc_info=True)
-                    raise
-
-            # Закрываем старый пул уже вне блокировки, но синхронно
-            if old_pool is not None:
-                await self._close_pool_with_timeout(old_pool, "reconnect")
-
-            # Создаём новый пул под блокировкой, без использования _ensure_pool,
-            # чтобы избежать рекурсивного захвата замка.
-            async with self._bounded_lock(self._pool_lock, "pool lock (recreate)"):
-                try:
-                    self._pool = await self._create_pool_with_timeout("force_reconnect")
-                    self._perf_inc("db_reconnects_total")
-                    self.logger.info("Connection pool recreated successfully after failure")
-                except Exception as e:
-                    # Невозможно восстановить подключение к БД — критический уровень и проброс исключения наверх
-                    self.logger.critical(f"Force reconnect failed, database remains unavailable: {e}")
-                    raise
+    async def close(self) -> None:
+        """Остановить запись и закрыть пул (без остановки надзора, как в 0.2.15)."""
+        await self._stop_buffers()
+        await self._supervisor.stop()
+        await self._db.stop()
 
     async def _terminate_stale_backends(self) -> None:
-        """
-        Снимает чужие сессии с тем же application_name.
+        """Снять зависшие сессии своего же приложения.
 
-        Нужно после SIGKILL контейнера: старый backend может держать INSERT
-        часами и блокировать CREATE INDEX / новые записи. Своё соединение
-        и сессии других приложений не трогаем.
+        После SIGKILL контейнера старый backend может часами держать INSERT и
+        блокировать CREATE INDEX и новые записи. Отличаем свои сессии по
+        application_name; своё соединение и чужие приложения не трогаем.
         """
-        app_name = self._db_application_name
-        if not app_name:
-            return
+        app_name = self._settings.connection.application_name
         try:
-            rows = await self._fetch(
+            rows = await self._db.fetch(
                 """
-                SELECT pid
-                FROM pg_stat_activity
+                SELECT pid FROM pg_stat_activity
                 WHERE application_name = $1
                   AND pid <> pg_backend_pid()
                   AND datname = current_database()
                 """,
                 app_name,
             )
-        except Exception as e:
-            self.logger.warning("Failed to list stale PostgreSQL backends: %s", e)
+        except Exception as exc:
+            self.logger.warning("Список зависших сессий не получен: %s", exc)
             return
+
+        # Собственные соединения пула тоже носят это имя — их не трогаем.
+        own = await self._own_backend_pids()
         for row in rows:
             pid = row["pid"]
+            if pid in own:
+                continue
             try:
-                await self._execute("SELECT pg_terminate_backend($1)", pid)
-                self.logger.warning(
-                    "Terminated stale PostgreSQL backend pid=%s application_name=%s",
-                    pid,
-                    app_name,
-                )
-            except Exception as e:
-                self.logger.warning(
-                    "Failed to terminate stale PostgreSQL backend pid=%s: %s",
-                    pid,
-                    e,
-                )
+                await self._db.execute("SELECT pg_terminate_backend($1)", pid)
+                self.logger.warning("Снята зависшая сессия pid=%s (%s)", pid, app_name)
+            except Exception as exc:
+                self.logger.warning("Сессию pid=%s снять не удалось: %s", pid, exc)
 
-    async def _index_exists(self, index_name: str) -> bool:
-        val = await self._fetchval(
-            """
-            SELECT 1
-            FROM pg_indexes
-            WHERE schemaname = $1 AND indexname = $2
-            """,
-            self._schema,
-            index_name,
-        )
-        return val is not None
-
-    async def _ensure_index(self, index_name: str, sql: str) -> None:
-        """
-        Создаёт индекс только если его ещё нет. CREATE INDEX IF NOT EXISTS
-        на горячей таблице всё равно ждёт AccessExclusive/ShareLock за живым
-        INSERT и блокирует новые записи. Таймаут или lock на старте не валят процесс.
-        """
+    async def _own_backend_pids(self) -> set:
         try:
-            if await self._index_exists(index_name):
-                return
-            await self._execute(sql)
-        except (asyncio.TimeoutError, TimeoutError) as e:
-            self.logger.warning(
-                "Skipping missing index %s during startup after timeout: %s",
-                index_name,
-                e,
-            )
-        except Exception as e:
-            self.logger.warning(
-                "Skipping missing index %s during startup: %s",
-                index_name,
-                e,
-            )
+            pool = self._db._pool
+            if pool is None:
+                return set()
+            pids = set()
+            for holder in getattr(pool, "_holders", []):
+                connection = getattr(holder, "_con", None)
+                if connection is not None and not connection.is_closed():
+                    pids.add(connection.get_server_pid())
+            return pids
+        except Exception:
+            return set()
 
-    async def _create_metadata_tables(self) -> None:
-        """Создание единых таблиц для историзации в указанной схеме."""
+    async def _load_metadata_cache(self) -> None:
         try:
-            # Создаем схему если она не существует
-            await self._execute(f'CREATE SCHEMA IF NOT EXISTS "{self._schema}"')
-            
-                        # Единая таблица для всех переменных
-            await self._execute(f'''
-                CREATE TABLE IF NOT EXISTS "{self._schema}".variables_history (
-                    id BIGSERIAL,
-                    variable_id BIGINT NOT NULL,
-                    servertimestamp TIMESTAMPTZ NOT NULL,
-                    sourcetimestamp TIMESTAMPTZ NOT NULL,
-                    statuscode INTEGER,
-                    value TEXT,
-                    varianttype INTEGER,
-                    variantbinary BYTEA,
-                    created_at TIMESTAMPTZ DEFAULT NOW()
-                )
-            ''')
+            limit = max(1, self._settings.cache.metadata_init_max_rows)
+            mapping = await self._variables.load_metadata_cache(limit)
+            self._caches.variables.update(mapping)
+            self.logger.info("Кэш метаданных: %d переменных (лимит %d)", len(mapping), limit)
+        except Exception as exc:
+            self.logger.error("Кэш метаданных не загружен: %s", exc)
 
-            # Единая таблица для всех событий
-            await self._execute(f'''
-                CREATE TABLE IF NOT EXISTS "{self._schema}".events_history (
-                    id BIGSERIAL,
-                    source_id BIGINT NOT NULL,
-                    event_type_id BIGINT NOT NULL,
-                    event_timestamp TIMESTAMPTZ NOT NULL,
-                    event_data JSONB,
-                    created_at TIMESTAMPTZ DEFAULT NOW()
-                )
-            ''')
-
-            # Таблица метаданных переменных
-            await self._execute(f'''
-                CREATE TABLE IF NOT EXISTS "{self._schema}".variable_metadata (
-                    id BIGSERIAL PRIMARY KEY,
-                    variable_id BIGINT GENERATED ALWAYS AS (id) STORED,
-                    node_id TEXT NOT NULL,
-                    data_type TEXT,
-                    retention_period INTERVAL,
-                    max_records INTEGER,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ DEFAULT NOW(),
-                    UNIQUE(variable_id)
-                )
-            ''')
-
-            # Таблица источников событий
-            await self._execute(f'''
-                CREATE TABLE IF NOT EXISTS "{self._schema}".event_sources (
-                    id BIGSERIAL PRIMARY KEY,
-                    source_id BIGINT GENERATED ALWAYS AS (id) STORED,
-                    source_node_id TEXT NOT NULL,
-                    retention_period INTERVAL,
-                    max_records INTEGER,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ DEFAULT NOW(),
-                    UNIQUE(source_id)
-                )
-            ''')
-
-            # Таблица типов событий
-            await self._execute(f'''
-                CREATE TABLE IF NOT EXISTS "{self._schema}".event_types (
-                    id BIGSERIAL PRIMARY KEY,
-                    event_type_id BIGINT GENERATED ALWAYS AS (id) STORED,
-                    event_type_name TEXT NOT NULL,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ DEFAULT NOW(),
-                    UNIQUE(event_type_id)
-                )
-            ''')
-            
-            # Таблица кэша последних значений переменных.
-            # Инвариант: для каждой зарегистрированной переменной здесь есть строка
-            # (см. seed_last_values) — чтение последних значений не обращается к истории.
-            # is_seed=TRUE — строка-дефолт, ещё не сверенная с историей
-            # (снимается реальной записью значения или backfill_last_values).
-            await self._execute(f'''
-                CREATE TABLE IF NOT EXISTS "{self._schema}".variables_last_value (
-                    variable_id BIGINT PRIMARY KEY,
-                    sourcetimestamp TIMESTAMPTZ NOT NULL,
-                    servertimestamp TIMESTAMPTZ NOT NULL,
-                    statuscode INTEGER NOT NULL,
-                    varianttype INTEGER NOT NULL,
-                    variantbinary BYTEA NOT NULL,
-                    updated_at TIMESTAMPTZ DEFAULT NOW()
-                )
-            ''')
-            await self._execute(f'''
-                ALTER TABLE "{self._schema}".variables_last_value
-                ADD COLUMN IF NOT EXISTS is_seed BOOLEAN NOT NULL DEFAULT FALSE
-            ''')
-            
-            schema = self._schema
-            await self._ensure_index(
-                "idx_variables_variable_id",
-                f'CREATE INDEX idx_variables_variable_id ON "{schema}".variables_history(variable_id)',
-            )
-            await self._ensure_index(
-                "idx_variables_timestamp",
-                f'CREATE INDEX idx_variables_timestamp ON "{schema}".variables_history(sourcetimestamp)',
-            )
-            await self._ensure_index(
-                "idx_variables_server_timestamp",
-                f'CREATE INDEX idx_variables_server_timestamp ON "{schema}".variables_history(servertimestamp)',
-            )
-            await self._ensure_index(
-                "idx_variables_varid_sourcets",
-                f'CREATE UNIQUE INDEX idx_variables_varid_sourcets ON "{schema}".variables_history(variable_id, sourcetimestamp)',
-            )
-            await self._ensure_index(
-                "idx_events_source_id",
-                f'CREATE INDEX idx_events_source_id ON "{schema}".events_history(source_id)',
-            )
-            await self._ensure_index(
-                "idx_events_event_type_id",
-                f'CREATE INDEX idx_events_event_type_id ON "{schema}".events_history(event_type_id)',
-            )
-            await self._ensure_index(
-                "idx_events_timestamp",
-                f'CREATE INDEX idx_events_timestamp ON "{schema}".events_history(event_timestamp)',
-            )
-            await self._ensure_index(
-                "idx_events_data_gin",
-                f'CREATE INDEX idx_events_data_gin ON "{schema}".events_history USING GIN (event_data)',
-            )
-            await self._ensure_index(
-                "idx_events_sourceid_eventts",
-                f'CREATE UNIQUE INDEX idx_events_sourceid_eventts ON "{schema}".events_history(source_id, event_timestamp)',
-            )
-            await self._ensure_index(
-                "idx_variable_metadata_variable_id",
-                f'CREATE INDEX idx_variable_metadata_variable_id ON "{schema}".variable_metadata(variable_id)',
-            )
-            await self._ensure_index(
-                "idx_event_sources_source_id",
-                f'CREATE INDEX idx_event_sources_source_id ON "{schema}".event_sources(source_id)',
-            )
-            await self._ensure_index(
-                "idx_event_types_event_type_id",
-                f'CREATE INDEX idx_event_types_event_type_id ON "{schema}".event_types(event_type_id)',
-            )
-            await self._ensure_index(
-                "idx_event_sources_node_id",
-                f'CREATE UNIQUE INDEX idx_event_sources_node_id ON "{schema}".event_sources(source_node_id)',
-            )
-            await self._ensure_index(
-                "idx_event_types_name",
-                f'CREATE UNIQUE INDEX idx_event_types_name ON "{schema}".event_types(event_type_name)',
-            )
-            await self._ensure_index(
-                "idx_variable_metadata_node_id",
-                f'CREATE UNIQUE INDEX idx_variable_metadata_node_id ON "{schema}".variable_metadata(node_id)',
-            )
-            await self._ensure_index(
-                "idx_variables_history_variable_id_timestamp",
-                f'CREATE INDEX idx_variables_history_variable_id_timestamp ON "{schema}".variables_history(variable_id, sourcetimestamp)',
-            )
-            await self._ensure_index(
-                "idx_events_history_source_timestamp",
-                f'CREATE INDEX idx_events_history_source_timestamp ON "{schema}".events_history(source_id, event_timestamp)',
-            )
-            await self._ensure_index(
-                "idx_events_history_type_source",
-                f'CREATE INDEX idx_events_history_type_source ON "{schema}".events_history(event_type_id, source_id)',
-            )
-            await self._ensure_index(
-                "idx_events_history_event_type_source",
-                f'CREATE INDEX idx_events_history_event_type_source ON "{schema}".events_history(event_type_id, source_id)',
-            )
-            await self._ensure_index(
-                "idx_variable_metadata_created",
-                f'CREATE INDEX idx_variable_metadata_created ON "{schema}".variable_metadata(created_at)',
-            )
-            await self._ensure_index(
-                "idx_event_sources_created",
-                f'CREATE INDEX idx_event_sources_created ON "{schema}".event_sources(created_at)',
-            )
-            await self._ensure_index(
-                "idx_event_types_created",
-                f'CREATE INDEX idx_event_types_created ON "{schema}".event_types(created_at)',
-            )
-            await self._ensure_index(
-                "idx_variables_last_value_updated",
-                f'CREATE INDEX idx_variables_last_value_updated ON "{schema}".variables_last_value(updated_at)',
-            )
-            await self._ensure_index(
-                "idx_variables_history_vid_ts_desc_covering",
-                f'CREATE INDEX idx_variables_history_vid_ts_desc_covering ON "{schema}".variables_history '
-                f'(variable_id, sourcetimestamp DESC) INCLUDE (statuscode, varianttype, servertimestamp)',
-            )
-            
-            self.logger.info(f"Unified history tables created successfully in schema '{self._schema}'")
-            
-            # Настраиваем TimescaleDB hypertables после создания всех индексов
-            await self._setup_timescale_hypertable(f'{self._schema}.variables_history', 'sourcetimestamp', 'variable_id', 128)
-            await self._setup_timescale_hypertable(f'{self._schema}.events_history', 'event_timestamp', 'source_id', 64)
-
-            # Настраиваем глобальную retention policy (если задана)
-            await self._ensure_global_retention_policies()
-        except Exception as e:
-            self.logger.error(f"Failed to create unified history tables: {e}")
-            raise
-
-    async def _setup_timescale_hypertable(self, table: str, partition_column: str, space_partition_column: Optional[str] = None, space_partitions: Optional[int] = None) -> None:
-        """
-        Настройка TimescaleDB hypertable с возможностью дополнительного партиционирования.
-        
-        Args:
-            table: Имя таблицы
-            partition_column: Колонка для временного партиционирования
-            space_partition_column: Дополнительная колонка для пространственного партиционирования (TimescaleDB 2+)
-            space_partitions: Количество партиций для space-измерения (1..32767)
-        """
+    async def _load_last_values_cache(self) -> None:
         try:
-            # Проверяем, доступно ли расширение TimescaleDB
-            extension_check = await self._fetchval("SELECT COUNT(*) FROM pg_extension WHERE extname = 'timescaledb'")
-            if extension_check == 0:
-                self.logger.warning("TimescaleDB extension not found. Creating regular table without hypertable.")
-                return
-            
-            # Проверяем версию TimescaleDB
-            timescale_version = await self._fetchval("SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'")
-            if timescale_version:
-                major_version = int(timescale_version.split('.')[0])
-                if major_version >= 2 and space_partition_column:
-                    # Устанавливаем дефолт для количества партиций, если не задано
-                    partitions = space_partitions if (space_partitions and 1 <= space_partitions <= 32767) else 32
-                    await self._execute(
-                        f"SELECT create_hypertable('{table}', '{partition_column}', partitioning_column => '{space_partition_column}', number_partitions => {partitions}, if_not_exists => TRUE)"
-                    )
-                    self.logger.info(f"TimescaleDB hypertable created for table {table} with space partitioning on {space_partition_column} (number_partitions={partitions})")
-                else:
-                    # Стандартное партиционирование только по времени
-                    await self._execute(
-                        f"SELECT create_hypertable('{table}', '{partition_column}', if_not_exists => TRUE)"
-                    )
-                    self.logger.info(f"TimescaleDB hypertable created for table {table}")
-            else:
-                # Fallback для старых версий
-                await self._execute(
-                    f"SELECT create_hypertable('{table}', '{partition_column}', if_not_exists => TRUE)"
-                )
-                self.logger.info(f"TimescaleDB hypertable created for table {table}")
-        except Exception as e:
-            self.logger.warning(f"Failed to create TimescaleDB hypertable for table {table}: {e}")
-            self.logger.info("Continuing with regular table (without TimescaleDB optimization)")
+            cache = self._settings.cache
+            values = await self._variables.iter_last_values(
+                cache.last_values_init_batch_size,
+                max_bytes=cache.last_values_max_size_mb * 1024 * 1024,
+            )
+            self._caches.last_values.update(values)
+            self.logger.info("Кэш последних значений: %d значений", len(values))
+        except Exception as exc:
+            self.logger.error("Кэш последних значений не загружен: %s", exc)
 
-    def _get_effective_retention_period(self, requested: Optional[timedelta]) -> Optional[timedelta]:
-        """
-        Вычисляет эффективный retention_period для узла/источника событий.
+    # ================================================================== регистрация
 
-        Правило:
-        - если глобальный период не задан — используем requested как есть;
-        - если глобальный задан:
-          - requested is None или requested >= global → используем global;
-          - иначе → используем requested.
-        """
-        global_period = self._global_retention_period
-        if global_period is None:
+    def _effective_retention(self, requested: Optional[timedelta]) -> Optional[timedelta]:
+        """Период хранения узла не может превышать глобальный."""
+        limit = self._settings.global_retention_period
+        if limit is None:
             return requested
         if requested is None:
-            return global_period
-        try:
-            return requested if requested < global_period else global_period
-        except Exception:
-            # На всякий случай (если прилетел неожиданный тип)
-            return global_period
+            return limit
+        return requested if requested < limit else limit
 
-    async def _timescaledb_available(self) -> bool:
-        """True если расширение TimescaleDB установлено в текущей БД."""
-        try:
-            extension_check = await self._fetchval("SELECT COUNT(*) FROM pg_extension WHERE extname = 'timescaledb'")
-            return bool(extension_check and int(extension_check) > 0)
-        except Exception:
-            return False
-
-    async def _setup_retention_policy(self, table_name: str, drop_after: timedelta) -> None:
-        """
-        Идемпотентно обеспечивает наличие TimescaleDB retention policy для hypertable.
-
-        Args:
-            table_name: имя таблицы без схемы (например, 'variables_history')
-            drop_after: interval хранения (chunks старше now()-drop_after будут удаляться)
-        """
-        if drop_after is None:
-            return
-        if drop_after.total_seconds() <= 0:
-            self.logger.warning(f"Global retention period must be >0, got {drop_after}. Skipping policy setup.")
-            return
-
-        if not await self._timescaledb_available():
-            # Нет Timescale — ничего не делаем
-            return
-
-        drop_after_seconds = int(drop_after.total_seconds())
-        try:
-            await self._execute(
-                "SELECT add_retention_policy("
-                "  format('%I.%I', $1::text, $2::text)::regclass, "
-                "  drop_after => make_interval(secs => $3::integer), "
-                "  if_not_exists => TRUE"
-                ")",
-                self._schema,
-                table_name,
-                drop_after_seconds,
-            )
-            self.logger.info(
-                f"Retention policy ensured for {self._schema}.{table_name}: drop_after={drop_after_seconds}s"
-            )
-        except Exception as e:
-            # Не критично для работы — предупреждаем и продолжаем
-            self.logger.warning(f"Failed to ensure retention policy for {self._schema}.{table_name}: {e}")
-
-    async def _ensure_global_retention_policies(self) -> None:
-        """Настраивает глобальную retention policy для таблиц *history (если задано)."""
-        if self._global_retention_period is None:
-            return
-        await self._setup_retention_policy("variables_history", self._global_retention_period)
-        await self._setup_retention_policy("events_history", self._global_retention_period)
-
-    async def reapply_global_retention_policy(
-        self,
-        period: Optional[timedelta] = None,
-        *,
-        drop_immediately: bool = False,
-    ) -> None:
-        """
-        Принудительная переустановка глобальной retention policy для hypertables.
-
-        Использование:
-        - вызвать после `await init()`
-        - при смене `global_retention_period` в рантайме, чтобы обновить Timescale policy без перезапуска
-
-        Args:
-            period: новый глобальный период. Если None — используется текущий self._global_retention_period.
-                Если итоговый период None — политика будет удалена (глобальный лимит отключён).
-            drop_immediately: если True и период задан — выполнить разовый drop_chunks, чтобы
-                уменьшение retention применилось сразу (а не по расписанию фоновой job).
-        """
-        await self._ensure_pool()
-
-        if not await self._timescaledb_available():
-            self.logger.warning("TimescaleDB extension not found. Cannot (re)apply retention policies.")
-            return
-
-        if period is not None:
-            self._global_retention_period = period
-
-        effective = self._global_retention_period
-
-        async def _remove(table: str) -> None:
-            await self._execute(
-                "SELECT remove_retention_policy(format('%I.%I', $1::text, $2::text)::regclass, if_exists => TRUE)",
-                self._schema,
-                table,
-            )
-
-        async def _add(table: str, td: timedelta) -> None:
-            secs = int(td.total_seconds())
-            await self._execute(
-                "SELECT add_retention_policy("
-                "  format('%I.%I', $1::text, $2::text)::regclass, "
-                "  drop_after => make_interval(secs => $3::integer), "
-                "  if_not_exists => FALSE"
-                ")",
-                self._schema,
-                table,
-                secs,
-            )
-            if drop_immediately:
-                await self._execute(
-                    "SELECT drop_chunks("
-                    "  format('%I.%I', $1::text, $2::text)::regclass, "
-                    "  older_than => make_interval(secs => $3::integer)"
-                    ")",
-                    self._schema,
-                    table,
-                    secs,
-                )
-
-        for t in ("variables_history", "events_history"):
-            try:
-                await _remove(t)
-                if effective is not None:
-                    if effective.total_seconds() <= 0:
-                        raise ValueError(f"Global retention period must be >0, got {effective}")
-                    await _add(t, effective)
-            except Exception as e:
-                self.logger.warning(f"Failed to reapply retention policy for {self._schema}.{t}: {e}")
-
-        # Обновим OPC UA витрину настроек, если она включена
-        await self.refresh_history_settings_nodes()
-
-    async def _flush_variable_batch(self, items: List[VariableWriteItem]) -> None:
-        """
-        Флаш батча значений переменных в таблицы variables_history и variables_last_value.
-        """
-        if not items:
-            return
-
-        history_params = [
-            (
-                it.variable_id,
-                it.server_timestamp,
-                it.source_timestamp,
-                it.status_code,
-                it.value_str,
-                it.variant_type,
-                it.variant_binary,
-            )
-            for it in items
-        ]
-
-        last_value_params = [
-            (
-                it.variable_id,
-                it.source_timestamp,
-                it.server_timestamp,
-                it.status_code,
-                it.variant_type,
-                it.variant_binary,
-            )
-            for it in items
-        ]
-
-        flush_timeout = self._flush_op_timeout_sec()
-        # Две попытки: первая — с текущим пулом, вторая — после реконнекта
-        # (таймаут обрабатывается так же, как ошибка SQL; батч не выбрасывается сразу).
-        for attempt in (1, 2):
-            await self._ensure_pool()
-            failed_pool = self._pool
-            try:
-                async def _op() -> None:
-                    async with self._flush_on_connection(failed_pool) as conn:
-                        insert_started_at = time.perf_counter()
-                        await conn.executemany(
-                            f'INSERT INTO "{self._schema}".variables_history '
-                            f'(variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) '
-                            f'VALUES ($1, $2, $3, $4, $5, $6, $7) '
-                            f'ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
-                            history_params,
-                            timeout=flush_timeout,
-                        )
-                        self._perf_observe_ms(
-                            "variable_insert_history",
-                            (time.perf_counter() - insert_started_at) * 1000.0,
-                        )
-
-                        upsert_started_at = time.perf_counter()
-                        await conn.executemany(
-                            f'''
-                            INSERT INTO "{self._schema}".variables_last_value
-                                (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
-                            VALUES ($1, $2, $3, $4, $5, $6)
-                            ON CONFLICT (variable_id) DO UPDATE
-                                SET sourcetimestamp = EXCLUDED.sourcetimestamp,
-                                    servertimestamp = EXCLUDED.servertimestamp,
-                                    statuscode = EXCLUDED.statuscode,
-                                    varianttype = EXCLUDED.varianttype,
-                                    variantbinary = EXCLUDED.variantbinary,
-                                    is_seed = FALSE,
-                                    updated_at = NOW()
-                                WHERE "{self._schema}".variables_last_value.is_seed
-                                   OR "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
-                            ''',
-                            last_value_params,
-                            timeout=flush_timeout,
-                        )
-                        self._perf_observe_ms(
-                            "variable_upsert_last_value",
-                            (time.perf_counter() - upsert_started_at) * 1000.0,
-                        )
-                flush_started_at = time.perf_counter()
-                await self._run_db_operation(
-                    _op(),
-                    "flush variable batch",
-                    timeout=flush_timeout,
-                    layer="flush",
-                )
-                self._perf_observe_ms(
-                    "variable_flush_total",
-                    (time.perf_counter() - flush_started_at) * 1000.0,
-                )
-
-                self._log_connection_restored_if_needed()
-
-                for it in items:
-                    self._update_last_values_cache(it.variable_id, it.datavalue)
-                return
-            except Exception as e:
-                if attempt == 1:
-                    self.logger.error(
-                        "Flush variable batch failed, will reconnect and retry: %s",
-                        e,
-                    )
-                    await self._force_reconnect(failed_pool)
-                else:
-                    self.logger.error("Flush variable batch failed after reconnect: %s", e)
-                    raise
-
-    async def _flush_event_batch(self, items: List[EventWriteItem]) -> None:
-        """
-        Флаш батча событий в таблицу events_history.
-        """
-        if not items:
-            return
-
-        params = [
-            (
-                it.source_db_id,
-                it.event_type_id,
-                it.event_timestamp,
-                it.event_data_json,
-            )
-            for it in items
-        ]
-
-        flush_timeout = self._flush_op_timeout_sec()
-        for attempt in (1, 2):
-            await self._ensure_pool()
-            failed_pool = self._pool
-            try:
-                async def _op() -> None:
-                    async with self._flush_on_connection(failed_pool) as conn:
-                        insert_started_at = time.perf_counter()
-                        await conn.executemany(
-                            f'INSERT INTO "{self._schema}".events_history '
-                            f'(source_id, event_type_id, event_timestamp, event_data) '
-                            f'VALUES ($1, $2, $3, $4) '
-                            f'ON CONFLICT (source_id, event_timestamp) DO NOTHING',
-                            params,
-                            timeout=flush_timeout,
-                        )
-                        self._perf_observe_ms(
-                            "event_insert_history",
-                            (time.perf_counter() - insert_started_at) * 1000.0,
-                        )
-                flush_started_at = time.perf_counter()
-                await self._run_db_operation(
-                    _op(),
-                    "flush event batch",
-                    timeout=flush_timeout,
-                    layer="flush",
-                )
-                self._perf_observe_ms(
-                    "event_flush_total",
-                    (time.perf_counter() - flush_started_at) * 1000.0,
-                )
-                return
-            except Exception as e:
-                if attempt == 1:
-                    self.logger.error(
-                        "Flush event batch failed, will reconnect and retry: %s",
-                        e,
-                    )
-                    await self._force_reconnect(failed_pool)
-                else:
-                    self.logger.error("Flush event batch failed after reconnect: %s", e)
-                    raise
-
-    async def _save_variable_metadata(self, node_id: ua.NodeId, period: Optional[timedelta], count: int) -> int:
-        """
-        Сохранение метаданных переменной.
-
-        Args:
-            node_id: Идентификатор узла
-            period: Период хранения
-            count: Максимальное количество записей
-
-        Returns:
-            int: variable_id для использования в таблице истории
-        """
-        # Сохраняем метаданные переменной (используем INSERT ... RETURNING для получения ID)
-        # Создаем полное имя узла для уникальной идентификации
-        node_id_str = self._format_node_id(node_id)
-        
-        # При регистрации переменной тип данных пока неизвестен
-        # Будет обновлен при первом сохранении значения
-        data_type = "Unknown"
-
-        # Приводим период хранения к глобальному максимуму (если задан)
-        period = self._get_effective_retention_period(period)
-        
-        result = await self._fetchval(f'''
-            INSERT INTO "{self._schema}".variable_metadata (node_id, data_type, retention_period, max_records)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (node_id) DO UPDATE SET
-                data_type = EXCLUDED.data_type,
-                retention_period = EXCLUDED.retention_period,
-                max_records = EXCLUDED.max_records,
-                updated_at = NOW()
-            RETURNING variable_id
-        ''', node_id_str, data_type, period, count)
-
-        if result is None:
-            # Если не удалось вставить, получаем существующий ID
-            result = await self._fetchval(f'''
-                SELECT variable_id FROM "{self._schema}".variable_metadata
-                WHERE node_id = $1
-                LIMIT 1
-            ''', node_id_str)
-        
-        # Обновляем кэш метаданных
-        if result is not None:
-            self._variable_metadata_cache[node_id_str] = result
-        
-        return result
-
-    async def _save_event_source(self, source_id: ua.NodeId, period: Optional[timedelta], count: int) -> int:
-        """
-        Сохранение источника событий.
-
-        Args:
-            source_id: Идентификатор источника событий
-            period: Период хранения
-            count: Максимальное количество записей
-
-        Returns:
-            int: source_id для использования в таблице истории
-        """
-        source_node_id_str = self._format_node_id(source_id)
-
-        # Приводим период хранения к глобальному максимуму (если задан)
-        period = self._get_effective_retention_period(period)
-        
-        result = await self._fetchval(f'''
-            INSERT INTO "{self._schema}".event_sources (source_node_id, retention_period, max_records)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (source_node_id) DO UPDATE SET
-                retention_period = EXCLUDED.retention_period,
-                max_records = EXCLUDED.max_records,
-                updated_at = NOW()
-            RETURNING source_id
-        ''', source_node_id_str, period, count)
-
-        if result is None:
-            # Если не удалось вставить, получаем существующий ID
-            result = await self._fetchval(f'''
-                SELECT source_id FROM "{self._schema}".event_sources
-                WHERE source_node_id = $1
-                LIMIT 1
-            ''', source_node_id_str)
-        
-        # Обновляем кэш источников событий
-        if result is not None:
-            self._event_source_cache[source_node_id_str] = result
-        
-        return result
-
-    async def _save_event_metadata(self, event_type: ua.NodeId, source_id: ua.NodeId, fields: List[str], period: Optional[timedelta], count: int) -> Tuple[int, int]:
-        """
-        Сохранение метаданных события.
-
-        Args:
-            event_type: Тип события
-            source_id: Идентификатор источника
-            fields: Список расширенных полей события
-            period: Период хранения
-            count: Максимальное количество записей
-
-        Returns:
-            Tuple[int, int]: (source_id, event_type_id) для использования в таблице истории
-        """
-        # Сначала создаем или получаем источник событий
-        source_db_id = await self._save_event_source(source_id, period, count)
-        
-        # Теперь создаем запись для типа события
-        event_type_name = self._format_node_id(event_type)
-        
-        event_db_id = await self._fetchval(f'''
-            INSERT INTO "{self._schema}".event_types (event_type_name)
-            VALUES ($1)
-            ON CONFLICT (event_type_name) DO UPDATE SET
-                updated_at = NOW()
-            RETURNING event_type_id
-        ''', event_type_name)
-
-        if event_db_id is None:
-            # Если не удалось вставить, получаем существующий ID
-            event_db_id = await self._fetchval(f'''
-                SELECT event_type_id FROM "{self._schema}".event_types
-                WHERE event_type_name = $1
-                LIMIT 1
-            ''', event_type_name)
-        
-        # Обновляем кэш типов событий
-        if event_db_id is not None:
-            self._event_type_cache[event_type_name] = event_db_id
-        
-        return source_db_id, event_db_id
-
-    async def _init_last_values_cache(self) -> None:
-        """
-        Инициализация in-memory кэша последних значений из таблицы variables_last_value.
-
-        Загрузка выполняется пакетами, с грубой оценкой потребления памяти и
-        ограничением по конфигурируемому порогу (history_last_values_cache_max_size_mb).
-        """
-        if not self._history_last_values_cache_enabled:
-            return
-
-        try:
-            await self._ensure_pool()
-            max_bytes = self._history_last_values_cache_max_size_mb * 1024 * 1024
-            approx_bytes = 0
-            batch_size = max(1, self._history_last_values_init_batch_size)
-            offset = 0
-            total_loaded = 0
-
-            async with self._pool.acquire(timeout=self._db_query_timeout_sec) as conn:
-                # Пытаемся оценить размер таблицы на стороне БД
-                try:
-                    rel_name = f'{self._schema}.variables_last_value'
-                    rel_size = await conn.fetchval(
-                        "SELECT pg_total_relation_size($1::regclass)",
-                        rel_name,
-                        timeout=self._db_query_timeout_sec,
-                    )
-                    if rel_size is not None:
-                        approx_mb = rel_size / (1024 * 1024)
-                        limit_mb = max_bytes / (1024 * 1024)
-                        self.logger.info(
-                            "Estimated relation size for %s: %.1f MB (cache limit %.1f MB)",
-                            rel_name,
-                            approx_mb,
-                            limit_mb,
-                        )
-                except Exception as e:
-                    self.logger.debug(f"Failed to estimate variables_last_value size: {e}")
-
-                while True:
-                    rows = await conn.fetch(
-                        f'''
-                        SELECT variable_id, sourcetimestamp, servertimestamp,
-                               statuscode, varianttype, variantbinary
-                        FROM "{self._schema}".variables_last_value
-                        ORDER BY variable_id
-                        LIMIT $1 OFFSET $2
-                        ''',
-                        batch_size,
-                        offset,
-                        timeout=self._db_query_timeout_sec,
-                    )
-                    if not rows:
-                        break
-
-                    for row in rows:
-                        vid = row["variable_id"]
-                        dv = ua.DataValue(
-                            Value=variant_from_binary(Buffer(row["variantbinary"])),
-                            StatusCode_=ua.StatusCode(row["statuscode"]),
-                            SourceTimestamp=row["sourcetimestamp"],
-                            ServerTimestamp=row["servertimestamp"],
-                        )
-                        self._last_values_cache[vid] = dv
-                        total_loaded += 1
-
-                        # Грубая оценка потребления памяти: размер бинарника + константа
-                        vb = row["variantbinary"] or b""
-                        approx_bytes += len(vb) + 128
-                        if approx_bytes >= max_bytes:
-                            self.logger.warning(
-                                "Last values cache memory limit reached (%.1f MB), "
-                                "stopping further loading (loaded %d entries)",
-                                approx_bytes / (1024 * 1024),
-                                total_loaded,
-                            )
-                            return
-
-                    offset += len(rows)
-
-            self.logger.info(
-                "Last values cache initialized: %d entries (approx %.1f MB)",
-                total_loaded,
-                approx_bytes / (1024 * 1024),
-            )
-        except Exception as e:
-            self.logger.error(f"Failed to initialize last values cache: {e}")
-
-    async def _init_metadata_cache(self) -> None:
-        """
-        Инициализация кэша метаданных переменных (node_id -> variable_id).
-
-        Загружаем пары (node_id, variable_id) из таблицы variable_metadata
-        пакетами, с ограничением по максимальному числу строк.
-        """
-        if not self._history_metadata_cache_enabled:
-            return
-
-        try:
-            await self._ensure_pool()
-            max_rows = max(1, self._history_metadata_cache_init_max_rows)
-            batch_size = min(10000, max_rows)
-            total_loaded = 0
-            last_variable_id = 0
-
-            async with self._pool.acquire(timeout=self._db_query_timeout_sec) as conn:
-                while total_loaded < max_rows:
-                    rows = await conn.fetch(
-                        f'''
-                        SELECT node_id, variable_id
-                        FROM "{self._schema}".variable_metadata
-                        WHERE variable_id > $1
-                        ORDER BY variable_id
-                        LIMIT $2
-                        ''',
-                        last_variable_id,
-                        min(batch_size, max_rows - total_loaded),
-                        timeout=self._db_query_timeout_sec,
-                    )
-                    if not rows:
-                        break
-
-                    for row in rows:
-                        node_id_str = row["node_id"]
-                        vid = row["variable_id"]
-                        self._variable_metadata_cache[node_id_str] = vid
-                        total_loaded += 1
-                        last_variable_id = vid
-                        if total_loaded >= max_rows:
-                            break
-
-            self.logger.info(
-                "Variable metadata cache initialized: %d entries (limit %d)",
-                total_loaded,
-                max_rows,
-            )
-        except Exception as e:
-            self.logger.error(f"Failed to initialize variable metadata cache: {e}")
-
-    def _extract_variant_values(self, event_data: dict) -> dict:
-        """
-        Извлекает значения из Variant объектов для JSON сериализации.
-        Преобразует все несериализуемые типы в сериализуемые.
-        
-        Args:
-            event_data: Словарь с данными события, содержащий Variant объекты
-            
-        Returns:
-            Словарь с извлеченными значениями, готовыми для JSON сериализации
-        """
-        extracted = {}
-        for key, value in event_data.items():
-            if hasattr(value, 'Value'):
-                # Если это Variant, извлекаем значение и рекурсивно обрабатываем
-                extracted[key] = self._make_json_serializable(value.Value)
-            else:
-                # Если не Variant, обрабатываем значение
-                extracted[key] = self._make_json_serializable(value)
-        return extracted
-
-    def _make_json_serializable(self, value: Any) -> Any:
-        """
-        Преобразует значение в JSON-сериализуемый тип.
-        
-        Args:
-            value: Значение для преобразования
-            
-        Returns:
-            JSON-сериализуемое значение
-        """
-        if value is None:
-            return None
-
-    def _update_last_values_cache(self, variable_id: int, datavalue: ua.DataValue) -> None:
-        """
-        Обновление in-memory кэша последних значений.
-
-        Используется как при инициализации из БД, так и при новых записях.
-        """
-        if not self._history_last_values_cache_enabled:
-            return
-        if variable_id is None or datavalue is None:
-            return
-        self._last_values_cache[variable_id] = datavalue
-
-    def _event_to_binary_map(self, ev_dict: dict) -> dict:
-        import base64
-        result = {}
-        for key, variant in ev_dict.items():
-            try:
-                # Диагностика для ExtensionObject
-                if hasattr(variant, 'VariantType') and variant.VariantType == ua.VariantType.ExtensionObject:
-                    #self.logger.debug(f"_event_to_binary_map: Processing ExtensionObject for key '{key}': {variant.Value}")
-                    try:
-                        binary_data = variant_to_binary(variant)
-                        #self.logger.debug(f"_event_to_binary_map: variant_to_binary success for '{key}', binary length: {len(binary_data)}")
-                        result[key] = f"base64:{base64.b64encode(binary_data).decode('utf-8')}"
-                    except Exception as e:
-                        self.logger.error(f"_event_to_binary_map: variant_to_binary failed for '{key}': {e}")
-                        result[key] = None
-                else:
-                    # Обычная обработка для не-ExtensionObject
-                    binary_data = variant_to_binary(variant)
-                    result[key] = f"base64:{base64.b64encode(binary_data).decode('utf-8')}"
-            except Exception as e:
-                self.logger.error(f"_event_to_binary_map: Failed to process key '{key}' with value {variant}: {e}")
-                # На всякий случай, если вдруг попадётся не Variant
-                try:
-                    binary_data = variant_to_binary(ua.Variant(variant))
-                    result[key] = f"base64:{base64.b64encode(binary_data).decode('utf-8')}"
-                except Exception as e2:
-                    self.logger.error(f"_event_to_binary_map: Fallback also failed for '{key}': {e2}")
-                    result[key] = None
-        return result
-
-    def _binary_map_to_event_values(self, data: dict) -> dict:
-        import base64
-        result = {}
-        for key, b64s in data.items():
-            try:
-                if b64s is None:
-                    self.logger.debug(f"_binary_map_to_event_values: Skipping None value for key '{key}'")
-                    result[key] = None
-                    continue
-                    
-                if not isinstance(b64s, str) or not b64s.startswith('base64:'):
-                    self.logger.debug(f"_binary_map_to_event_values: Non-base64 value for key '{key}': {type(b64s)} - {b64s}")
-                    result[key] = b64s
-                    continue
-                    
-                raw = base64.b64decode(b64s[7:])
-                self.logger.debug(f"_binary_map_to_event_values: Decoded binary for key '{key}', length: {len(raw)}")
-                
-                v = variant_from_binary(Buffer(raw))
-                self.logger.debug(f"_binary_map_to_event_values: variant_from_binary success for '{key}': {v}")
-                
-                # Диагностика для ExtensionObject
-                if hasattr(v, 'VariantType') and v.VariantType == ua.VariantType.ExtensionObject:
-                    self.logger.debug(f"_binary_map_to_event_values: Recovered ExtensionObject for key '{key}': {v.Value}")
-                
-                result[key] = v
-            except Exception as e:
-                self.logger.error(f"_binary_map_to_event_values: Failed to process key '{key}' with value {b64s}: {e}")
-                # Фоллбэк: вернуть None
-                result[key] = None
-        return result
-
-    async def _get_event_fields(self, evtypes: List[ua.NodeId]) -> List[str]:
-        """
-        Получение полей событий из типов узлов.
-        
-        Args:
-            evtypes: Список типов событий
-            
-        Returns:
-            Список имен полей событий
-        """
-        ev_aggregate_fields = []
-        for event_type in evtypes:
-            if isinstance(event_type, ua.NodeId):
-                self.logger.warning(
-                    "Cannot introspect event fields from NodeId %s without server Node; "
-                    "pass asyncua Node from historize_event",
-                    event_type,
-                )
-                continue
-            ev_aggregate_fields.extend(await get_event_properties_from_type_node(event_type))
-        ev_fields = []
-        for field in set(ev_aggregate_fields):
-            ev_fields.append((await field.read_display_name()).Text)
-        return ev_fields
-    
     async def new_historized_node(
         self,
         node_id: ua.NodeId,
         period: Optional[timedelta],
-        count: int = 0
+        count: int = 0,
     ) -> None:
-        """
-        Регистрация нового узла для историзации в единой таблице.
-        Таблица уже создана при инициализации.
-
-        Args:
-            node_id: Идентификатор узла OPC UA
-            period: Период хранения данных (None для бесконечного хранения)
-            count: Максимальное количество записей (0 для неограниченного)
-        """
-        #self.logger.debug("new_historized_node: node_id=%s period=%s count=%s",node_id, period, count,)
-
+        """Зарегистрировать переменную для историзации."""
         try:
-            effective_period = self._get_effective_retention_period(period)
-            node_id_str = self._format_node_id(node_id)
-            # Если variable_id уже есть в кэше метаданных (прогревается из БД при init),
-            # upsert не нужен: retention применяется глобально через Timescale policy,
-            # а data_type обновляется при сохранении значения.
-            variable_id = self._variable_metadata_cache.get(node_id_str)
+            node_id_str = format_node_id(node_id)
+            variable_id = self._caches.variables.peek(node_id_str)
             if variable_id is None:
-                variable_id = await self._save_variable_metadata(node_id, effective_period, count)
-
-            # Сохраняем mapping node_id -> variable_id для быстрого доступа
-            self._datachanges_period[node_id] = (effective_period, count, variable_id)
-
+                variable_id = await self._variables.ensure_metadata(
+                    node_id_str,
+                    retention_period=self._effective_retention(period),
+                    max_records=count,
+                )
+                self._caches.variables.put(node_id_str, variable_id)
+            self._variable_ids[node_id] = variable_id
             if self.suppress_initial_datachange:
-                self._pending_initial_datachange_skip[node_id_str] = True
-
-            #self.logger.info(f"Variable node {node_id} registered for historization in unified table (variable_id: {variable_id})")
-        except Exception as e:
-            self.logger.error(f"Failed to register variable node {node_id}: {e}")
+                self._pending_initial_skip[node_id_str] = True
+        except Exception as exc:
+            self.logger.error("Переменная %s не зарегистрирована: %s", node_id, exc)
             raise
 
     async def new_historized_nodes(
         self,
         node_ids: List[ua.NodeId],
         period: Optional[timedelta],
-        count: int = 0
+        count: int = 0,
     ) -> None:
-        """
-        Батчевая регистрация узлов для историзации: один SQL-запрос на все узлы,
-        отсутствующие в кэше метаданных, вместо upsert-роундтрипа на каждый узел.
-
-        Семантика идентична последовательным вызовам new_historized_node()
-        с одинаковыми period/count.
-
-        Args:
-            node_ids: Список идентификаторов узлов OPC UA
-            period: Период хранения данных (None для бесконечного хранения)
-            count: Максимальное количество записей (0 для неограниченного)
-        """
-        effective_period = self._get_effective_retention_period(period)
-
-        # Дедупликация по строковому node_id с сохранением порядка
-        pairs: List[Tuple[ua.NodeId, str]] = []
-        seen: set = set()
+        """Зарегистрировать переменные одним запросом вместо запроса на узел."""
+        pairs: List[Tuple[Any, str]] = []
+        seen = set()
         for node_id in node_ids:
-            node_id_str = self._format_node_id(node_id)
-            if node_id_str in seen:
-                continue
-            seen.add(node_id_str)
-            pairs.append((node_id, node_id_str))
+            node_id_str = format_node_id(node_id)
+            if node_id_str not in seen:
+                seen.add(node_id_str)
+                pairs.append((node_id, node_id_str))
 
-        to_upsert = [node_id_str for _, node_id_str in pairs
-                     if node_id_str not in self._variable_metadata_cache]
-        if to_upsert:
-            # data_type при конфликте не сбрасываем в 'Unknown': реальный тип
-            # уже определён при сохранении значений и не должен теряться
-            rows = await self._fetch(f'''
-                INSERT INTO "{self._schema}".variable_metadata (node_id, data_type, retention_period, max_records)
-                SELECT t.node_id, 'Unknown', $2, $3
-                FROM unnest($1::text[]) AS t(node_id)
-                ON CONFLICT (node_id) DO UPDATE SET
-                    retention_period = EXCLUDED.retention_period,
-                    max_records = EXCLUDED.max_records,
-                    updated_at = NOW()
-                RETURNING node_id, variable_id
-            ''', to_upsert, effective_period, count)
-            for row in rows:
-                self._variable_metadata_cache[row["node_id"]] = row["variable_id"]
+        missing = [key for _, key in pairs if key not in self._caches.variables]
+        if missing:
+            mapping = await self._variables.ensure_metadata_many(
+                missing, retention_period=self._effective_retention(period), max_records=count
+            )
+            self._caches.variables.update(mapping)
 
-        missing: List[ua.NodeId] = []
-        registered = 0
+        fallback = []
         for node_id, node_id_str in pairs:
-            variable_id = self._variable_metadata_cache.get(node_id_str)
+            variable_id = self._caches.variables.peek(node_id_str)
             if variable_id is None:
-                missing.append(node_id)
+                fallback.append(node_id)
                 continue
-            self._datachanges_period[node_id] = (effective_period, count, variable_id)
+            self._variable_ids[node_id] = variable_id
             if self.suppress_initial_datachange:
-                self._pending_initial_datachange_skip[node_id_str] = True
-            registered += 1
+                self._pending_initial_skip[node_id_str] = True
 
-        # Фоллбэк на поштучную регистрацию (не должен срабатывать в норме)
-        for node_id in missing:
+        for node_id in fallback:
             await self.new_historized_node(node_id, period, count)
 
         self.logger.info(
-            "Bulk historized-node registration: %d nodes (%d upserted, %d fallback)",
-            registered + len(missing), len(to_upsert), len(missing),
+            "Зарегистрировано %d переменных (новых в БД %d, поштучно %d)",
+            len(pairs),
+            len(missing),
+            len(fallback),
         )
 
     async def new_historized_event(
         self,
         source_id: ua.NodeId,
-        evtypes: List[ua.NodeId],
+        evtypes: List[Any],
         period: Optional[timedelta],
-        count: int = 0
+        count: int = 0,
     ) -> None:
-        """
-        Регистрация нового источника событий для историзации в единой таблице.
-        Таблица уже создана при инициализации.
-
-        Args:
-            source_id: Идентификатор источника событий
-            evtypes: Список типов событий
-            period: Период хранения данных (None для бесконечного хранения)
-            count: Максимальное количество записей (0 для неограниченного)
-        """
-        self.logger.debug(
-            "new_historized_event: source_id=%s evtypes=%s period=%s count=%s",
-            source_id, evtypes, period, count,
-        )
-
+        """Зарегистрировать источник событий и типы его событий."""
         try:
-            evtypes_raw = evtypes
-            source_id = _coerce_node_id(source_id)
-            evtypes = [_coerce_node_id(event_type) for event_type in evtypes_raw]
-            effective_period = self._get_effective_retention_period(period)
-            # Поля читаем из asyncua Node до приведения к NodeId
-            ev_fields = await self._get_event_fields(evtypes_raw)
-            self._event_fields[source_id] = ev_fields
+            raw_types = list(evtypes)
+            source = coerce_node_id(source_id)
+            # Поля читаются из asyncua Node до приведения к NodeId.
+            fields = await self._get_event_fields(raw_types)
+            self._event_fields[source] = fields
 
-            # Сохраняем метаданные для каждого типа события и получаем IDs
-            event_ids = {}
-            for event_type in evtypes:
-                source_db_id, event_db_id = await self._save_event_metadata(event_type, source_id, ev_fields, effective_period, count)
-                event_ids[event_type] = (source_db_id, event_db_id)
+            source_db_id = await self._events.ensure_source(
+                format_node_id(source),
+                retention_period=self._effective_retention(period),
+                max_records=count,
+            )
+            self._caches.event_sources.put(format_node_id(source), source_db_id)
 
-            # Сохраняем mapping source_id -> (period, count, source_db_id, event_ids)
-            self._datachanges_period[source_id] = (effective_period, count, source_db_id, event_ids)
+            type_ids: Dict[Any, int] = {}
+            for raw_type in raw_types:
+                type_node = coerce_node_id(raw_type)
+                type_name = format_node_id(type_node)
+                type_db_id = await self._events.ensure_type(type_name)
+                self._caches.event_types.put(type_name, type_db_id)
+                type_ids[type_node] = type_db_id
+                await self._sync_event_type(type_db_id, type_node, fields)
 
-            self.logger.info(f"Event source {source_id} registered for historization in unified table (source_id: {source_db_id})")
-        except Exception as e:
-            self.logger.error(f"Failed to register event source {source_id}: {e}")
+            self._event_source_ids[source] = (source_db_id, type_ids)
+            self.logger.info("Источник событий %s зарегистрирован (id %d)", source, source_db_id)
+        except Exception as exc:
+            self.logger.error("Источник событий %s не зарегистрирован: %s", source_id, exc)
             raise
-    
+
+    async def _sync_event_type(
+        self, type_db_id: int, type_node: ua.NodeId, fields: List[str]
+    ) -> None:
+        if (
+            not should_write_v2(self._events_mode)
+            or self._event_registry is None
+            or self._event_search is None
+        ):
+            return
+        table, version = await self._event_registry.sync_event_type(
+            type_db_id, type_node, self._event_registry.describe_fields(fields)
+        )
+        self._event_search.remember_type(type_db_id, table, version)
+
+    async def _get_event_fields(self, evtypes: List[Any]) -> List[str]:
+        """Имена полей событий по узлам типов.
+
+        Поля берутся из узла asyncua; по голому NodeId их не узнать — нужен
+        сервер, поэтому такие типы пропускаются с предупреждением.
+        """
+        properties: List[Any] = []
+        for event_type in evtypes:
+            if isinstance(event_type, ua.NodeId):
+                self.logger.warning(
+                    "Поля события %s не определить по NodeId: нужен узел сервера", event_type
+                )
+                continue
+            properties.extend(await get_event_properties_from_type_node(event_type) or [])
+        names = []
+        for prop in set(properties):
+            names.append((await prop.read_display_name()).Text)
+        return names
+
+    # ================================================================== запись
+
     async def save_node_value(self, node_id: ua.NodeId, datavalue: ua.DataValue) -> None:
-        """
-        Сохранение значения узла в единую таблицу истории переменных.
-
-        Args:
-            node_id: Идентификатор узла OPC UA
-            datavalue: Значение данных для сохранения
-        """
-        #self.logger.debug(
-        #    "save_node_value: node_id=%s source_ts=%s server_ts=%s status=%s",
-        #    node_id, getattr(datavalue, 'SourceTimestamp', None), getattr(datavalue, 'ServerTimestamp', None), getattr(datavalue, 'StatusCode', None),
-        #)
-        self._perf_inc("save_node_value_calls_total")
-
-        node_id_str = self._format_node_id(node_id)
+        """Записать значение переменной."""
+        self._metrics.variables.record_call()
+        node_id_str = format_node_id(node_id)
 
         if self.suppress_initial_datachange:
-            # Подавляем первое уведомление после подписки, чтобы не перезаписывать данные из БД
-            if self._pending_initial_datachange_skip.pop(node_id_str, False):
-                #self.logger.debug("save_node_value: suppressed initial datachange for %s", node_id_str)
+            if self._pending_initial_skip.pop(node_id_str, False):
                 return
         else:
-            # Если подавление выключено, очищаем возможный накопленный флаг
-            self._pending_initial_datachange_skip.pop(node_id_str, None)
+            self._pending_initial_skip.pop(node_id_str, None)
 
         try:
-            # Получаем variable_id из mapping
-            node_data = self._datachanges_period.get(node_id)
-            if node_data is None:
-                variable_id = None
+            if node_id in self._event_source_ids:
+                self.logger.warning("Узел %s зарегистрирован как источник событий", node_id)
+                return
+            variable_id = await self._resolve_variable_id(node_id, create=True)
+            assert variable_id is not None
+
+            variant = datavalue.Value
+            if variant is None:
+                raise ValueError("DataValue без значения")
+            # Колонки времени объявлены NOT NULL, и значение без метки уронило бы
+            # всю пачку, в которую попало. Без времени источника значение
+            # датируется временем сервера; без обоих — отвергается поштучно.
+            source_ts = datavalue.SourceTimestamp or datavalue.ServerTimestamp
+            server_ts = datavalue.ServerTimestamp or datavalue.SourceTimestamp
+            if source_ts is None or server_ts is None:
+                raise ValueError("DataValue без меток времени")
+            item = VariableWriteItem(
+                variable_id=variable_id,
+                node_id_str=node_id_str,
+                source_timestamp=source_ts,
+                server_timestamp=server_ts,
+                status_code=status_code_value(datavalue.StatusCode),
+                value_str=value_text(variant),
+                variant_type=int(variant.VariantType),
+                variant_binary=encode_variant(variant),
+                group_key=group_key(node_id_str),
+                datavalue=datavalue,
+            )
+            # Чтение последнего значения сразу после записи должно видеть его,
+            # даже если в базу оно доедет позже.
+            self._caches.last_values.put(variable_id, datavalue)
+
+            if self._value_buffer is not None:
+                await self._value_buffer.enqueue(item, sync=self._settings.write.wait_for_flush)
             else:
-                # Проверяем формат данных
-                if len(node_data) == 3:
-                    period, count, variable_id = node_data
-                elif len(node_data) == 4:
-                    # Формат для событий: (period, count, source_db_id, event_ids)
-                    self.logger.warning(f"Node {node_id} is registered as event source, not variable")
-                    return
-                else:
-                    self.logger.warning(f"Unexpected data format for node {node_id}: {node_data}")
-                    return
-                    
-            if variable_id is None:
-                # Если mapping не найден, пробуем получить метаданные из кэша/БД
-                cached_vid = self._variable_metadata_cache.get(node_id_str)
-                if cached_vid is not None:
-                    self._cache_stats["variable_metadata_hits"] += 1
-                else:
-                    self._cache_stats["variable_metadata_misses"] += 1
+                await self._variables.flush([item])
+            await self._remember_data_type(variable_id, datavalue)
+            self._note_save_succeeded()
+        except Exception as exc:
+            self._metrics.variables.record_error()
+            self._log_save_failure("value", str(node_id), exc, str(datavalue))
 
-                meta_row = await self._fetchrow(f'''
-                    SELECT variable_id, retention_period, max_records
-                    FROM "{self._schema}".variable_metadata
-                    WHERE node_id = $1
-                    LIMIT 1
-                ''', node_id_str)
+    async def _remember_data_type(self, variable_id: int, datavalue: ua.DataValue) -> None:
+        """Записать тип данных переменной, когда он стал известен.
 
-                if meta_row is not None:
-                    variable_id = int(meta_row["variable_id"])
-                    period = meta_row["retention_period"]
-                    count = int(meta_row["max_records"] or 0)
-                else:
-                    # Если метаданные не найдены, создаем их (с учетом глобального retention)
-                    effective_period = self._get_effective_retention_period(None)
-                    variable_id = await self._save_variable_metadata(node_id, effective_period, 0)
-                    period = effective_period
-                    count = 0
+        В 0.2.15 это делалось только без батчинга и двумя запросами на каждое
+        значение. Здесь — один UPDATE на переменную за жизнь процесса.
+        """
+        name = data_type_name(datavalue)
+        if name == "Unknown" or self._known_data_types.get(variable_id) == name:
+            return
+        await self._variables.update_data_type(variable_id, name)
+        self._known_data_types[variable_id] = name
 
-                # Обновляем in-memory mapping и кэш метаданных
-                self._datachanges_period[node_id] = (period, count, variable_id)
-                self._variable_metadata_cache[node_id_str] = variable_id
+    async def _flush_values(self, items: List[VariableWriteItem]) -> None:
+        await self._variables.flush(items)
 
-            # Подготовка данных для записи
-            value_str = str(datavalue.Value.Value)
-            variant_type = int(datavalue.Value.VariantType)
-            variant_binary = variant_to_binary(datavalue.Value)
+    async def _resolve_variable_id(self, node_id: Any, *, create: bool) -> Optional[int]:
+        variable_id = self._variable_ids.get(node_id)
+        if variable_id is not None:
+            return variable_id
 
-            # Обновляем in-memory кэш последних значений (read-after-write внутри процесса)
-            self._update_last_values_cache(variable_id, datavalue)
-
-            if self._history_write_batch_enabled and self._value_write_buffer is not None:
-                # Батчированная запись через HistoryWriteBuffer
-                node_id_str = self._format_node_id(node_id)
-                group_key = self._build_group_key_from_node_id(node_id_str)
-                item = VariableWriteItem(
-                    variable_id=variable_id,
-                    node_id_str=node_id_str,
-                    source_timestamp=datavalue.SourceTimestamp,
-                    server_timestamp=datavalue.ServerTimestamp,
-                    status_code=datavalue.StatusCode.value,
-                    value_str=value_str,
-                    variant_type=variant_type,
-                    variant_binary=variant_binary,
-                    group_key=group_key,
-                    datavalue=datavalue,
+        node_id_str = format_node_id(node_id)
+        variable_id = self._caches.variables.get(node_id_str)
+        if variable_id is None:
+            row = await self._variables.find_metadata(node_id_str)
+            if row is not None:
+                variable_id = int(row["variable_id"])
+            elif create:
+                variable_id = await self._variables.ensure_metadata(
+                    node_id_str, retention_period=self._effective_retention(None)
                 )
-                # В режиме global ожидаем завершения флаша
-                sync = self._history_write_read_consistency_mode == "global"
-                await self._value_write_buffer.enqueue(item, sync=sync)
-            else:
-                # Синхронная запись как раньше (без батчирования)
-                await self._execute(
-                    f'INSERT INTO "{self._schema}".variables_history (variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
-                    variable_id,
-                    datavalue.ServerTimestamp,
-                    datavalue.SourceTimestamp,
-                    datavalue.StatusCode.value,
-                    value_str,
-                    variant_type,
-                    variant_binary,
-                )
+            if variable_id is not None:
+                self._caches.variables.put(node_id_str, variable_id)
+        if variable_id is not None and create:
+            self._variable_ids[node_id] = variable_id
+        return variable_id
 
-                await self._execute(f'''
-                    INSERT INTO "{self._schema}".variables_last_value
-                    (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT (variable_id) DO UPDATE
-                        SET sourcetimestamp = EXCLUDED.sourcetimestamp,
-                            servertimestamp = EXCLUDED.servertimestamp,
-                            statuscode = EXCLUDED.statuscode,
-                            varianttype = EXCLUDED.varianttype,
-                            variantbinary = EXCLUDED.variantbinary,
-                            is_seed = FALSE,
-                            updated_at = NOW()
-                        WHERE "{self._schema}".variables_last_value.is_seed
-                           OR "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
-                ''', variable_id, datavalue.SourceTimestamp, datavalue.ServerTimestamp,
-                    datavalue.StatusCode.value, variant_type, variant_binary)
-
-            # Обновляем тип данных в метаданных на основе реального DataValue только при изменении
-            if datavalue and hasattr(datavalue, 'Value') and datavalue.Value is not None:
-                actual_data_type = self._get_node_data_type(node_id, datavalue)
-                if actual_data_type != "Unknown":
-                    # Проверяем, изменился ли тип данных
-                    current_data_type = await self._fetchval(f'''
-                        SELECT data_type FROM "{self._schema}".variable_metadata 
-                        WHERE variable_id = $1
-                    ''', variable_id)
-                    
-                    # Обновляем только если тип изменился
-                    if current_data_type != actual_data_type:
-                        await self._execute(f'''
-                            UPDATE "{self._schema}".variable_metadata 
-                            SET data_type = $1, updated_at = NOW() 
-                            WHERE variable_id = $2
-                        ''', actual_data_type, variable_id)
-
-        except Exception as e:
-            self._perf_inc("save_node_value_errors_total")
-            # Антиспам логирование при длительной недоступности БД
-            self._log_save_failure_throttled('value', str(node_id), e, str(datavalue))
-    
     async def save_event(self, event: Any) -> None:
-        """
-        Сохранение события в единую таблицу истории событий.
+        """Записать событие."""
+        self._metrics.events.record_call()
 
-        Args:
-            event: Событие OPC UA для сохранения
-        """
-        #self.logger.debug(f"save_event: {type(event)}")
-        #self.logger.debug(f"save_event: {dir(event)}")
-        #self.logger.debug(f"save_event: {event.get_event_props_as_fields_dict()}")
-        self._perf_inc("save_event_calls_total")
-
-        if event is None or not hasattr(event, 'SourceNode') or event.SourceNode is None:
-            self.logger.error("save_event: invalid event")
+        source = getattr(event, "SourceNode", None) if event is not None else None
+        if source is None:
+            self.logger.error("save_event: событие без источника")
             return
-
-        event_type = getattr(event, 'EventType', None)
-
+        event_type = getattr(event, "EventType", None)
         if event_type is None:
-            self.logger.error("save_event: event.EventType is None")
+            self.logger.error("save_event: у события нет EventType")
             return
 
         try:
-            # Получаем source_id и event_type_id из mapping
-            source_data = self._datachanges_period.get(event.SourceNode)
-            if source_data is None:
-                source_db_id = None
-                event_db_id = None
+            source_db_id, type_db_id = await self._resolve_event_ids(source, event_type)
+            moment = getattr(event, "Time", None) or getattr(event, "time", None) or datetime.now(timezone.utc)
+            fields = (
+                event.get_event_props_as_fields_dict()
+                if hasattr(event, "get_event_props_as_fields_dict")
+                else {}
+            )
+            item = EventWriteItem(
+                source_db_id=source_db_id,
+                event_type_id=type_db_id,
+                event_timestamp=moment,
+                event_data_json=json.dumps(encode_event_fields(fields)),
+                group_key=group_key(format_node_id(source)),
+            )
+            if self._event_buffer is not None:
+                await self._event_buffer.enqueue(item, sync=self._settings.write.wait_for_flush)
             else:
-                # Проверяем формат данных
-                if len(source_data) == 4:
-                    period, count, source_db_id, event_ids = source_data
-                    event_db_id = event_ids.get(event_type, (None, None))[1]
-                elif len(source_data) == 3:
-                    # Старый формат для переменных: (period, count, variable_id)
-                    self.logger.warning(f"Source {event.SourceNode} is registered as variable, not event source")
-                    return
-                else:
-                    self.logger.warning(f"Unexpected data format for source {event.SourceNode}: {source_data}")
-                    return
+                await self._flush_events([item])
+            self._note_save_succeeded()
+        except Exception as exc:
+            self._metrics.events.record_error()
+            self._log_save_failure("event", str(source), exc)
 
-            if source_db_id is None or event_db_id is None:
-                # Если mapping не найден, получаем IDs из кэша или базы данных
-                # Сначала получаем source_id из event_sources
-                source_node_id_str = self._format_node_id(event.SourceNode)
-                cached_sid = self._event_source_cache.get(source_node_id_str)
-                if cached_sid is not None:
-                    self._cache_stats["event_source_hits"] += 1
-                    source_db_id = cached_sid
-                else:
-                    self._cache_stats["event_source_misses"] += 1
-                    source_db_id = await self._fetchval(f'''
-                        SELECT source_id FROM "{self._schema}".event_sources 
-                        WHERE source_node_id = $1
-                        LIMIT 1
-                    ''', source_node_id_str)
-                
-                if source_db_id is None:
-                    # Если источник не найден, создаем его
-                    source_db_id = await self._save_event_source(event.SourceNode, None, 0)
+    async def _resolve_event_ids(self, source: Any, event_type: Any) -> Tuple[int, int]:
+        registered = self._event_source_ids.get(source)
+        if registered is not None:
+            source_db_id, type_ids = registered
+            type_db_id = type_ids.get(event_type)
+            if type_db_id is not None:
+                return source_db_id, type_db_id
 
-                # Теперь получаем event_type_id из event_types (через кэш)
-                event_type_name = self._format_node_id(event_type)
-                cached_eid = self._event_type_cache.get(event_type_name)
-                if cached_eid is not None:
-                    self._cache_stats["event_type_hits"] += 1
-                    event_db_id = cached_eid
-                else:
-                    self._cache_stats["event_type_misses"] += 1
-                    event_db_id = await self._fetchval(f'''
-                        SELECT event_type_id FROM "{self._schema}".event_types 
-                        WHERE event_type_name = $1
-                        LIMIT 1
-                    ''', event_type_name)
-                
-                if event_db_id is None:
-                    # Если тип события не найден, создаем его
-                    ev_fields = self._event_fields.get(event.SourceNode, [])
-                    source_db_id, event_db_id = await self._save_event_metadata(event_type, event.SourceNode, ev_fields, None, 0)
-                    if event.SourceNode not in self._datachanges_period:
-                        self._datachanges_period[event.SourceNode] = (None, 0, source_db_id, {event_type: (source_db_id, event_db_id)})
+        source_key = format_node_id(source)
+        source_db_id_opt = self._caches.event_sources.get(source_key)
+        if source_db_id_opt is None:
+            source_db_id_opt = await self._events.find_source(source_key)
+            if source_db_id_opt is None:
+                source_db_id_opt = await self._events.ensure_source(
+                    source_key, retention_period=self._effective_retention(None)
+                )
+            self._caches.event_sources.put(source_key, source_db_id_opt)
 
-            # Получаем время события
-            event_time = getattr(event, 'Time', None) or getattr(event, 'time', None) or datetime.now(timezone.utc)
-
-            # Получаем все поля события (Variant) и сериализуем в бинарь (base64)
-            raw_event_data = event.get_event_props_as_fields_dict() if hasattr(event, 'get_event_props_as_fields_dict') else {}
-            bin_event_data = self._event_to_binary_map(raw_event_data)
-
-            event_data_json = json.dumps(bin_event_data)  # asyncpg требует сериализованную строку для JSONB
-
-            if self._history_write_batch_enabled and self._event_write_buffer is not None:
-                # Батчированная запись событий
+        type_key = format_node_id(event_type)
+        type_db_id_opt = self._caches.event_types.get(type_key)
+        if type_db_id_opt is None:
+            type_db_id_opt = await self._events.find_type(type_key)
+            if type_db_id_opt is None:
+                type_db_id_opt = await self._events.ensure_type(type_key)
                 try:
-                    source_node_id_str = self._format_node_id(event.SourceNode)
-                except Exception:
-                    source_node_id_str = str(getattr(event, "SourceNode", "unknown"))
-                group_key = self._build_group_key_from_node_id(source_node_id_str)
-                item = EventWriteItem(
-                    source_db_id=source_db_id,
-                    event_type_id=event_db_id,
-                    event_timestamp=event_time,
-                    event_data_json=event_data_json,
-                    group_key=group_key,
-                )
-                sync = self._history_write_read_consistency_mode == "global"
-                await self._event_write_buffer.enqueue(item, sync=sync)
-            else:
-                # Синхронная запись как раньше (без батчирования)
-                await self._execute(
-                    f'INSERT INTO "{self._schema}".events_history (source_id, event_type_id, event_timestamp, event_data) VALUES ($1, $2, $3, $4) ON CONFLICT (source_id, event_timestamp) DO NOTHING',
-                    source_db_id,
-                    event_db_id,
-                    event_time,
-                    event_data_json,
-                )
+                    await self._sync_event_type(
+                        type_db_id_opt, coerce_node_id(event_type), self._event_fields.get(source, [])
+                    )
+                except Exception as exc:
+                    self.logger.warning("Тип события %s не синхронизирован: %s", type_key, exc)
+            self._caches.event_types.put(type_key, type_db_id_opt)
 
-        except Exception as e:
-            self._perf_inc("save_event_errors_total")
-            # Антиспам логирование при длительной недоступности БД
-            src = getattr(event, 'SourceNode', 'unknown')
-            self._log_save_failure_throttled('event', str(src), e)
+        if source not in self._event_source_ids:
+            self._event_source_ids[source] = (source_db_id_opt, {event_type: type_db_id_opt})
+        else:
+            self._event_source_ids[source][1][event_type] = type_db_id_opt
+        return source_db_id_opt, type_db_id_opt
+
+    async def _flush_events(self, items: List[EventWriteItem]) -> None:
+        if should_write_v2(self._events_mode) and self._event_search is not None:
+            await self._event_search.flush(items)
+        else:
+            await self._events.flush(items)
+
+    def _note_save_succeeded(self) -> None:
+        if self._failure_since is None:
+            return
+        self.logger.info(
+            "Запись истории восстановилась после %.1f с; неудачных записей: значения %d, события %d",
+            (datetime.now(timezone.utc) - self._failure_since).total_seconds(),
+            self._failed_saves["value"],
+            self._failed_saves["event"],
+        )
+        self._failure_since = None
+        self._failure_log_at = None
+        self._failed_saves = {"value": 0, "event": 0}
+
+    def _log_save_failure(
+        self, kind: str, node: str, error: Exception, value: Optional[str] = None
+    ) -> None:
+        """Сообщить о неудачной записи, не утопив лог при долгой недоступности БД.
+
+        Первые десять минут пишется каждая ошибка с подробностями; дальше —
+        сводка не чаще раза в десять секунд.
+        """
+        now = datetime.now(timezone.utc)
+        if self._failure_since is None:
+            self._failure_since = now
+        self._failed_saves[kind] += 1
+
+        if now - self._failure_since < DETAILED_FAILURE_LOG_WINDOW:
+            if value is not None:
+                self.logger.error("Не записано (%s) для %s: %s\n %s", kind, node, error, value)
+            else:
+                self.logger.error("Не записано (%s) для %s: %s", kind, node, error)
+            return
+
+        if self._failure_log_at is None or now - self._failure_log_at >= AGGREGATED_FAILURE_LOG_INTERVAL:
+            self._failure_log_at = now
+            self.logger.error(
+                "БД по-прежнему недоступна: не записано (%s) %d, последняя ошибка: %s",
+                kind,
+                self._failed_saves[kind],
+                error,
+            )
+            self._failed_saves[kind] = 0
+
+    # ================================================================== чтение
 
     async def read_node_history(
         self,
@@ -3842,99 +890,26 @@ class HistoryTimescale(HistoryStorageInterface):
         start: Optional[datetime],
         end: Optional[datetime],
         nb_values: Optional[int],
-        return_bounds: bool = False
+        return_bounds: bool = False,
     ) -> Tuple[List[ua.DataValue], Optional[datetime]]:
-        """
-        Чтение истории узла из единой таблицы переменных.
-
-        Args:
-            node_id: Идентификатор узла
-            start: Начальное время
-            end: Конечное время
-            nb_values: Количество значений
-            return_bounds: Возвращать ли границы
-
-        Returns:
-            Кортеж (список значений, время продолжения)
-        """
-        #self.logger.debug(f"read_node_history: {node_id} {start} {end} {nb_values} {return_bounds}")
-        start_time, end_time, order, limit = self._get_bounds(start, end, nb_values)
-
+        """Прочитать историю переменной (HistoryRead, ReadRawModifiedDetails)."""
+        window = resolve_window(start, end, nb_values)
         try:
-            # Получаем variable_id
-            node_data = self._datachanges_period.get(node_id)
-            if node_data is None:
-                variable_id = None
-            else:
-                # Проверяем формат данных
-                if len(node_data) == 3:
-                    period, count, variable_id = node_data
-                elif len(node_data) == 4:
-                    # Формат для событий: (period, count, source_db_id, event_ids)
-                    self.logger.warning(f"Node {node_id} is registered as event source, not variable")
-                    return [], None
-                else:
-                    self.logger.warning(f"Unexpected data format for node {node_id}: {node_data}")
-                    return [], None
-                    
+            if node_id in self._event_source_ids:
+                self.logger.warning("Узел %s зарегистрирован как источник событий", node_id)
+                return [], None
+            variable_id = await self._resolve_variable_id(node_id, create=False)
             if variable_id is None:
-                # Если mapping не найден, пробуем получить variable_id из кэша по node_id_str
-                node_id_str = self._format_node_id(node_id)
-                cached_vid = self._variable_metadata_cache.get(node_id_str)
-                if cached_vid is not None:
-                    self._cache_stats["variable_metadata_hits"] += 1
-                    variable_id = cached_vid
-                else:
-                    self._cache_stats["variable_metadata_misses"] += 1
-                    # Если в кэше нет, получаем variable_id из базы данных
-                    variable_id = await self._fetchval(f'''
-                        SELECT variable_id FROM "{self._schema}".variable_metadata
-                        WHERE node_id = $1
-                        LIMIT 1
-                    ''', node_id_str)
-
-                if variable_id is not None:
-                    # Обновляем кэш
-                    self._variable_metadata_cache[node_id_str] = variable_id
-
-            if variable_id is None:
-                self.logger.warning(f"No metadata found for node {node_id}")
+                self.logger.warning("Узел %s не историзуется", node_id)
                 return [], None
 
-            # Запрос к единой таблице переменных
-            select_sql = f'''
-                SELECT servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary
-                FROM "{self._schema}".variables_history
-                WHERE variable_id = $1 AND sourcetimestamp BETWEEN $2 AND $3
-                ORDER BY sourcetimestamp {order}
-                LIMIT $4
-            '''
-            #self.logger.debug(f"read_node_history: {select_sql}")
-            rows = await self._fetch(select_sql, variable_id, start_time, end_time, limit)
-            #self.logger.debug(f"read_node_history: {len(rows)} rows")
-            # Преобразуем в DataValue
-            results = []
-            for row in rows:
-                #self.logger.debug(f"read_node_history: {row}")
-                datavalue = ua.DataValue(
-                    Value=variant_from_binary(Buffer(row['variantbinary'])),
-                    StatusCode_=ua.StatusCode(row['statuscode']),
-                    SourceTimestamp=row['sourcetimestamp'],
-                    ServerTimestamp=row['servertimestamp']
-                )
-                results.append(datavalue)
-                #self.logger.debug(f"read_node_history: {datavalue}")
-
-            # Определяем время продолжения
-            cont = None
-            if len(results) == limit and len(rows) > 0:
-                cont = rows[-1]['sourcetimestamp']
-
-            #self.logger.debug(f"read_node_history: {len(results)} results")
-            return results, cont
-
-        except Exception as e:
-            self.logger.error(f"Failed to read node history for {node_id}: {e}")
+            rows = await self._variables.read_history_rows(
+                variable_id, window.start, window.end, window.limit, window.order
+            )
+            values = [row_to_datavalue(row) for row in rows]
+            return values, continuation_point(rows, len(values), window.limit, "sourcetimestamp")
+        except Exception as exc:
+            self.logger.error("История %s не прочитана: %s", node_id, exc)
             return [], None
 
     async def read_event_history(
@@ -3943,295 +918,99 @@ class HistoryTimescale(HistoryStorageInterface):
         start: Optional[datetime],
         end: Optional[datetime],
         nb_values: Optional[int],
-        evfilter: Any
+        evfilter: Any,
     ) -> Tuple[List[Any], Optional[datetime]]:
-        """
-        Чтение истории событий из единой таблицы событий.
-
-        Args:
-            source_id: Идентификатор источника событий
-            start: Начальное время
-            end: Конечное время
-            nb_values: Количество значений
-            evfilter: Фильтр событий
-
-        Returns:
-            Кортеж (список событий, время продолжения)
-        """
-        start_time, end_time, order, limit = self._get_bounds(start, end, nb_values)
-        #self.logger.debug(f"read_event_history: {source_id} {start} {end} nb_values evfilter")
+        """Прочитать историю событий (HistoryRead, ReadEventDetails)."""
+        window = resolve_window(start, end, nb_values)
         try:
-            # Получаем source_db_id
-            source_data = self._datachanges_period.get(source_id)
-            if source_data is None:
-                # Если mapping не найден, пробуем получить source_db_id из кэша или базы данных
-                source_node_id_str = self._format_node_id(source_id)
-                cached_sid = self._event_source_cache.get(source_node_id_str)
+            if source_id in self._variable_ids:
+                self.logger.warning("Узел %s зарегистрирован как переменная", source_id)
+                return [], None
+            source_db_id = await self._resolve_source_id(source_id)
+            if source_db_id is None:
+                self.logger.warning("Источник событий %s не историзуется", source_id)
+                return [], None
 
-                if cached_sid is not None:
-                    self._cache_stats["event_source_hits"] += 1
-                    source_db_id = cached_sid
-                else:
-                    self._cache_stats["event_source_misses"] += 1
-                    source_db_id = await self._fetchval(f'''
-                        SELECT source_id FROM "{self._schema}".event_sources 
-                        WHERE source_node_id = $1
-                        LIMIT 1
-                    ''', source_node_id_str)
+            if should_read_v2(self._events_mode) and self._event_search is not None:
+                result = await self._event_search.read(
+                    source_db_id, window.start, window.end, window.limit, window.order, evfilter
+                )
+                return result.events, result.cursor[0] if result.cursor else None
 
-                if source_db_id is None:
-                    self.logger.warning(f"No metadata found for source {source_id}")
-                    return [], None
-                else:
-                    # Обновляем кэш
-                    self._event_source_cache[source_node_id_str] = source_db_id
-            else:
-                # Проверяем формат данных
-                if len(source_data) == 4:
-                    #self.logger.debug(f"read_event_history: source_data: {source_data}")
-                    period, count, source_db_id, event_ids = source_data
-                    #self.logger.debug(f"read_event_history: using cached source_db_id: {source_db_id}")
-                    
-                elif len(source_data) == 3:
-                    # Старый формат для переменных: (period, count, variable_id)
-                    self.logger.warning(f"Source {source_id} is registered as variable, not event source")
-                    return [], None
-                else:
-                    self.logger.warning(f"Unexpected data format for source {source_id}: {source_data}")
-                    return [], None
-
-            # Запрос к единой таблице событий
-            select_sql = f'''
-                SELECT event_timestamp, event_type_id, event_data
-                FROM "{self._schema}".events_history
-                WHERE source_id = $1 AND event_timestamp BETWEEN $2 AND $3
-                ORDER BY event_timestamp {order}
-                LIMIT $4
-            '''
-
-            rows = await self._fetch(select_sql, source_db_id, start_time, end_time, limit)
-            #self.logger.debug(f"read_event_history: query: {select_sql}")
-            #self.logger.debug(f"read_event_history: params: source_db_id={source_db_id}, start_time={start_time}, end_time={end_time}, limit={limit}")
-            #self.logger.debug(f"read_event_history: {len(rows)} rows")
-            # Преобразуем в события
-            results = []
+            rows = await self._events.read_history_rows(
+                source_db_id, window.start, window.end, window.limit, window.order
+            )
+            events = []
             for row in rows:
-                data = row['event_data']
-                if isinstance(data, str):
-                    data = json.loads(data)
-                values = self._binary_map_to_event_values(data)
-                #payload = {"Time": row["event_timestamp"], "EventType": row["event_type_id"], **values}
                 try:
-                    #self.logger.debug(f"read_event_history: event: {values}")
-                    event = Event.from_field_dict(values)
-                    results.append(event)
-                except Exception as e:
-                    # Фоллбэк, если from_field_dict недоступен у конкретной реализации Event
-                    self.logger.debug(f"read_event_history fallback: {e}")
-                    self.logger.debug(f"read_event_history fallback: event: {values}")
-                    #results.append(Event(**values))
-
-            # Применяем EventFilter для фильтрации событий
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(
-                    "read_event_history: applying event filter %s to %d events",
-                    "present" if evfilter else "absent",
-                    len(results),
-                )
-            results = apply_event_filter(results, evfilter)
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(
-                    "read_event_history: after filter %d events (from %d)",
-                    len(results),
-                    len(rows),
-                )
-
-            # Определяем время продолжения
-            cont = None
-            if len(results) == limit and len(rows) > 0:
-                cont = rows[-1]['event_timestamp']
-
-            return results, cont
-        except Exception as e:
-            self.logger.error(f"Failed to read event history for {source_id}: {e}")
+                    events.append(Event.from_field_dict(decode_payload(row["event_data"])))
+                except Exception as exc:
+                    self.logger.debug("Событие не собрано: %s", exc)
+            events = apply_event_filter(events, evfilter)
+            return events, continuation_point(rows, len(events), window.limit, "event_timestamp")
+        except Exception as exc:
+            self.logger.error("История событий %s не прочитана: %s", source_id, exc)
             return [], None
 
-    @staticmethod
-    def _get_bounds(
-        start: Optional[datetime], 
-        end: Optional[datetime], 
-        nb_values: Optional[int]
-    ) -> Tuple[datetime, datetime, str, int]:
-        """
-        Определение границ и параметров для запроса истории.
-        
-        Args:
-            start: Начальное время
-            end: Конечное время
-            nb_values: Количество значений
-            
-        Returns:
-            Кортеж (начальное время, конечное время, порядок сортировки, лимит)
-        """
-        order = "ASC"
-        if start is None or start == ua.get_win_epoch():
-            order = "DESC"
-            start = ua.get_win_epoch()
-        if end is None or end == ua.get_win_epoch():
-            end = datetime.now(timezone.utc) + timedelta(days=1)
-        if start < end:
-            start_time = start
-            end_time = end
-        else:
-            order = "DESC"
-            start_time = end
-            end_time = start
-        limit = nb_values if nb_values else 10000
-        
-        return start_time, end_time, order, limit
+    async def _resolve_source_id(self, source_id: Any) -> Optional[int]:
+        registered = self._event_source_ids.get(source_id)
+        if registered is not None:
+            return registered[0]
+        key = format_node_id(source_id)
+        value = self._caches.event_sources.get(key)
+        if value is None:
+            value = await self._events.find_source(key)
+            if value is not None:
+                self._caches.event_sources.put(key, value)
+        return value
 
     async def execute_sql_delete(
-        self, 
-        condition: str, 
-        args: Iterable, 
-        table: str, 
-        node_id: ua.NodeId
+        self,
+        condition: str,
+        args: Iterable,
+        table: str,
+        node_id: ua.NodeId,
     ) -> None:
-        """
-        Выполнение SQL запроса удаления данных.
-        
-        Args:
-            condition: SQL условие для удаления
-            args: Аргументы для SQL запроса
-            table: Имя таблицы (variables_history или events_history)
-            node_id: Идентификатор узла для логирования
+        """Удалить строки истории по условию.
+
+        Условие подставляется в SQL как есть — метод достался от интерфейса
+        asyncua и предназначен для вызова кодом сервера, не клиентом.
         """
         try:
-            # Определяем полное имя таблицы со схемой
-            if table == "variables_history":
-                full_table = f'"{self._schema}".variables_history'
-            elif table == "events_history":
-                full_table = f'"{self._schema}".events_history'
-            else:
-                # Для обратной совместимости
-                full_table = f'"{self._schema}".{table}'
-            
-            await self._execute(f'DELETE FROM {full_table} WHERE {condition}', *args)
-        except Exception as e:
-            self.logger.error(f"Failed to delete data for {node_id}: {e}")
+            validate_table_name(table)
+            await self._db.execute(
+                f'DELETE FROM "{self._schema}"."{table}" WHERE {condition}', *args
+            )
+        except Exception as exc:
+            self.logger.error("Данные %s не удалены: %s", node_id, exc)
+
+    # ================================================================== последние значения
 
     async def read_last_value(self, node_id: ua.NodeId) -> Optional[ua.DataValue]:
-        """
-        Быстрое получение последнего сохраненного значения переменной.
-        
-        Args:
-            node_id: Идентификатор узла OPC UA
-            
-        Returns:
-            Последнее значение или None если не найдено
-        """
+        """Последнее значение переменной: из памяти, из кэша в БД или из истории."""
         try:
-            # Получаем variable_id
-            node_data = self._datachanges_period.get(node_id)
-            if node_data is None:
-                # Если mapping не найден, пробуем получить variable_id из кэша по node_id_str
-                node_id_str = self._format_node_id(node_id)
-                cached_vid = self._variable_metadata_cache.get(node_id_str)
-                if cached_vid is not None:
-                    self._cache_stats["variable_metadata_hits"] += 1
-                    variable_id = cached_vid
-                else:
-                    self._cache_stats["variable_metadata_misses"] += 1
-                    # Если в кэше нет, получаем variable_id из базы данных
-                    variable_id = await self._fetchval(f'''
-                        SELECT variable_id FROM "{self._schema}".variable_metadata
-                        WHERE node_id = $1
-                        LIMIT 1
-                    ''', node_id_str)
-
-                if variable_id is not None:
-                    # Обновляем кэш
-                    self._variable_metadata_cache[node_id_str] = variable_id
-            else:
-                # Проверяем формат данных
-                if len(node_data) == 3:
-                    period, count, variable_id = node_data
-                elif len(node_data) == 4:
-                    # Формат для событий: (period, count, source_db_id, event_ids)
-                    self.logger.warning(f"Node {node_id} is registered as event source, not variable")
-                    return None
-                else:
-                    self.logger.warning(f"Unexpected data format for node {node_id}: {node_data}")
-                    return None
-            
+            if node_id in self._event_source_ids:
+                return None
+            variable_id = await self._resolve_variable_id(node_id, create=False)
             if variable_id is None:
                 return None
 
-            # Пытаемся получить из in-memory кэша последних значений
-            if self._history_last_values_cache_enabled:
-                cached = self._last_values_cache.get(variable_id)
-                if cached is not None:
-                    self._cache_stats["last_values_memory_hits"] += 1
-                    return cached
-                else:
-                    self._cache_stats["last_values_memory_misses"] += 1
+            cached = self._caches.last_values.get(variable_id)
+            if cached is not None:
+                return cached
 
-            # Если в памяти нет, читаем из таблицы кэша в БД
-            row = await self._fetchrow(f'''
-                SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
-                FROM "{self._schema}".variables_last_value
-                WHERE variable_id = $1
-            ''', variable_id)
-            
-            if row is not None:
-                # Попали в таблицу-кэш последних значений
-                self._cache_stats["last_values_table_hits"] += 1
-                # Преобразуем в DataValue
-                return ua.DataValue(
-                    Value=variant_from_binary(Buffer(row['variantbinary'])),
-                    StatusCode_=ua.StatusCode(row['statuscode']),
-                    SourceTimestamp=row['sourcetimestamp'],
-                    ServerTimestamp=row['servertimestamp']
-                )
-            
-            # Fallback: получаем из основной таблицы через покрывающий индекс
-            self._cache_stats["last_values_table_misses"] += 1
-            row = await self._fetchrow(f'''
-                SELECT sourcetimestamp, servertimestamp, statuscode, varianttype
-                FROM "{self._schema}".variables_history
-                WHERE variable_id = $1
-                ORDER BY sourcetimestamp DESC
-                LIMIT 1
-            ''', variable_id)
-            
-            if row is not None:
-                self._cache_stats["last_values_history_fallbacks"] += 1
-                # Получаем variantbinary отдельным запросом
-                variantbinary_row = await self._fetchrow(f'''
-                    SELECT variantbinary
-                    FROM "{self._schema}".variables_history
-                    WHERE variable_id = $1 AND sourcetimestamp = $2
-                    LIMIT 1
-                ''', variable_id, row['sourcetimestamp'])
-                
-                if variantbinary_row is not None:
-                    variantbinary = variantbinary_row['variantbinary']
-                else:
-                    return None
-            
-            if row is not None:
-                # Преобразуем в DataValue
-                return ua.DataValue(
-                    Value=variant_from_binary(Buffer(variantbinary)),
-                    StatusCode_=ua.StatusCode(row['statuscode']),
-                    SourceTimestamp=row['sourcetimestamp'],
-                    ServerTimestamp=row['servertimestamp']
-                )
-            
-            return None
-            
-        except Exception as e:
-            self.logger.error(f"Failed to read last value for {node_id}: {e}")
+            value = await self._variables.read_last_value(variable_id)
+            if value is not None:
+                self._caches.stats.hit("last_values_table_hits")
+                return value
+            self._caches.stats.hit("last_values_table_misses")
+
+            value = await self._variables.read_latest_from_history(variable_id)
+            if value is not None:
+                self._caches.stats.hit("last_values_history_fallbacks")
+            return value
+        except Exception as exc:
+            self.logger.error("Последнее значение %s не прочитано: %s", node_id, exc)
             return None
 
     async def read_last_values(
@@ -4241,296 +1020,98 @@ class HistoryTimescale(HistoryStorageInterface):
         *,
         allow_history_fallback: bool = True,
     ) -> dict:
-        """
-        Быстрое получение последних сохраненных значений для списка переменных.
+        """Последние значения списка переменных.
 
-        Args:
-            node_ids: Список идентификаторов узлов OPC UA
-            history_lookback: Ограничение фоллбэк-чтения из variables_history
-                последними history_lookback времени. Позволяет TimescaleDB
-                исключить старые чанки: без ограничения переменные, у которых
-                нет данных вообще, заставляют пробегать индексы всех чанков.
-                None — без ограничения (полная история).
-            allow_history_fallback: Если False — только memory/variables_last_value,
-                без LATERAL по hypertable. Нужен для bulk-restore при старте:
-                фоллбэк по тысячам «пустых» переменных иначе упирается в
-                db_query_timeout и рвёт пул соединений.
-
-        Returns:
-            Словарь {node_id: DataValue} или {node_id: None} для отсутствующих
+        ``history_lookback`` ограничивает поиск в истории, позволяя TimescaleDB
+        отбросить старые чанки: без него переменная без данных заставляет
+        пробегать индексы всех чанков. ``allow_history_fallback=False`` не ходит
+        в историю вовсе — нужно при массовом восстановлении на старте.
         """
-        result = {}
-        
+        result: Dict[Any, Optional[ua.DataValue]] = {}
         try:
-            # Получаем variable_id для всех узлов
-            variable_ids = []
-            node_to_variable = {}
-            
+            by_variable: Dict[int, Any] = {}
             for node_id in node_ids:
-                node_data = self._datachanges_period.get(node_id)
-                if node_data is None:
-                    # Если mapping не найден, пробуем получить variable_id из кэша по node_id_str
-                    node_id_str = self._format_node_id(node_id)
-                    cached_vid = self._variable_metadata_cache.get(node_id_str)
-                    if cached_vid is not None:
-                        self._cache_stats["variable_metadata_hits"] += 1
-                        variable_id = cached_vid
-                    else:
-                        self._cache_stats["variable_metadata_misses"] += 1
-                        # Если в кэше нет, получаем variable_id из базы данных
-                        variable_id = await self._fetchval(f'''
-                            SELECT variable_id FROM "{self._schema}".variable_metadata
-                            WHERE node_id = $1
-                            LIMIT 1
-                        ''', node_id_str)
-
-                    if variable_id is not None:
-                        # Обновляем кэш
-                        self._variable_metadata_cache[node_id_str] = variable_id
-                else:
-                    # Проверяем формат данных
-                    if len(node_data) == 3:
-                        period, count, variable_id = node_data
-                    elif len(node_data) == 4:
-                        # Формат для событий: (period, count, source_db_id, event_ids)
-                        result[node_id] = None
-                        continue
-                    else:
-                        self.logger.warning(f"Unexpected data format for node {node_id}: {node_data}")
-                        result[node_id] = None
-                        continue
-                
-                if variable_id is not None:
-                    variable_ids.append(variable_id)
-                    node_to_variable[variable_id] = node_id
-                else:
+                if node_id in self._event_source_ids:
                     result[node_id] = None
-
-            if not variable_ids:
-                return result
-
-            # Сначала пробуем получить значения из in-memory кэша
-            remaining_variable_ids: List[int] = []
-            if self._history_last_values_cache_enabled:
-                for vid in variable_ids:
-                    cached = self._last_values_cache.get(vid)
-                    if cached is not None:
-                        self._cache_stats["last_values_memory_hits"] += 1
-                        node_id = node_to_variable[vid]
-                        result[node_id] = cached
-                    else:
-                        self._cache_stats["last_values_memory_misses"] += 1
-                        remaining_variable_ids.append(vid)
-            else:
-                remaining_variable_ids = list(variable_ids)
-
-            if not remaining_variable_ids:
-                return result
-
-            # Получаем отсутствующие значения из таблицы кэша в БД батчем
-            rows = await self._fetch(f'''
-                SELECT variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
-                FROM "{self._schema}".variables_last_value
-                WHERE variable_id = ANY($1)
-            ''', remaining_variable_ids)
-
-            # Обрабатываем результаты из таблицы кэша
-            cached_variable_ids = set()
-            for row in rows:
-                variable_id = row['variable_id']
-                node_id = node_to_variable[variable_id]
-                cached_variable_ids.add(variable_id)
-                
-                dv = ua.DataValue(
-                    Value=variant_from_binary(Buffer(row['variantbinary'])),
-                    StatusCode_=ua.StatusCode(row['statuscode']),
-                    SourceTimestamp=row['sourcetimestamp'],
-                    ServerTimestamp=row['servertimestamp']
-                )
-                result[node_id] = dv
-                self._update_last_values_cache(variable_id, dv)
-                self._cache_stats["last_values_table_hits"] += 1
-            
-            # Fallback для узлов, которых нет ни в памяти, ни в таблице кэша.
-            # LATERAL top-1 на каждый variable_id: планировщик идёт по индексу
-            # (variable_id, sourcetimestamp DESC) от новых чанков к старым и
-            # останавливается на первом значении. DISTINCT ON ... ORDER BY на
-            # hypertable с большим числом чанков деградирует до слияния индексов
-            # всех чанков (секунды на вызов).
-            missing_variable_ids = [vid for vid in remaining_variable_ids if vid not in cached_variable_ids]
-            if missing_variable_ids and not allow_history_fallback:
-                self._cache_stats["last_values_history_fallbacks_skipped"] = (
-                    self._cache_stats.get("last_values_history_fallbacks_skipped", 0)
-                    + len(missing_variable_ids)
-                )
-                missing_variable_ids = []
-            if missing_variable_ids:
-                if history_lookback is not None:
-                    since = datetime.now(timezone.utc) - history_lookback
-                    fallback_rows = await self._fetch(f'''
-                        SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
-                               h.statuscode, h.varianttype, h.variantbinary
-                        FROM unnest($1::bigint[]) AS v(variable_id)
-                        CROSS JOIN LATERAL (
-                            SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
-                            FROM "{self._schema}".variables_history
-                            WHERE variable_id = v.variable_id
-                              AND sourcetimestamp >= $2
-                            ORDER BY sourcetimestamp DESC
-                            LIMIT 1
-                        ) h
-                    ''', missing_variable_ids, since)
+                    continue
+                variable_id = await self._resolve_variable_id(node_id, create=False)
+                if variable_id is None:
+                    result[node_id] = None
                 else:
-                    fallback_rows = await self._fetch(f'''
-                        SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
-                               h.statuscode, h.varianttype, h.variantbinary
-                        FROM unnest($1::bigint[]) AS v(variable_id)
-                        CROSS JOIN LATERAL (
-                            SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
-                            FROM "{self._schema}".variables_history
-                            WHERE variable_id = v.variable_id
-                            ORDER BY sourcetimestamp DESC
-                            LIMIT 1
-                        ) h
-                    ''', missing_variable_ids)
+                    by_variable[variable_id] = node_id
 
-                if fallback_rows:
-                    self._cache_stats["last_values_history_fallbacks"] += len(fallback_rows)
-                    # Самозалечивание: найденное фоллбэком фиксируем в таблице-кэше
-                    # variables_last_value, чтобы при следующих чтениях (и рестартах)
-                    # фоллбэк по истории для этих переменных больше не требовался
+            remaining = []
+            for variable_id, node_id in by_variable.items():
+                cached = self._caches.last_values.get(variable_id)
+                if cached is not None:
+                    result[node_id] = cached
+                else:
+                    remaining.append(variable_id)
+
+            if remaining:
+                stored = await self._variables.read_last_values(remaining)
+                for variable_id, value in stored.items():
+                    result[by_variable[variable_id]] = value
+                    self._caches.last_values.put(variable_id, value)
+                    self._caches.stats.hit("last_values_table_hits")
+                remaining = [v for v in remaining if v not in stored]
+
+            if remaining and not allow_history_fallback:
+                self._caches.stats.hit("last_values_history_fallbacks_skipped", len(remaining))
+                remaining = []
+
+            if remaining:
+                since = (
+                    datetime.now(timezone.utc) - history_lookback
+                    if history_lookback is not None
+                    else None
+                )
+                found = await self._variables.latest_from_history_many(remaining, since)
+                if found:
+                    self._caches.stats.hit("last_values_history_fallbacks", len(found))
                     try:
-                        await self._execute(f'''
-                            INSERT INTO "{self._schema}".variables_last_value
-                            (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
-                            SELECT * FROM unnest(
-                                $1::bigint[], $2::timestamptz[], $3::timestamptz[],
-                                $4::integer[], $5::integer[], $6::bytea[]
-                            )
-                            ON CONFLICT (variable_id) DO UPDATE
-                                SET sourcetimestamp = EXCLUDED.sourcetimestamp,
-                                    servertimestamp = EXCLUDED.servertimestamp,
-                                    statuscode = EXCLUDED.statuscode,
-                                    varianttype = EXCLUDED.varianttype,
-                                    variantbinary = EXCLUDED.variantbinary,
-                                    is_seed = FALSE,
-                                    updated_at = NOW()
-                                WHERE "{self._schema}".variables_last_value.is_seed
-                                   OR "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
-                        ''',
-                            [r['variable_id'] for r in fallback_rows],
-                            [r['sourcetimestamp'] for r in fallback_rows],
-                            [r['servertimestamp'] for r in fallback_rows],
-                            [r['statuscode'] for r in fallback_rows],
-                            [r['varianttype'] for r in fallback_rows],
-                            [r['variantbinary'] for r in fallback_rows],
-                        )
-                    except Exception as e:
-                        self.logger.debug(f"Failed to backfill variables_last_value from fallback: {e}")
+                        await self._variables.upsert_last_values_rows(found)
+                    except Exception as exc:
+                        self.logger.debug("Кэш последних значений не дополнен: %s", exc)
+                for row in found:
+                    variable_id = int(row["variable_id"])
+                    value = row_to_datavalue(row)
+                    result[by_variable[variable_id]] = value
+                    self._caches.last_values.put(variable_id, value)
 
-                for row in fallback_rows:
-                    variable_id = row['variable_id']
-                    node_id = node_to_variable[variable_id]
-                    dv = ua.DataValue(
-                        Value=variant_from_binary(Buffer(row['variantbinary'])),
-                        StatusCode_=ua.StatusCode(row['statuscode']),
-                        SourceTimestamp=row['sourcetimestamp'],
-                        ServerTimestamp=row['servertimestamp']
-                    )
-                    result[node_id] = dv
-                    self._update_last_values_cache(variable_id, dv)
-            
-            # Заполняем None для узлов, которых вообще нет в истории
             for node_id in node_ids:
-                if node_id not in result:
-                    result[node_id] = None
-            
+                result.setdefault(node_id, None)
             return result
-            
-        except Exception as e:
-            self.logger.error(f"Failed to read last values: {e}")
-            # Возвращаем None для всех узлов при ошибке
+        except Exception as exc:
+            self.logger.error("Последние значения не прочитаны: %s", exc)
             return {node_id: None for node_id in node_ids}
 
-    def _resolve_variable_id_cached(self, node_id: ua.NodeId) -> Optional[int]:
-        """variable_id из mapping историзации или кэша метаданных, без обращения к БД."""
-        node_data = self._datachanges_period.get(node_id)
-        if node_data is not None and len(node_data) == 3:
-            return node_data[2]
-        return self._variable_metadata_cache.get(self._format_node_id(node_id))
-
     async def seed_last_values(self, items: List[Tuple[ua.NodeId, ua.DataValue]]) -> int:
-        """
-        Гарантирует строку в variables_last_value для каждой переданной переменной:
-        вставляет значение по умолчанию с is_seed=TRUE, НЕ трогая существующие
-        строки (ON CONFLICT DO NOTHING). Вместе с backfill_last_values поддерживает
-        инвариант «у каждой зарегистрированной переменной есть строка последнего
-        значения», благодаря которому чтение последних значений никогда не
-        обращается к таблице истории.
+        """Создать строки последних значений для переменных, у которых их нет.
 
-        Args:
-            items: Пары (node_id, DataValue с текущим/дефолтным значением узла)
-
-        Returns:
-            Число вставленных строк-сидов.
+        Существующие строки не трогаются. Вместе с backfill_last_values это
+        держит инвариант «у каждой зарегистрированной переменной есть строка»,
+        благодаря которому чтение последнего значения не ходит в историю.
         """
-        now = datetime.now(timezone.utc)
-        vids: List[int] = []
-        source_ts: List[datetime] = []
-        server_ts: List[datetime] = []
-        statuscodes: List[int] = []
-        varianttypes: List[int] = []
-        binaries: List[bytes] = []
-        seen: set = set()
-        dv_by_vid: Dict[int, ua.DataValue] = {}
-        for node_id, dv in items:
-            variable_id = self._resolve_variable_id_cached(node_id)
+        prepared: List[Tuple[int, ua.DataValue]] = []
+        seen = set()
+        for node_id, datavalue in items:
+            variable_id = self._variable_ids.get(node_id)
+            if variable_id is None:
+                variable_id = self._caches.variables.peek(format_node_id(node_id))
             if variable_id is None or variable_id in seen:
                 continue
-            try:
-                variant = getattr(dv, 'Value', None) if dv is not None else None
-                if variant is None:
-                    variant = ua.Variant(None)
-                binary = variant_to_binary(variant)
-            except Exception as e:
-                self.logger.debug(f"seed_last_values: cannot serialize value for {node_id}: {e}")
-                continue
             seen.add(variable_id)
-            vids.append(variable_id)
-            source_ts.append(getattr(dv, 'SourceTimestamp', None) or now)
-            server_ts.append(getattr(dv, 'ServerTimestamp', None) or now)
-            sc = getattr(dv, 'StatusCode', None)
-            statuscodes.append(sc.value if sc is not None else 0)
-            varianttypes.append(variant.VariantType.value)
-            binaries.append(binary)
-            dv_by_vid[variable_id] = dv
+            prepared.append(
+                (variable_id, datavalue if datavalue is not None else ua.DataValue(Value=ua.Variant(None)))
+            )
 
-        if not vids:
-            return 0
-
-        rows = await self._fetch(f'''
-            INSERT INTO "{self._schema}".variables_last_value
-                (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary, is_seed)
-            SELECT u.variable_id, u.sourcetimestamp, u.servertimestamp,
-                   u.statuscode, u.varianttype, u.variantbinary, TRUE
-            FROM unnest(
-                $1::bigint[], $2::timestamptz[], $3::timestamptz[],
-                $4::integer[], $5::integer[], $6::bytea[]
-            ) AS u(variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
-            ON CONFLICT (variable_id) DO NOTHING
-            RETURNING variable_id
-        ''', vids, source_ts, server_ts, statuscodes, varianttypes, binaries)
-
-        inserted = len(rows)
-        for row in rows:
-            dv = dv_by_vid.get(row['variable_id'])
-            if dv is not None:
-                self._update_last_values_cache(row['variable_id'], dv)
-        self.logger.info(
-            "seed_last_values: %d of %d rows seeded (existing preserved)",
-            inserted, len(vids),
-        )
-        return inserted
+        created = await self._variables.seed_last_values(prepared)
+        values = dict(prepared)
+        for variable_id in created:
+            self._caches.last_values.put(variable_id, values[variable_id])
+        self.logger.info("Созданы строки последних значений: %d из %d", len(created), len(prepared))
+        return len(created)
 
     async def backfill_last_values(
         self,
@@ -4543,194 +1124,277 @@ class HistoryTimescale(HistoryStorageInterface):
             Callable[[List[Tuple[str, ua.DataValue]]], Union[Coroutine[Any, Any, Any], Any]]
         ] = None,
     ) -> dict:
+        """Сверить строки-заглушки последних значений с историей.
+
+        Заглушка заменяется реальным последним значением из истории; заглушка,
+        для которой истории нет, помечается сверенной. Идёт мелкими порциями,
+        чтобы не упираться в таймауты запросов.
         """
-        Фоновая идемпотентная сверка variables_last_value с историей:
-          - зарегистрированным переменным без строки добавляется последнее
-            значение из истории (если оно есть);
-          - строки-сиды (is_seed=TRUE) замещаются реальным последним значением
-            из истории; сиды без истории помечаются сверенными (is_seed=FALSE).
-
-        LATERAL по hypertable выполняется только для кандидатов и (при заданном
-        history_lookback) с time predicate для chunk exclusion. По умолчанию
-        мелкие чанки (100), чтобы не упираться в db_query_timeout.
-
-        Args:
-            chunk_size: размер батча variable_id
-            pause_sec: пауза между чанками (снижение нагрузки на пул)
-            query_timeout_sec: таймаут acquire/SQL на чанк
-            history_lookback: ограничить поиск в истории (None — вся история)
-            on_chunk_restored: async/sync callback со списком
-                (node_id_str, DataValue) для применения в address space
-
-        Returns:
-            Статистика: candidates, restored_from_history, confirmed_defaults,
-            errors, restored_items (list[(node_id_str, DataValue)])
-        """
-        await self._ensure_pool()
-        # Только строки-сиды: отсутствующие last_value должен создавать seed_last_values
-        # при historize. Иначе orphan metadata без истории вечно гоняет LATERAL.
-        rows = await self._fetch(f'''
-            SELECT m.variable_id, m.node_id
-            FROM "{self._schema}".variable_metadata m
-            INNER JOIN "{self._schema}".variables_last_value lv ON lv.variable_id = m.variable_id
-            WHERE lv.is_seed
-            ORDER BY m.variable_id
-        ''')
-        candidate_ids = [r['variable_id'] for r in rows]
-        node_id_by_vid = {r['variable_id']: r['node_id'] for r in rows}
-        stats = {
-            "candidates": len(candidate_ids),
+        candidates = await self._variables.seed_candidates()
+        node_by_id = {int(row["variable_id"]): row["node_id"] for row in candidates}
+        ids = list(node_by_id)
+        stats: Dict[str, Any] = {
+            "candidates": len(ids),
             "restored_from_history": 0,
             "confirmed_defaults": 0,
             "errors": 0,
             "restored_items": [],
         }
-        if not candidate_ids:
+        if not ids:
             return stats
-        since = None
-        if history_lookback is not None:
-            since = datetime.now(timezone.utc) - history_lookback
-        self.logger.info(
-            "Backfill variables_last_value: %d candidates (chunk=%d, lookback=%s)",
-            len(candidate_ids),
-            max(1, int(chunk_size)),
-            history_lookback if history_lookback is not None else "full",
+
+        since = (
+            datetime.now(timezone.utc) - history_lookback if history_lookback is not None else None
         )
-
-        chunk_size = max(1, int(chunk_size))
-        for i in range(0, len(candidate_ids), chunk_size):
-            chunk = candidate_ids[i:i + chunk_size]
+        step = max(1, int(chunk_size))
+        for offset in range(0, len(ids), step):
+            chunk = ids[offset : offset + step]
             try:
-                pool = self._pool
 
-                async def _op(chunk_ids=chunk):
-                    async with pool.acquire(timeout=query_timeout_sec) as conn:
-                        if since is not None:
-                            found = await conn.fetch(f'''
-                                SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
-                                       h.statuscode, h.varianttype, h.variantbinary
-                                FROM unnest($1::bigint[]) AS v(variable_id)
-                                CROSS JOIN LATERAL (
-                                    SELECT sourcetimestamp, servertimestamp, statuscode,
-                                           varianttype, variantbinary
-                                    FROM "{self._schema}".variables_history
-                                    WHERE variable_id = v.variable_id
-                                      AND sourcetimestamp >= $2
-                                    ORDER BY sourcetimestamp DESC
-                                    LIMIT 1
-                                ) h
-                            ''', chunk_ids, since, timeout=query_timeout_sec)
-                        else:
-                            found = await conn.fetch(f'''
-                                SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
-                                       h.statuscode, h.varianttype, h.variantbinary
-                                FROM unnest($1::bigint[]) AS v(variable_id)
-                                CROSS JOIN LATERAL (
-                                    SELECT sourcetimestamp, servertimestamp, statuscode,
-                                           varianttype, variantbinary
-                                    FROM "{self._schema}".variables_history
-                                    WHERE variable_id = v.variable_id
-                                    ORDER BY sourcetimestamp DESC
-                                    LIMIT 1
-                                ) h
-                            ''', chunk_ids, timeout=query_timeout_sec)
-                        if found:
-                            await conn.execute(f'''
-                                INSERT INTO "{self._schema}".variables_last_value
-                                    (variable_id, sourcetimestamp, servertimestamp, statuscode,
-                                     varianttype, variantbinary)
-                                SELECT * FROM unnest(
-                                    $1::bigint[], $2::timestamptz[], $3::timestamptz[],
-                                    $4::integer[], $5::integer[], $6::bytea[]
-                                )
-                                ON CONFLICT (variable_id) DO UPDATE
-                                    SET sourcetimestamp = EXCLUDED.sourcetimestamp,
-                                        servertimestamp = EXCLUDED.servertimestamp,
-                                        statuscode = EXCLUDED.statuscode,
-                                        varianttype = EXCLUDED.varianttype,
-                                        variantbinary = EXCLUDED.variantbinary,
-                                        is_seed = FALSE,
-                                        updated_at = NOW()
-                                    WHERE "{self._schema}".variables_last_value.is_seed
-                                       OR "{self._schema}".variables_last_value.sourcetimestamp
-                                          <= EXCLUDED.sourcetimestamp
-                            ''',
-                                [r['variable_id'] for r in found],
-                                [r['sourcetimestamp'] for r in found],
-                                [r['servertimestamp'] for r in found],
-                                [r['statuscode'] for r in found],
-                                [r['varianttype'] for r in found],
-                                [r['variantbinary'] for r in found],
-                                timeout=query_timeout_sec,
-                            )
-                        # Сиды без истории в этом окне — считаем сверенными
-                        await conn.execute(f'''
-                            UPDATE "{self._schema}".variables_last_value
-                            SET is_seed = FALSE
-                            WHERE variable_id = ANY($1) AND is_seed
-                        ''', chunk_ids, timeout=query_timeout_sec)
-                        return found
+                async def _chunk() -> List[Any]:
+                    found = await self._variables.latest_from_history_many(chunk, since)
+                    await self._variables.upsert_last_values_rows(found)
+                    await self._variables.confirm_seeds(chunk)
+                    return found
 
-                found = await asyncio.wait_for(_op(), timeout=query_timeout_sec * 2)
+                found = await asyncio.wait_for(_chunk(), timeout=query_timeout_sec * 2)
                 stats["restored_from_history"] += len(found)
                 stats["confirmed_defaults"] += len(chunk) - len(found)
 
-                chunk_items: List[Tuple[str, ua.DataValue]] = []
+                restored: List[Tuple[str, ua.DataValue]] = []
                 for row in found:
-                    node_id_str = node_id_by_vid.get(row['variable_id'])
-                    if not node_id_str:
-                        continue
-                    try:
-                        dv = ua.DataValue(
-                            Value=variant_from_binary(Buffer(row['variantbinary'])),
-                            StatusCode_=ua.StatusCode(row['statuscode']),
-                            SourceTimestamp=row['sourcetimestamp'],
-                            ServerTimestamp=row['servertimestamp'],
-                        )
-                    except Exception as e:
-                        self.logger.debug(
-                            "Backfill: cannot decode value for %s: %s", node_id_str, e
-                        )
-                        continue
-                    self._update_last_values_cache(row['variable_id'], dv)
-                    item = (node_id_str, dv)
-                    chunk_items.append(item)
-                    # Полный список — только без callback (иначе O(N) память на десятки тысяч)
+                    variable_id = int(row["variable_id"])
+                    value = row_to_datavalue(row)
+                    self._caches.last_values.put(variable_id, value)
+                    restored.append((node_by_id[variable_id], value))
+                    # Полный список — только без обратного вызова, иначе десятки
+                    # тысяч значений держались бы в памяти до конца сверки.
                     if on_chunk_restored is None:
-                        stats["restored_items"].append(item)
+                        stats["restored_items"].append((node_by_id[variable_id], value))
 
-                if chunk_items and on_chunk_restored is not None:
+                if restored and on_chunk_restored is not None:
                     try:
-                        result = on_chunk_restored(chunk_items)
-                        if asyncio.iscoroutine(result):
-                            await result
-                    except Exception as e:
-                        self.logger.warning(
-                            "Backfill on_chunk_restored failed (%d items): %r",
-                            len(chunk_items), e,
-                        )
-            except Exception as e:
+                        outcome = on_chunk_restored(restored)
+                        if asyncio.iscoroutine(outcome):
+                            await outcome
+                    except Exception as exc:
+                        self.logger.warning("Обработчик восстановленных значений упал: %r", exc)
+            except Exception as exc:
                 stats["errors"] += 1
-                self.logger.warning("Backfill chunk failed (%d ids): %r", len(chunk), e)
+                self.logger.warning("Порция сверки (%d переменных) не прошла: %r", len(chunk), exc)
             if pause_sec > 0:
                 await asyncio.sleep(pause_sec)
 
-        # Не засорять лог полным списком DataValue
-        log_stats = {
-            k: v for k, v in stats.items() if k != "restored_items"
-        }
-        log_stats["restored_items_count"] = len(stats["restored_items"])
-        self.logger.info("Backfill variables_last_value done: %s", log_stats)
+        summary = {k: v for k, v in stats.items() if k != "restored_items"}
+        summary["restored_items_count"] = stats["restored_from_history"]
+        self.logger.info("Сверка последних значений завершена: %s", summary)
         return stats
 
-    async def close(self) -> None:
-        """Закрытие модуля историзации"""
-        # Останавливаем фоновые буферы записи
-        if self._value_write_buffer:
-            await self._value_write_buffer.stop()
-        if self._event_write_buffer:
-            await self._event_write_buffer.stop()
+    # ================================================================== ретенция
 
-        if self._pool:
-            await self._pool.close()
-            self.logger.info("HistoryTimescale closed")
+    async def reapply_global_retention_policy(
+        self,
+        period: Optional[timedelta] = None,
+        *,
+        drop_immediately: bool = False,
+    ) -> None:
+        """Переустановить глобальную политику хранения без перезапуска.
+
+        ``period=None`` оставляет текущий период; если и текущий не задан,
+        политика снимается — данные хранятся бессрочно.
+        """
+        if not await self._bootstrap.timescaledb_available():
+            self.logger.warning("TimescaleDB не найдена: политику хранения не применить")
+            return
+        if period is not None:
+            self._settings = StorageSettings(
+                connection=self._settings.connection,
+                timeouts=self._settings.timeouts,
+                keepalive=self._settings.keepalive,
+                write=self._settings.write,
+                cache=self._settings.cache,
+                global_retention_period=period,
+            )
+        await self._bootstrap.reapply_retention(
+            self._settings.global_retention_period, drop_immediately=drop_immediately
+        )
+        await self.refresh_history_settings_nodes()
+
+    # ================================================================== метрики
+
+    def get_performance_metrics(self) -> dict:
+        """Снимок метрик без обращения к БД."""
+        return self._metrics.snapshot(self._settings.metrics_snapshot())
+
+    def reset_performance_metrics(self) -> None:
+        self._metrics.reset()
+
+    def get_cache_stats(self) -> dict:
+        return self._caches.stats.as_dict()
+
+    def reset_cache_stats(self) -> None:
+        self._caches.stats.reset()
+
+    # ================================================================== узлы OPC UA
+
+    async def expose_history_settings_nodes(
+        self,
+        server: Any,
+        namespace_index: int,
+        *,
+        parent: Any = None,
+    ) -> None:
+        """Опубликовать настройки хранения в ``History/HistorySettings``."""
+        if server is None:
+            raise ValueError("server is required")
+        idx = int(namespace_index)
+        root = await opc_nodes.server_parent(server, parent)
+        history = await opc_nodes.get_or_add_object(root, idx, "History")
+        settings = await opc_nodes.get_or_add_object(history, idx, "HistorySettings")
+
+        nodes: Dict[str, Any] = {}
+        for name, initial in self._settings_values(timescale_available=False).items():
+            nodes[name] = await opc_nodes.get_or_add_variable(settings, idx, name, initial)
+        if self._publish_event_capabilities:
+            for name, initial in self._event_capability_values(backfill_complete=True).items():
+                nodes[name] = await opc_nodes.get_or_add_variable(settings, idx, name, initial)
+        self._settings_nodes = nodes
+        await self.refresh_history_settings_nodes()
+
+    async def refresh_history_settings_nodes(self) -> None:
+        if not self._settings_nodes:
+            return
+        try:
+            values = self._settings_values(
+                timescale_available=await self._bootstrap.timescaledb_available()
+            )
+            if self._publish_event_capabilities:
+                values.update(
+                    self._event_capability_values(backfill_complete=await self._backfill_complete())
+                )
+            await opc_nodes.write_values(self._settings_nodes, values)
+        except Exception:
+            return
+
+    def _settings_values(self, *, timescale_available: bool) -> Dict[str, ua.Variant]:
+        try:
+            version = importlib_metadata.version("uapg")
+        except Exception:
+            version = "unknown"
+        retention = self._settings.global_retention_period
+        write = self._settings.write
+        return {
+            "UapgVersion": ua.Variant(str(version), ua.VariantType.String),
+            "StorageType": ua.Variant("timescale", ua.VariantType.String),
+            "Schema": ua.Variant(str(self._schema), ua.VariantType.String),
+            "GlobalRetentionSeconds": ua.Variant(
+                int(retention.total_seconds()) if retention is not None else -1,
+                ua.VariantType.Int64,
+            ),
+            "WriteBatchEnabled": ua.Variant(bool(write.batch_enabled), ua.VariantType.Boolean),
+            "WriteMaxBatchSize": ua.Variant(int(write.max_batch_size), ua.VariantType.Int32),
+            "WriteMaxBatchIntervalSec": ua.Variant(
+                float(write.max_batch_interval_sec), ua.VariantType.Double
+            ),
+            "WriteQueueMaxSize": ua.Variant(int(write.queue_max_size), ua.VariantType.Int32),
+            "WriteDurabilityMode": ua.Variant(str(write.durability_mode), ua.VariantType.String),
+            "WriteReadConsistencyMode": ua.Variant(
+                str(write.read_consistency_mode), ua.VariantType.String
+            ),
+            "TimescaleExtensionAvailable": ua.Variant(
+                bool(timescale_available), ua.VariantType.Boolean
+            ),
+        }
+
+    def _event_capability_values(self, *, backfill_complete: bool) -> Dict[str, ua.Variant]:
+        sql_supported = (
+            self._v2_ready
+            and self._events_mode != StorageMode.LEGACY
+            and bool(self._events_config.sql_filter_fields)
+        )
+        return {
+            "EventsStorageVersion": ua.Variant("v2" if self._v2_ready else "v1", ua.VariantType.String),
+            "EventsStorageMode": ua.Variant(self._events_mode.value, ua.VariantType.String),
+            "EventsSqlFilterSupported": ua.Variant(sql_supported, ua.VariantType.Boolean),
+            "EventsSqlFilterFields": ua.Variant(
+                self._events_config.sql_filter_fields_csv() if sql_supported else "",
+                ua.VariantType.String,
+            ),
+            "EventsBackfillComplete": ua.Variant(backfill_complete, ua.VariantType.Boolean),
+        }
+
+    async def _backfill_complete(self) -> bool:
+        if not self._v2_ready:
+            return True
+        try:
+            return await self._events.backfill_lag() == 0
+        except Exception:
+            return False
+
+    async def expose_history_metrics_nodes(
+        self,
+        server: Any,
+        namespace_index: int,
+        *,
+        parent: Any = None,
+    ) -> None:
+        """Опубликовать метрики в ``History/HistoryMetrics``.
+
+        Значения обновляются только явным вызовом refresh_history_metrics_nodes().
+        """
+        if server is None:
+            raise ValueError("server is required")
+        idx = int(namespace_index)
+        root = await opc_nodes.server_parent(server, parent)
+        history = await opc_nodes.get_or_add_object(root, idx, "History")
+        metrics = await opc_nodes.get_or_add_object(history, idx, "HistoryMetrics")
+
+        nodes: Dict[str, Any] = {}
+        for path, value in opc_nodes.flatten_metrics(self.get_performance_metrics()).items():
+            nodes[path] = await opc_nodes.get_or_add_variable(
+                metrics, idx, opc_nodes.metric_node_name(path), opc_nodes.metric_variant(value)
+            )
+        self._metrics_nodes = nodes
+        await self.refresh_history_metrics_nodes()
+
+    async def refresh_history_metrics_nodes(self) -> None:
+        if not self._metrics_nodes:
+            return
+        try:
+            flattened = opc_nodes.flatten_metrics(self.get_performance_metrics())
+            await opc_nodes.write_values(
+                self._metrics_nodes,
+                {path: opc_nodes.metric_variant(value) for path, value in flattened.items()},
+            )
+        except Exception:
+            return
+
+    # ================================================================== поиск событий (v2)
+
+    async def _run_events_backfill(self, batch_size: int) -> Dict[str, Any]:
+        if self._event_search is None:
+            return {"backfill_lag_rows": -1, "v2_coverage_pct": 0.0}
+        return await self._event_search.backfill(batch_size)
+
+    async def _explain_event_filter(
+        self,
+        source_id: ua.NodeId,
+        start: Any,
+        end: Any,
+        nb_values: Optional[int],
+        evfilter: Any,
+    ) -> str:
+        if self._event_search is None:
+            return ""
+        window = resolve_window(start, end, nb_values)
+        source_db_id = await self._resolve_source_id(source_id)
+        if source_db_id is None:
+            return ""
+        from .storage.filter_plan import EventFilterPlanner
+
+        planner = EventFilterPlanner(field_aliases=self._events_config.field_aliases)
+        type_ids = await self._event_search._resolve_types(planner, planner.build(evfilter))
+        return await self._event_search.explain(
+            source_db_id, window.start, window.end, window.limit, window.order, type_ids
+        )
+

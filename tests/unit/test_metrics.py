@@ -51,6 +51,15 @@ def test_snapshot_paths_match_contract() -> None:
     assert _paths(snapshot) == baseline["metric_paths"]
 
 
+def test_value_types_match_contract() -> None:
+    """Тип значения выбирает тип данных узла OPC UA; другой тип в узел не запишется."""
+    from tests.contract.api_introspect import metric_types
+
+    baseline = json.loads(BASELINE_API.read_text())["metric_types"]
+    current = metric_types(MetricsRegistry().snapshot(_settings().metrics_snapshot()))
+    assert current == baseline
+
+
 def test_cache_keys_match_contract() -> None:
     baseline = json.loads(BASELINE_API.read_text())
     assert sorted(CacheStats().as_dict()) == baseline["cache_stat_keys"]
