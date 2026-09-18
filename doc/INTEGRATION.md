@@ -18,7 +18,10 @@
 ## uapg core
 
 - Без product-specific хардкода: indexed/filterable fields задаёт потребитель через `EventsV2Config`.
-- См. `src/uapg/v2/events_config.py`.
+- Реализация — `src/uapg/storage/events_config.py`; путь импорта `uapg.v2.events_config` сохранён.
+- С 3.0 фильтр по `EventType` из стандартного клиента (список подтипов `BaseEventType` числовыми NodeId)
+  разрешается правильно; в 0.2.x числовой NodeId принимался за `event_type_id` и такой запрос
+  возвращал пустую историю в режимах `dual`/`v2`.
 
 ## opc-vibro-iot-client (ovic) — следующий этап
 

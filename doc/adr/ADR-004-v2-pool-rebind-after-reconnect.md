@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — 2026-07-24
+Accepted — 2026-07-24. Superseded by ADR-005 (3.0): `Database` не отдаёт пул наружу, и класс ошибки исчез.
 
 ## Context
 
