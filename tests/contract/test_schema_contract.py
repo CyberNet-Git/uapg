@@ -146,6 +146,119 @@ async def test_v2_schema_matches_baseline(pg_database: str) -> None:
     _assert_matches("schema_v2.json", await _snapshot(pg_database))
 
 
+def _new_database(dsn: str, schema: str = SCHEMA):
+    from uapg.core.config import ConnectionSettings, Keepalive, Timeouts
+    from uapg.core.database import Database
+    from uapg.core.metrics import DatabaseMetrics
+
+    return Database(
+        connection=ConnectionSettings.build(**connect_kwargs(dsn), schema=schema),
+        timeouts=Timeouts.build(),
+        keepalive=Keepalive.build(),
+        metrics=DatabaseMetrics(),
+    )
+
+
+async def _bootstrap_new_schema(dsn: str, *, with_v2: bool = False) -> None:
+    from uapg.storage.bootstrap import SchemaBootstrap
+    from uapg.storage.migrations import SqlMigrator
+
+    database = _new_database(dsn)
+    await database.start()
+    try:
+        await SchemaBootstrap(database, SCHEMA).ensure_core_schema(
+            global_retention=timedelta(days=365)
+        )
+        if with_v2:
+            await SqlMigrator(database, SCHEMA).apply_all()
+    finally:
+        await database.stop()
+
+
+async def test_new_bootstrap_matches_baseline(pg_database: str) -> None:
+    """Главная проверка переноса схемы в SQL-файлы: она обязана совпасть с 0.2.15."""
+    await _bootstrap_new_schema(pg_database)
+    _assert_matches("schema_core.json", await _snapshot(pg_database))
+
+
+async def test_new_migrations_match_baseline(pg_database: str) -> None:
+    """Слой типизированных событий тоже обязан совпасть с 0.2.15."""
+    await _bootstrap_new_schema(pg_database, with_v2=True)
+    _assert_matches("schema_v2.json", await _snapshot(pg_database))
+
+
+async def test_migrations_are_applied_once(pg_database: str) -> None:
+    """Повторный запуск не должен переприменять функции и процедуры."""
+    from uapg.storage.bootstrap import SchemaBootstrap
+    from uapg.storage.migrations import SqlMigrator
+
+    database = _new_database(pg_database)
+    await database.start()
+    try:
+        await SchemaBootstrap(database, SCHEMA).ensure_core_schema()
+        migrator = SqlMigrator(database, SCHEMA)
+
+        first = await migrator.apply_all()
+        assert first, "первый запуск обязан применить миграции"
+        assert await migrator.apply_all() == []
+        assert await migrator.detect_v2_ready() is True
+    finally:
+        await database.stop()
+
+
+async def test_v2_not_ready_on_bare_core_schema(pg_database: str) -> None:
+    """Признак готовности должен честно говорить «нет» до миграций."""
+    from uapg.storage.bootstrap import SchemaBootstrap
+    from uapg.storage.migrations import SqlMigrator
+
+    database = _new_database(pg_database)
+    await database.start()
+    try:
+        await SchemaBootstrap(database, SCHEMA).ensure_core_schema()
+        assert await SqlMigrator(database, SCHEMA).detect_v2_ready() is False
+    finally:
+        await database.stop()
+
+
+async def test_new_bootstrap_is_idempotent(pg_database: str) -> None:
+    """Сервер перезапускают часто: повторный запуск не должен менять схему."""
+    await _bootstrap_new_schema(pg_database)
+    first = await _snapshot(pg_database)
+    await _bootstrap_new_schema(pg_database)
+    assert await _snapshot(pg_database) == first
+
+
+async def test_new_bootstrap_works_in_custom_schema(pg_database: str) -> None:
+    """Схема настраивается параметром, и всё должно оказаться именно в ней."""
+    import asyncpg
+
+    from uapg.core.config import ConnectionSettings, Keepalive, Timeouts
+    from uapg.core.database import Database
+    from uapg.core.metrics import DatabaseMetrics
+    from uapg.storage.bootstrap import SchemaBootstrap
+
+    database = Database(
+        connection=ConnectionSettings.build(**connect_kwargs(pg_database), schema="opcua_hist"),
+        timeouts=Timeouts.build(),
+        keepalive=Keepalive.build(),
+        metrics=DatabaseMetrics(),
+    )
+    await database.start()
+    try:
+        await SchemaBootstrap(database, "opcua_hist").ensure_core_schema()
+    finally:
+        await database.stop()
+
+    conn = await asyncpg.connect(pg_database)
+    try:
+        snapshot = await snapshot_schema(conn, "opcua_hist")
+    finally:
+        await conn.close()
+
+    assert "variables_history" in snapshot["tables"]
+    assert snapshot["timescale"]["hypertables"] == ["events_history", "variables_history"]
+
+
 async def test_schema_bootstrap_is_idempotent(pg_database: str) -> None:
     """Повторная инициализация не должна менять схему: сервер перезапускают часто."""
     from uapg.history_timescale_v2 import HistoryTimescaleV2
