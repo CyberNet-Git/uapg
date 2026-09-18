@@ -46,6 +46,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "uapg.sql.core" = ["*.sql"]
+"uapg.sql.queries" = ["*.sql"]
 "uapg.sql.migrations" = ["*.sql"]
 
 [tool.black]
