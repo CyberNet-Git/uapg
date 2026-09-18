@@ -9,6 +9,18 @@ import inspect
 from typing import Any, Dict, List
 
 
+def plain_signature(func: Any) -> str:
+    """Сигнатура без аннотаций типов.
+
+    Контракт — имена, порядок, вид и значения по умолчанию параметров. Текст
+    аннотаций зависит от того, вычислены они или отложены (``from __future__
+    import annotations``), и к поведению отношения не имеет.
+    """
+    signature = inspect.signature(func)
+    parameters = [p.replace(annotation=inspect.Parameter.empty) for p in signature.parameters.values()]
+    return str(signature.replace(parameters=parameters, return_annotation=inspect.Signature.empty))
+
+
 def public_members(cls: type) -> Dict[str, str]:
     """Сигнатуры публичных методов и свойств класса."""
     members: Dict[str, str] = {}
@@ -21,7 +33,7 @@ def public_members(cls: type) -> Dict[str, str]:
         if not callable(member):
             continue
         try:
-            members[name] = f"{name}{inspect.signature(member)}"
+            members[name] = f"{name}{plain_signature(member)}"
         except (TypeError, ValueError):
             members[name] = f"{name}(?)"
     return members
@@ -52,8 +64,8 @@ def api_snapshot() -> Dict[str, Any]:
         # Конструктор в getmembers отфильтровывается как приватный, а именно его
         # opc-vibro-iot-server заполняет тремя десятками именованных аргументов.
         "constructors": {
-            "HistoryTimescale": str(inspect.signature(HistoryTimescale.__init__)),
-            "HistoryTimescaleV2": str(inspect.signature(HistoryTimescaleV2.__init__)),
+            "HistoryTimescale": plain_signature(HistoryTimescale.__init__),
+            "HistoryTimescaleV2": plain_signature(HistoryTimescaleV2.__init__),
         },
         "classes": {
             "HistoryTimescale": public_members(HistoryTimescale),
