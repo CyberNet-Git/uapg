@@ -87,6 +87,10 @@
     "schema",
     "user"
   ],
+  "constructors": {
+    "HistoryTimescale": "(self, user: str = 'postgres', password: str = 'postmaster', database: str = 'opcua', host: str = 'localhost', port: int = 5432, min_size: int = 1, max_size: int = 10, schema: str = 'public', sslmode: Optional[str] = None, config_file: Optional[str] = None, encrypted_config: Optional[str] = None, master_password: Optional[str] = None, global_retention_period: Optional[datetime.timedelta] = None, history_write_batch_enabled: bool = True, history_write_max_batch_size: int = 500, history_write_max_batch_interval_sec: float = 1.0, history_write_queue_max_size: int = 10000, history_write_durability_mode: str = 'async', history_write_read_consistency_mode: str = 'local', history_cache_enabled: bool = True, history_last_values_cache_enabled: bool = True, history_last_values_cache_max_size_mb: int = 100, history_last_values_init_batch_size: int = 1000, history_metadata_cache_enabled: bool = True, history_metadata_cache_init_max_rows: int = 500000, db_query_timeout_sec: Optional[float] = 30.0, db_pool_close_timeout_sec: float = 5.0, db_pool_create_timeout_sec: float = 30.0, db_lock_wait_timeout_sec: float = 60.0, db_command_timeout_sec: Optional[float] = 60.0, db_tcp_keepalive_idle_sec: int = 30, db_tcp_keepalive_interval_sec: int = 10, db_tcp_keepalive_count: int = 3, db_tcp_user_timeout_sec: float = 60.0, history_flush_timeout_sec: float = 120.0, history_worker_stall_timeout_sec: float = 300.0, db_application_name: str = 'uapg-history', **kwargs) -> None",
+    "HistoryTimescaleV2": "(self, *args: 'Any', events_storage_mode: 'Optional[StorageMode]' = None, events_v2_config: 'Optional[EventsV2Config]' = None, **kwargs: 'Any') -> 'None'"
+  },
   "instance_attributes": {
     "max_history_data_response_size": 1000,
     "suppress_initial_datachange": true

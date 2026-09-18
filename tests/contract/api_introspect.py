@@ -49,6 +49,12 @@ def api_snapshot() -> Dict[str, Any]:
 
     return {
         "module_all": sorted(uapg.__all__),
+        # Конструктор в getmembers отфильтровывается как приватный, а именно его
+        # opc-vibro-iot-server заполняет тремя десятками именованных аргументов.
+        "constructors": {
+            "HistoryTimescale": str(inspect.signature(HistoryTimescale.__init__)),
+            "HistoryTimescaleV2": str(inspect.signature(HistoryTimescaleV2.__init__)),
+        },
         "classes": {
             "HistoryTimescale": public_members(HistoryTimescale),
             "HistoryTimescaleV2": public_members(HistoryTimescaleV2),

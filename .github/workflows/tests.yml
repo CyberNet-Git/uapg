@@ -9,6 +9,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.1.8 — версия, на которой работает opc-vibro-iot-server; 2.x получает
+        # любая свежая установка. У DataValue в них разные имена параметров,
+        # поэтому проверяем обе.
+        asyncua: ["1.1.8", "2.0.1"]
+
     services:
       timescaledb:
         image: timescale/timescaledb:latest-pg17
@@ -35,6 +43,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]" pytest-asyncio
+          pip install "asyncua==${{ matrix.asyncua }}"
 
       - name: Unit and contract tests
         run: pytest -m "not integration"

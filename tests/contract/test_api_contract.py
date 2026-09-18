@@ -41,6 +41,7 @@ def _diff_sequence(kind: str, baseline: List[str], current: List[str]) -> List[s
 def diff_api(baseline: Dict[str, Any], current: Dict[str, Any]) -> List[str]:
     diffs: List[str] = []
     diffs += _diff_sequence("module_all", baseline["module_all"], current["module_all"])
+    diffs += _diff_mapping("constructor", baseline["constructors"], current["constructors"])
 
     for cls in sorted(set(baseline["classes"]) | set(current["classes"])):
         diffs += _diff_mapping(
