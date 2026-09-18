@@ -18,6 +18,8 @@ from uapg.codec import (
     encode_event_fields,
     encode_variant,
     row_to_datavalue,
+    status_code_from_column,
+    status_code_to_column,
     status_code_value,
     value_text,
 )
@@ -68,6 +70,19 @@ class TestStatusCode:
 
     def test_missing_status_is_good(self) -> None:
         assert status_code_value(None) == 0
+
+    def test_bad_codes_fit_into_integer_column(self) -> None:
+        """Колонка statuscode — INTEGER, а коды Bad не помещаются в него без знака."""
+        for code in (0x80000000, 0x808D0000, 0xFFFFFFFF):
+            stored = status_code_to_column(ua.StatusCode(code))
+            assert -2147483648 <= stored <= 2147483647, hex(code)
+            assert status_code_from_column(stored).value == code, hex(code)
+
+    def test_good_and_uncertain_are_stored_unchanged(self) -> None:
+        """Уже накопленные строки обязаны читаться так же, как раньше."""
+        for code in (0, 0x40000000, 0x7FFFFFFF):
+            assert status_code_to_column(ua.StatusCode(code)) == code
+            assert status_code_from_column(code).value == code
 
 
 class TestEventCodec:

@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from functools import lru_cache
 from importlib import resources
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _INDEX_NAME = re.compile(
@@ -65,3 +65,43 @@ def index_name(statement: str) -> Optional[str]:
     """Имя индекса из инструкции CREATE INDEX."""
     match = _INDEX_NAME.search(statement)
     return match.group("name") if match else None
+
+
+_QUERY_MARKER = re.compile(r"^--\s*name:\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*$")
+
+
+def load_queries(
+    filename: str,
+    schema: str,
+    *,
+    package: str = "uapg.sql.queries",
+) -> Dict[str, str]:
+    """Прочитать файл с именованными запросами.
+
+    Запросы разделяются строкой ``-- name: <имя>``. Это позволяет держать
+    рабочий SQL в файлах, не разводя по файлу на каждый запрос, и видеть все
+    обращения к одной таблице рядом.
+    """
+    validate_identifier(schema)
+    queries: Dict[str, str] = {}
+    current: Optional[str] = None
+    lines: List[str] = []
+
+    for line in _read(package, filename).splitlines():
+        marker = _QUERY_MARKER.match(line.strip())
+        if marker:
+            if current is not None:
+                queries[current] = "\n".join(lines).strip()
+            current = marker.group("name")
+            lines = []
+            continue
+        if current is not None:
+            lines.append(line)
+
+    if current is not None:
+        queries[current] = "\n".join(lines).strip()
+
+    if not queries:
+        raise ValueError(f"в файле {filename} нет запросов с маркером '-- name:'")
+
+    return {name: sql.replace("{schema}", schema) for name, sql in queries.items()}

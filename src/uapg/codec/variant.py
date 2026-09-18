@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, cast
 
 from asyncua import ua
 from asyncua.common.utils import Buffer
@@ -43,15 +43,31 @@ def value_text(variant: ua.Variant) -> str:
 
 
 def status_code_value(status: Optional[ua.StatusCode]) -> int:
-    """Числовой код качества для колонки statuscode.
-
-    Колонка объявлена INTEGER, а коды OPC UA занимают 32 бита без знака, поэтому
-    всё, что начинается с 0x8000_0000 (то есть любой Bad), уезжает в минус.
-    Так писала и 0.2.15; чтение восстанавливает код через ua.StatusCode.
-    """
+    """Числовой код качества OPC UA (32 бита без знака)."""
     if status is None:
         return 0
     return int(status.value)
+
+
+def status_code_to_column(status: Optional[ua.StatusCode]) -> int:
+    """Код качества в том виде, в каком он ложится в колонку statuscode.
+
+    Колонка объявлена INTEGER, а коды OPC UA занимают 32 бита без знака: всё,
+    что начинается с 0x8000_0000, то есть любой Bad, в неё не помещается. В
+    0.2.15 такое значение не записывалось вовсе — PostgreSQL отвергал параметр,
+    и вместе с ним терялась вся пачка, где оно оказалось.
+
+    Те же 32 бита сохраняются как знаковое целое. Коды Good и Uncertain меньше
+    0x8000_0000 и записываются как прежде, поэтому уже накопленные данные
+    читаются без изменений и менять тип колонки не требуется.
+    """
+    value = status_code_value(status) & 0xFFFFFFFF
+    return value - 0x100000000 if value >= 0x80000000 else value
+
+
+def status_code_from_column(raw: Optional[int]) -> ua.StatusCode:
+    """Восстановить код качества из колонки statuscode."""
+    return ua.StatusCode(cast(Any, (int(raw or 0)) & 0xFFFFFFFF))
 
 
 def make_datavalue(
@@ -75,7 +91,7 @@ def row_to_datavalue(row: Mapping[str, Any]) -> ua.DataValue:
     """Собрать DataValue из строки variables_history или variables_last_value."""
     return make_datavalue(
         value=decode_variant(row["variantbinary"]),
-        status=ua.StatusCode(row["statuscode"]),
+        status=status_code_from_column(row["statuscode"]),
         source_timestamp=row["sourcetimestamp"],
         server_timestamp=row["servertimestamp"],
     )

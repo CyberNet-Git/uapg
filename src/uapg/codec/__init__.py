@@ -6,6 +6,8 @@ from .variant import (
     encode_variant,
     make_datavalue,
     row_to_datavalue,
+    status_code_from_column,
+    status_code_to_column,
     status_code_value,
     value_text,
 )
@@ -17,6 +19,8 @@ __all__ = [
     "encode_variant",
     "make_datavalue",
     "row_to_datavalue",
+    "status_code_from_column",
+    "status_code_to_column",
     "status_code_value",
     "value_text",
 ]
