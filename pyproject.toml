@@ -1,7 +1,7 @@
 [project]
 name = "uapg"
-version = "0.2.15"
-description = "OPC UA PostgreSQL History Storage Backend"
+version = "3.0.0"
+description = "OPC UA history storage backend for PostgreSQL/TimescaleDB"
 readme = "README.md"
 authors = [
     { name = "CyberNet-Git", email = "v.v.panfilov@gmail.com" }
@@ -23,12 +23,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Нужна только для HistoryTimescale.from_config_file / from_encrypted_config.
+crypto = [
+    "cryptography>=41",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "black>=23.0.0",
     "isort>=5.12.0",
     "mypy>=1.0.0",
+    "cryptography>=41",
 ]
 
 [project.urls]

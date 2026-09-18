@@ -20,18 +20,14 @@ from ..core.sql import load_sql
 
 PACKAGE = "uapg.sql.migrations"
 
-# Миграции 101/102 (переменные v2 по ADR-003) намеренно не применяются: они
-# создают гипертаблицу и функции, которых не касается ни одна строка Python.
+# Миграции 101/102 (переменные v2 по ADR-003) удалены: они создавали в каждой
+# базе гипертаблицу и функции, которых не касалась ни одна строка Python. В
+# базах, где они уже применены, объекты остаются и ничему не мешают.
 EVENT_MIGRATIONS: Sequence[str] = (
     "001_core_migrations.sql",
     "002_events_v2_tables.sql",
     "003_events_v2_functions.sql",
     "004_events_v2_timescale.sql",
-)
-
-VARIABLE_MIGRATIONS: Sequence[str] = (
-    "101_variables_v2_tables.sql",
-    "102_variables_v2_functions.sql",
 )
 
 # Признак готовности слоя v2. Проверка намеренно простая и не должна меняться:
@@ -47,19 +43,13 @@ class SqlMigrator:
         database: Database,
         schema: str,
         logger: Optional[logging.Logger] = None,
-        *,
-        include_variables: bool = False,
     ) -> None:
         self._db = database
         self._schema = schema
         self.logger = logger or logging.getLogger("uapg.migrations")
-        self._include_variables = include_variables
 
     def _files(self) -> List[str]:
-        files = list(EVENT_MIGRATIONS)
-        if self._include_variables:
-            files.extend(VARIABLE_MIGRATIONS)
-        return files
+        return list(EVENT_MIGRATIONS)
 
     async def apply_all(self) -> List[str]:
         """Применить недостающие миграции; вернуть список применённых."""

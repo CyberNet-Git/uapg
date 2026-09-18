@@ -26,7 +26,7 @@ from ..codec import decode_event_data
 from ..codec.node_id import format_node_id
 from ..core.database import Database
 from ..core.sql import load_queries
-from ..event_filter import apply_event_filter
+from ..opcua.event_filter import apply_event_filter
 from .events import EventRepository
 from .events_config import expand_sql_filter_fields, typed_fields_supported
 from .filter_plan import (

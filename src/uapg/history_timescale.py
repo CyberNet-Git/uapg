@@ -43,8 +43,8 @@ from .core.metrics import MetricsRegistry
 from .core.secrets import load_connection_config
 from .core.sql import validate_identifier
 from .core.supervisor import ConnectionSupervisor
-from .event_filter import apply_event_filter
 from .opcua import nodes as opc_nodes
+from .opcua.event_filter import apply_event_filter
 from .opcua.reads import continuation_point, resolve_window
 from .storage.bootstrap import SchemaBootstrap
 from .storage.cache import Caches
@@ -55,7 +55,7 @@ from .storage.items import EventWriteItem, VariableWriteItem
 from .storage.migrations import SqlMigrator
 from .storage.typed_events import EventSchemaRegistry, TypedEventTables
 from .storage.variables import VariableRepository
-from .v2.storage_mode import StorageMode, should_read_v2, should_write_v2
+from .storage.storage_mode import StorageMode, should_read_v2, should_write_v2
 
 __all__ = [
     "HistoryTimescale",

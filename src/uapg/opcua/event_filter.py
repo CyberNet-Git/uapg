@@ -7,7 +7,7 @@
 3. По значениям свойств события
 """
 
-from typing import Any, List, Optional, Set
+from typing import Any, Callable, List, Optional, Set
 import logging
 import re
 from asyncua import ua
@@ -305,7 +305,9 @@ class EventFilterEvaluator:
         
         return self._compare_values(val1, val2, lambda a, b: a <= b)
     
-    def _compare_values(self, val1: Any, val2: Any, comparator) -> bool:
+    def _compare_values(
+        self, val1: Any, val2: Any, comparator: Callable[[Any, Any], Any]
+    ) -> bool:
         """
         Сравнивает два значения с учетом их типов.
         
@@ -322,21 +324,21 @@ class EventFilterEvaluator:
         
         # Специальная обработка для NodeId
         if isinstance(val1, ua.NodeId) and isinstance(val2, ua.NodeId):
-            return comparator(val1, val2)
+            return bool(comparator(val1, val2))
         
         # Преобразуем значения к сравнимым типам
         try:
             if type(val1) != type(val2):
                 # Пытаемся привести к общему типу
                 if isinstance(val1, (int, float)) and isinstance(val2, (int, float)):
-                    return comparator(float(val1), float(val2))
+                    return bool(comparator(float(val1), float(val2)))
                 elif isinstance(val1, str) and isinstance(val2, str):
-                    return comparator(val1, val2)
+                    return bool(comparator(val1, val2))
                 else:
                     # Преобразуем оба к строке для сравнения
-                    return comparator(str(val1), str(val2))
+                    return bool(comparator(str(val1), str(val2)))
             else:
-                return comparator(val1, val2)
+                return bool(comparator(val1, val2))
         except Exception as e:
             _logger.debug(f"Ошибка при сравнении значений: {e}")
             return False
@@ -504,7 +506,7 @@ class EventFilterEvaluator:
             return False
         
         try:
-            return lower <= val <= upper
+            return bool(lower <= val <= upper)
         except Exception as e:
             _logger.debug(f"Ошибка в Between операторе: {e}")
             return False
@@ -605,148 +607,3 @@ def apply_event_filter(events: List[Event], evfilter: Optional[ua.EventFilter]) 
 
 
 # Вспомогательные функции для создания фильтров
-
-def create_source_node_filter(source_node_id: ua.NodeId) -> ua.EventFilter:
-    """
-    Создает EventFilter для фильтрации по узлу источника событий.
-    
-    Args:
-        source_node_id: NodeId источника событий
-        
-    Returns:
-        EventFilter, фильтрующий по SourceNode
-    """
-    evfilter = ua.EventFilter()
-    
-    # SelectClauses - выбираем стандартные поля события
-    op = ua.SimpleAttributeOperand()
-    op.AttributeId = ua.AttributeIds.Value
-    op.BrowsePath = [ua.QualifiedName("SourceNode", 0)]
-    op.TypeDefinitionId = ua.NodeId(ua.ObjectIds.BaseEventType)
-    evfilter.SelectClauses.append(op)
-    
-    # WhereClause - фильтр по SourceNode
-    cf = ua.ContentFilter()
-    el = ua.ContentFilterElement()
-    
-    # Первый операнд - атрибут SourceNode
-    source_operand = ua.SimpleAttributeOperand()
-    source_operand.BrowsePath = [ua.QualifiedName("SourceNode", 0)]
-    source_operand.AttributeId = ua.AttributeIds.Value
-    source_operand.TypeDefinitionId = ua.NodeId(ua.ObjectIds.BaseEventType)
-    el.FilterOperands.append(ua.ExtensionObject(Body=source_operand))
-    
-    # Второй операнд - литерал с NodeId источника
-    literal_operand = ua.LiteralOperand(Value=ua.Variant(source_node_id, ua.VariantType.NodeId))
-    el.FilterOperands.append(ua.ExtensionObject(Body=literal_operand))
-    
-    el.FilterOperator = ua.FilterOperator.Equals
-    cf.Elements.append(el)
-    evfilter.WhereClause = cf
-    
-    return evfilter
-
-
-def create_event_type_filter(event_type_ids: List[ua.NodeId]) -> ua.EventFilter:
-    """
-    Создает EventFilter для фильтрации по типу события.
-    
-    Args:
-        event_type_ids: Список NodeId типов событий для фильтрации
-        
-    Returns:
-        EventFilter, фильтрующий по EventType
-    """
-    evfilter = ua.EventFilter()
-    
-    # SelectClauses - выбираем стандартные поля события
-    op = ua.SimpleAttributeOperand()
-    op.AttributeId = ua.AttributeIds.Value
-    op.BrowsePath = [ua.QualifiedName("EventType", 0)]
-    op.TypeDefinitionId = ua.NodeId(ua.ObjectIds.BaseEventType)
-    evfilter.SelectClauses.append(op)
-    
-    # WhereClause - фильтр по EventType (InList)
-    cf = ua.ContentFilter()
-    el = ua.ContentFilterElement()
-    
-    # Первый операнд - атрибут EventType
-    event_type_operand = ua.SimpleAttributeOperand()
-    event_type_operand.BrowsePath = [ua.QualifiedName("EventType", 0)]
-    event_type_operand.AttributeId = ua.AttributeIds.Value
-    event_type_operand.TypeDefinitionId = ua.NodeId(ua.ObjectIds.BaseEventType)
-    el.FilterOperands.append(ua.ExtensionObject(Body=event_type_operand))
-    
-    # Остальные операнды - литералы с типами событий
-    for event_type_id in event_type_ids:
-        literal_operand = ua.LiteralOperand(Value=ua.Variant(event_type_id, ua.VariantType.NodeId))
-        el.FilterOperands.append(ua.ExtensionObject(Body=literal_operand))
-    
-    el.FilterOperator = ua.FilterOperator.InList
-    cf.Elements.append(el)
-    evfilter.WhereClause = cf
-    
-    return evfilter
-
-
-def create_property_filter(
-    property_name: str, 
-    operator: ua.FilterOperator, 
-    *values
-) -> ua.EventFilter:
-    """
-    Создает EventFilter для фильтрации по значению свойства события.
-    
-    Args:
-        property_name: Имя свойства события
-        operator: Оператор фильтрации
-        *values: Значения для сравнения
-        
-    Returns:
-        EventFilter, фильтрующий по свойству события
-    """
-    evfilter = ua.EventFilter()
-    
-    # SelectClauses - выбираем нужное свойство
-    op = ua.SimpleAttributeOperand()
-    op.AttributeId = ua.AttributeIds.Value
-    op.BrowsePath = [ua.QualifiedName(property_name, 0)]
-    op.TypeDefinitionId = ua.NodeId(ua.ObjectIds.BaseEventType)
-    evfilter.SelectClauses.append(op)
-    
-    # WhereClause - фильтр по свойству
-    cf = ua.ContentFilter()
-    el = ua.ContentFilterElement()
-    
-    # Первый операнд - атрибут свойства
-    property_operand = ua.SimpleAttributeOperand()
-    property_operand.BrowsePath = [ua.QualifiedName(property_name, 0)]
-    property_operand.AttributeId = ua.AttributeIds.Value
-    property_operand.TypeDefinitionId = ua.NodeId(ua.ObjectIds.BaseEventType)
-    el.FilterOperands.append(ua.ExtensionObject(Body=property_operand))
-    
-    # Добавляем значения для сравнения
-    for value in values:
-        # Определяем тип варианта автоматически
-        if isinstance(value, bool):
-            variant_type = ua.VariantType.Boolean
-        elif isinstance(value, int):
-            variant_type = ua.VariantType.Int32
-        elif isinstance(value, float):
-            variant_type = ua.VariantType.Double
-        elif isinstance(value, str):
-            variant_type = ua.VariantType.String
-        elif isinstance(value, ua.NodeId):
-            variant_type = ua.VariantType.NodeId
-        else:
-            variant_type = ua.VariantType.Variant
-        
-        literal_operand = ua.LiteralOperand(Value=ua.Variant(value, variant_type))
-        el.FilterOperands.append(ua.ExtensionObject(Body=literal_operand))
-    
-    el.FilterOperator = operator
-    cf.Elements.append(el)
-    evfilter.WhereClause = cf
-    
-    return evfilter
-

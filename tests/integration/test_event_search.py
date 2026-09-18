@@ -7,6 +7,7 @@ SQL, а не отсеивать строки в памяти после LIMIT. �
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
@@ -279,3 +280,18 @@ class TestStandardClientFilter:
 
         result = await h.store.read(h.source_id, *WINDOW, 10, "ASC", event_filter)
         assert len(result.events) == 1
+
+
+class TestTypedDdl:
+    async def test_no_advisory_lock_is_left_behind(self, h: Harness) -> None:
+        """Замок снимался через пул и мог попасть не на то соединение — и оставался навсегда."""
+        await asyncio.gather(
+            *(
+                h.tables.ensure_table("evt_t_2_events_sensorevent", [f"extra_{i}"])
+                for i in range(8)
+            )
+        )
+        held = await h.db.fetchval("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'")
+        assert held == 0
+        columns = await h.tables._load_columns("evt_t_2_events_sensorevent")
+        assert {f"extra_{i}" for i in range(8)} <= columns

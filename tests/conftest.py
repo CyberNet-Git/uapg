@@ -9,15 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
 import uuid
-from typing import Any, Dict, Iterator
-from unittest.mock import Mock
+from typing import Any, Dict
 from urllib.parse import urlparse
 
 import pytest
-
-sys.modules.setdefault("psycopg", Mock())
 
 DEFAULT_TEST_DSN = "postgresql://uapg_test:uapg_test@127.0.0.1:55432/uapg_test"
 

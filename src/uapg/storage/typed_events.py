@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set
 
 from asyncua import ua
 
+from ..codec.node_id import coerce_node_id
 from ..core.database import Database
 from ..core.sql import validate_identifier
 from .events_config import EventsV2Config
@@ -46,8 +47,6 @@ MAX_INDEX_NAME_LENGTH = 58
 
 def slug_from_node_id(node_id: ua.NodeId) -> str:
     """Имя типа события, пригодное для имени таблицы."""
-    from ..opc_node_id import coerce_node_id
-
     nid = coerce_node_id(node_id)
     identifier = nid.Identifier
     # У непрозрачного NodeId идентификатор — байты. Их представление участвует в
@@ -141,62 +140,74 @@ class TypedEventTables:
 
         Вызывается при регистрации типа события и при появлении незнакомого
         поля, но не на каждом событии.
+
+        Замок транзакционный и берётся в той же транзакции, что и DDL. В 0.2.15
+        pg_advisory_lock и pg_advisory_unlock уходили через пул и могли попасть на
+        разные соединения: снятие тогда не срабатывало, замок оставался на первом
+        соединении навсегда, и следующий DDL по этой таблице с любого другого
+        соединения повисал.
         """
         validate_identifier(table)
+        wanted = list(columns)
+        for column in wanted:
+            validate_identifier(column)
         known = self._columns.get(table)
-        if known is not None and all(column in known for column in columns):
+        if known is not None and all(column in known for column in wanted):
             return
 
         lock_key = advisory_lock_key(table)
-        await self._db.execute("SELECT pg_advisory_lock($1)", lock_key)
-        try:
-            await self._create_table(table)
-            existing = await self._load_columns(table)
-            for column in columns:
+        schema = self._schema
+        indexed = [column for column in wanted if self._is_indexed(column)]
+
+        async def _ddl(conn: Any) -> Set[str]:
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
+            await conn.execute(
+                f'''
+                CREATE TABLE IF NOT EXISTS "{schema}"."{table}" (
+                    event_id BIGINT NOT NULL,
+                    event_timestamp TIMESTAMPTZ NOT NULL,
+                    source_id BIGINT NOT NULL,
+                    PRIMARY KEY (event_id, event_timestamp)
+                )
+                '''
+            )
+            await conn.execute(
+                f'''
+                CREATE INDEX IF NOT EXISTS "idx_{table}_source_ts"
+                ON "{schema}"."{table}" (source_id, event_timestamp DESC, event_id DESC)
+                '''
+            )
+            rows = await conn.fetch(
+                """
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema = $1 AND table_name = $2
+                """,
+                schema,
+                table,
+            )
+            existing = {row["column_name"] for row in rows}
+            for column in wanted:
                 if column in existing:
                     continue
-                validate_identifier(column)
-                await self._db.execute(
-                    f'ALTER TABLE "{self._schema}"."{table}" '
-                    f'ADD COLUMN IF NOT EXISTS "{column}" TEXT'
+                await conn.execute(
+                    f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS "{column}" TEXT'
                 )
                 existing.add(column)
-                if self._is_indexed(column):
-                    await self._create_column_index(table, column)
-            self._columns[table] = existing
-        finally:
-            await self._db.execute("SELECT pg_advisory_unlock($1)", lock_key)
+                if column in indexed:
+                    index_name = f"idx_{table}_{column}"[:MAX_INDEX_NAME_LENGTH]
+                    await conn.execute(
+                        f'CREATE INDEX IF NOT EXISTS "{index_name}" '
+                        f'ON "{schema}"."{table}" ("{column}")'
+                    )
+            return existing
+
+        self._columns[table] = await self._db.run_in_transaction(_ddl, name=f"схема {table}")
 
     def _is_indexed(self, column: str) -> bool:
         indexed = self._config.indexed_fields
         if column in indexed:
             return True
         return any(self._config.field_aliases.get(name, name) == column for name in indexed)
-
-    async def _create_table(self, table: str) -> None:
-        await self._db.execute(
-            f'''
-            CREATE TABLE IF NOT EXISTS "{self._schema}"."{table}" (
-                event_id BIGINT NOT NULL,
-                event_timestamp TIMESTAMPTZ NOT NULL,
-                source_id BIGINT NOT NULL,
-                PRIMARY KEY (event_id, event_timestamp)
-            )
-            '''
-        )
-        await self._db.execute(
-            f'''
-            CREATE INDEX IF NOT EXISTS "idx_{table}_source_ts"
-            ON "{self._schema}"."{table}" (source_id, event_timestamp DESC, event_id DESC)
-            '''
-        )
-
-    async def _create_column_index(self, table: str, column: str) -> None:
-        index_name = f"idx_{table}_{column}"[:MAX_INDEX_NAME_LENGTH]
-        await self._db.execute(
-            f'CREATE INDEX IF NOT EXISTS "{index_name}" '
-            f'ON "{self._schema}"."{table}" ("{column}")'
-        )
 
     async def _load_columns(self, table: str) -> Set[str]:
         rows = await self._db.fetch(

@@ -65,3 +65,11 @@ def test_public_api_matches_baseline() -> None:
     baseline = json.loads(BASELINE.read_text())
     unexpected = [d for d in diff_api(baseline, api_snapshot()) if d not in ALLOWED]
     assert not unexpected, "Публичный API разошёлся с эталоном 0.2.15:\n" + "\n".join(unexpected)
+
+
+def test_allowed_divergences_are_still_needed() -> None:
+    """Разрешение, которое перестало срабатывать, должно исчезнуть из списка."""
+    baseline = json.loads(BASELINE.read_text())
+    actual = set(diff_api(baseline, api_snapshot()))
+    stale = sorted(set(ALLOWED) - actual)
+    assert not stale, "Эти отступления больше не происходят, уберите их из divergences.API:\n" + "\n".join(stale)

@@ -14,7 +14,7 @@ from asyncua import ua
 
 from .history_timescale import HistoryTimescale
 from .storage.events_config import EventsV2Config
-from .v2.storage_mode import StorageMode, get_events_storage_mode
+from .storage.storage_mode import StorageMode, get_events_storage_mode
 
 
 class HistoryTimescaleV2(HistoryTimescale):

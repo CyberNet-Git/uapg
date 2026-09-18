@@ -1,24 +1,26 @@
+"""uapg — бэкенд историзации OPC UA на PostgreSQL/TimescaleDB.
+
+Реализует ``HistoryStorageInterface`` из asyncua: хранит значения переменных и
+события и отдаёт их по HistoryRead.
+
+    from uapg import HistoryTimescale
+
+    storage = HistoryTimescale(user=..., password=..., database=..., host=...)
+    server.iserver.history_manager.set_storage(storage)
+    await storage.init()
+
+``HistoryTimescaleV2`` — тот же бэкенд с типизированным хранением и поиском
+событий на стороне БД.
 """
-UAPG - OPC UA PostgreSQL History Storage Backend
 
-Модуль для хранения исторических данных OPC UA в PostgreSQL
-с поддержкой TimescaleDB для эффективной работы с временными рядами.
-"""
+from importlib.metadata import PackageNotFoundError, version
 
-__version__ = "0.2.0"
-__author__ = "RTS IoT"
-__email__ = "panfilov@rts-iot.ru"
-
-from .history_pgsql import HistoryPgSQL
 from .history_timescale import HistoryTimescale
 from .history_timescale_v2 import HistoryTimescaleV2
-from .db_manager import DatabaseManager, create_database_standalone, backup_database_standalone
 
-__all__ = [
-    "HistoryPgSQL",
-    "HistoryTimescale",
-    "HistoryTimescaleV2",
-    "DatabaseManager", 
-    "create_database_standalone", 
-    "backup_database_standalone"
-]
+try:
+    __version__ = version("uapg")
+except PackageNotFoundError:  # pragma: no cover - запуск из исходников без установки
+    __version__ = "3.0.0"
+
+__all__ = ["HistoryTimescale", "HistoryTimescaleV2"]
