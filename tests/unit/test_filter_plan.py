@@ -126,6 +126,12 @@ class TestEventTypeExtraction:
         plan = planner.build(self._type_filter())
         assert planner.event_type_names(plan) == ["SensorInactive"]
 
+    def test_node_ids_are_not_mistaken_for_database_ids(self) -> None:
+        """Числовой NodeId — номер узла OPC UA, а не event_type_id в базе."""
+        planner = EventFilterPlanner()
+        plan = {"field": "EventType", "op": "in", "value": [ua.NodeId(2041), ua.NodeId("X", 2)]}
+        assert planner.event_type_nodes(plan) == [ua.NodeId(2041), ua.NodeId("X", 2)]
+
     def test_event_type_is_removed_from_typed_plan(self) -> None:
         """Тип события ищется отдельным столбцом, а не колонкой типизированной таблицы."""
         planner = EventFilterPlanner()

@@ -16,6 +16,7 @@ from asyncua import ua
 
 from tests.conftest import connect_kwargs
 from uapg.codec import encode_event_fields
+from uapg.codec.node_id import format_node_id
 from uapg.core.config import ConnectionSettings, Keepalive, Timeouts
 from uapg.core.database import Database
 from uapg.core.metrics import MetricsRegistry
@@ -54,7 +55,7 @@ class Harness:
             ("sensor", SENSOR_TYPE, ["Message", "Severity", "dev_eui"]),
             ("alarm", ALARM_TYPE, ["Message", "Severity"]),
         ):
-            type_id = await self.events.ensure_type(str(node))
+            type_id = await self.events.ensure_type(format_node_id(node))
             table, version = await self.registry.sync_event_type(
                 type_id, node, self.registry.describe_fields(fields)
             )
@@ -62,12 +63,12 @@ class Harness:
             self.type_ids[key] = type_id
 
     def item(self, kind: str, moment: datetime, **fields: Any) -> EventWriteItem:
+        event_type = fields.get("event_type") or (SENSOR_TYPE if kind == "sensor" else ALARM_TYPE)
         variants = {
             "Message": ua.Variant(ua.LocalizedText(fields.get("message", "m"), "ru"),
                                   ua.VariantType.LocalizedText),
             "Severity": ua.Variant(fields.get("severity", 100), ua.VariantType.UInt16),
-            "EventType": ua.Variant(SENSOR_TYPE if kind == "sensor" else ALARM_TYPE,
-                                    ua.VariantType.NodeId),
+            "EventType": ua.Variant(event_type, ua.VariantType.NodeId),
             "Time": ua.Variant(moment, ua.VariantType.DateTime),
         }
         if "dev_eui" in fields:
@@ -244,3 +245,37 @@ class TestBackfill:
 
         count = await h.db.fetchval("SELECT count(*) FROM evt_t_2_events_sensorevent")
         assert count == 12
+
+
+class TestStandardClientFilter:
+    async def test_subtype_list_with_numeric_node_ids_is_resolved(self, h: Harness) -> None:
+        """Стандартный клиент перечисляет подтипы числовыми NodeId пространства 0.
+
+        Идентификатор узла OPC UA — не event_type_id в базе; в 0.2.15 их
+        путали, и такой запрос возвращал пустую историю.
+        """
+        base_type = await h.events.ensure_type(format_node_id(ua.NodeId(ua.ObjectIds.BaseEventType)))
+        h.store.remember_type(base_type, None, 1)
+        item = h.item("sensor", BASE, dev_eui="Q", event_type=ua.NodeId(ua.ObjectIds.BaseEventType))
+        item.event_type_id = base_type
+        await h.store.flush([item])
+
+        element = ua.ContentFilterElement()
+        element.FilterOperator = ua.FilterOperator.InList
+        element.FilterOperands = [
+            ua.SimpleAttributeOperand(
+                TypeDefinitionId=ua.NodeId(ua.ObjectIds.BaseEventType),
+                BrowsePath=[ua.QualifiedName("EventType")],
+                AttributeId=ua.AttributeIds.Value,
+            ),
+            ua.LiteralOperand(ua.Variant(ua.NodeId(2782))),
+            ua.LiteralOperand(ua.Variant(ua.NodeId(ua.ObjectIds.BaseEventType))),
+            ua.LiteralOperand(ua.Variant(ua.NodeId(base_type))),
+        ]
+        content = ua.ContentFilter()
+        content.Elements = [element]
+        event_filter = ua.EventFilter()
+        event_filter.WhereClause = content
+
+        result = await h.store.read(h.source_id, *WINDOW, 10, "ASC", event_filter)
+        assert len(result.events) == 1

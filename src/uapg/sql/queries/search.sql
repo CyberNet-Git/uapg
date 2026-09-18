@@ -23,6 +23,11 @@ WHERE event_type_name = $1
    OR event_type_name LIKE $3
 LIMIT 1
 
+-- name: resolve_types_by_key
+SELECT event_type_id
+FROM "{schema}".event_types
+WHERE event_type_name = ANY($1::text[])
+
 -- name: types_with_storage
 SELECT ets.event_type_id, ets.physical_table
 FROM "{schema}".event_type_storage ets

@@ -191,15 +191,15 @@ class EventFilterPlanner:
                 names.append(name)
         return names
 
-    def event_type_ids(self, plan: FilterPlan) -> List[int]:
-        """Идентификаторы типов, названные числом напрямую."""
-        ids: List[int] = []
-        for value in self.event_type_literals(plan):
-            if isinstance(value, int):
-                ids.append(value)
-            elif hasattr(value, "Identifier") and isinstance(value.Identifier, int):
-                ids.append(int(value.Identifier))
-        return ids
+    def event_type_nodes(self, plan: FilterPlan) -> List[ua.NodeId]:
+        """Типы событий, названные в фильтре NodeId.
+
+        Числовой идентификатор NodeId — это номер узла в адресном пространстве
+        OPC UA, а не event_type_id в базе. В 0.2.15 их путали, и стандартный
+        клиент, перечисляющий подтипы BaseEventType (i=2041, i=2782, …),
+        получал пустую историю событий.
+        """
+        return [value for value in self.event_type_literals(plan) if isinstance(value, ua.NodeId)]
 
     def without_event_type(self, plan: FilterPlan) -> FilterPlan:
         """Убрать из плана условия по типу события: он задаётся отдельным столбцом."""

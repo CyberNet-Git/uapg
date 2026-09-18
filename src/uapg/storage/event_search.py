@@ -23,12 +23,18 @@ import asyncpg
 from asyncua.common.events import Event
 
 from ..codec import decode_event_data
+from ..codec.node_id import format_node_id
 from ..core.database import Database
 from ..core.sql import load_queries
 from ..event_filter import apply_event_filter
 from .events import EventRepository
 from .events_config import expand_sql_filter_fields, typed_fields_supported
-from .filter_plan import EventFilterPlanner, FilterPlan, render_filter
+from .filter_plan import (
+    EventFilterPlanner,
+    FilterPlan,
+    event_type_name_from_literal,
+    render_filter,
+)
 from .items import EventWriteItem
 from .typed_events import EventSchemaRegistry, TypedEventTables
 
@@ -143,7 +149,7 @@ class EventSearchStore:
         plan = planner.build(evfilter)
 
         type_ids = await self._resolve_types(planner, plan)
-        if planner.event_type_names(plan) and not type_ids:
+        if planner.event_type_literals(plan) and not type_ids:
             # Клиент назвал тип, которого в базе нет: событий такого типа нет тоже.
             return SearchResult([], None)
 
@@ -191,17 +197,33 @@ class EventSearchStore:
         return SearchResult(matched, next_cursor)
 
     async def _resolve_types(self, planner: EventFilterPlanner, plan: FilterPlan) -> List[int]:
-        ids = planner.event_type_ids(plan)
-        if ids:
-            return ids
+        """Идентификаторы типов в базе по условию на EventType.
+
+        NodeId сопоставляются по строковому ключу одним запросом: стандартный
+        клиент присылает сотню подтипов, и запрос на каждый стоил бы дорого.
+        Строковые литералы — короткие имена вроде «SensorInactive» — ищутся по
+        суффиксу ключа, как и раньше.
+        """
         resolved: List[int] = []
-        for name in planner.event_type_names(plan):
+        nodes = planner.event_type_nodes(plan)
+        if nodes:
+            rows = await self._db.fetch(
+                self._sql["resolve_types_by_key"], [format_node_id(node) for node in nodes]
+            )
+            resolved.extend(int(row["event_type_id"]) for row in rows)
+
+        for literal in planner.event_type_literals(plan):
+            if not isinstance(literal, str):
+                continue
+            name = event_type_name_from_literal(literal)
+            if not name:
+                continue
             value = await self._db.fetchval(
                 self._sql["resolve_type"], name, f"%;s=Events.{name}", f"%;s={name}"
             )
             if value is not None:
                 resolved.append(int(value))
-        return resolved
+        return sorted(set(resolved))
 
     async def _typed_branches(
         self, plan: FilterPlan, type_ids: Sequence[int]
