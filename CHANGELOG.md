@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.17] - 2026-09-30
+
+### Исправлено
+
+- **Typed-бэкфил не переносил исторические события вообще.** `EventsBackfillWorker._backfill_typed_rows` выбирал строки `ORDER BY et.legacy_row_id DESC LIMIT n` без курсора: каждый вызов брал одни и те же самые свежие N строк и до старых не доходил никогда, сколько бы раз ни вызывался `run_events_backfill()`. Добавлен восходящий курсор — отдельная строка `domain = 'events_typed'` в уже существующей `uapg_backfill_state` (схема таблицы не меняется). Дойдя до хвоста, курсор сбрасывается в 0: следующий круг подхватывает строки тех типов, у которых typed-таблица появилась позже. Повторная вставка безвредна — `insert_typed_row` делает `ON CONFLICT (event_id, event_timestamp) DO NOTHING`.
+- **Сортировка всей гипертаблицы `events_ts` на каждый батч.** Восходящий keyset (`legacy_row_id > $1 ORDER BY et.legacy_row_id LIMIT n`) обслуживается частичным индексом `idx_events_ts_legacy_row`; в плане `Index Scan` вместо `Sort` по всем чанкам. Проверка существования typed-таблицы переписана с `NOT EXISTS (SELECT 1 FROM information_schema.tables ...) IS FALSE` (двойное отрицание плюс коррелированный подзапрос к системному представлению на каждую строку) на `to_regclass(format('%I.%I', ...))`, а `physical_table` берётся из JOIN с `event_type_storage` — построчный `registry.get_storage_table()` больше не нужен.
+- **Батч бэкфила делал 1+2N обращений к БД.** `ProcedureGateway.backfill_events_batch` переписывал на Python логику, которая уже была в SQL, и на каждую строку выполнял `SELECT 1 FROM events_ts WHERE legacy_row_id = $1` и отдельный INSERT: при `batch_size=500` до 1001 обращения. Теперь один вызов SQL-функции.
+- **`uapg_backfill_events_batch` был мёртвым кодом с построчным циклом.** Процедура из `003_events_v2_functions.sql` не вызывалась нигде и сама шла `FOR ... LOOP`. Новая миграция `005_events_v2_backfill.sql` заменяет её функцией того же имени (`RETURNS TABLE (last_legacy_id, rows_processed, rows_inserted)`) с одним set-based `INSERT ... SELECT` — по образцу `uapg_save_event_v2`, которую гейтвей вызывает так же. Правка вынесена в отдельный файл потому, что `003` на существующих БД уже отмечен применённым в `uapg_schema_migrations` и повторно не выполняется. Семантика watermark сохранена: `last_legacy_id` двигается до максимального `id` батча (включая строки, уже записанные dual-write), `rows_processed` растёт только на фактически вставленные.
+- **Построчные обращения в typed-бэкфиле.** `event_data` тянется на весь батч одним `WHERE id = ANY($1::bigint[])` (индекс `idx_events_history_id`) вместо N запросов `WHERE id = $1`; избыточная построчная проверка существования в typed-таблице удалена; `ensure_columns_from_typed_values` вызывается один раз на таблицу по объединению ключей батча, а не на каждую строку — иначе advisory lock, `CREATE TABLE IF NOT EXISTS` и запрос к `information_schema.columns` выполнялись N раз. Итого на батч ~N+3 обращения вместо ~3N+2.
+- **Одна битая строка роняла весь батч.** Ошибка декодирования `event_data` или вставки одной строки теперь пишется в лог на WARNING и считается в `typed_rows_failed`; остальные строки батча обрабатываются. Циклический проход вернётся к строке на следующем круге.
+
+### Добавлено
+
+- **Миграция `005_events_v2_backfill.sql`** — функция `uapg_backfill_events_batch` вместо процедуры и seed-строка курсора `events_typed` в `uapg_backfill_state`.
+- **Ключи `typed_rows_inserted` и `typed_rows_failed`** в результате `run_events_backfill()`. Прежние четыре ключа (`last_legacy_id`, `rows_processed`, `backfill_lag_rows`, `v2_coverage_pct`) не изменились.
+- **Параметр `ensure_columns` у `EventSchemaRegistry.insert_typed_row`** (по умолчанию `True`, поведение записи не меняется) — для батчевых вызовов, которые досоздают колонки один раз на батч.
+- **Параметр `timeout` у `ProcedureGateway.backfill_events_batch`** — воркер передаёт свой `db_query_timeout_sec`, чтобы батч не висел бесконечно на сыром пуле.
+
 ## [0.2.16] - 2026-09-30
 
 ### Исправлено

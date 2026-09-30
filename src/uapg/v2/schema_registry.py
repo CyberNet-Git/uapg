@@ -303,8 +303,18 @@ class EventSchemaRegistry:
         event_timestamp: Any,
         source_id: int,
         typed_values: Dict[str, Any],
+        *,
+        ensure_columns: bool = True,
     ) -> None:
-        await self.ensure_columns_from_typed_values(table, typed_values)
+        """Вставка строки в typed-таблицу.
+
+        ensure_columns=False — для батчевых вызовов, которые уже вызвали
+        ensure_columns_from_typed_values один раз на объединение ключей батча:
+        иначе advisory lock, DDL и запрос к information_schema.columns выполняются
+        на каждую строку.
+        """
+        if ensure_columns:
+            await self.ensure_columns_from_typed_values(table, typed_values)
         aliases = self._events_config.field_aliases
         base_cols = ["event_id", "event_timestamp", "source_id"]
         base_vals = [event_id, event_timestamp, source_id]

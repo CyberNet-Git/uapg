@@ -246,6 +246,11 @@ class _StatsPool:
         self.timeouts.append(timeout)
         return []
 
+    async def execute(self, query, *args, timeout=None):
+        self.queries.append(query)
+        self.timeouts.append(timeout)
+        return "INSERT 0 1"
+
 
 def _make_worker(pool, new_last: int) -> EventsBackfillWorker:
     gateway = SimpleNamespace(
@@ -271,6 +276,8 @@ async def test_run_batch_reports_progress_without_full_scans():
         "rows_processed",
         "backfill_lag_rows",
         "v2_coverage_pct",
+        "typed_rows_inserted",
+        "typed_rows_failed",
     }
     assert stats["backfill_lag_rows"] == 0
     assert stats["v2_coverage_pct"] == 100.0
