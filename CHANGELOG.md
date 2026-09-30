@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.2.16] - 2026-09-30
+
+### Исправлено
+
+- **Старт сервера больше не рвёт пул 30-секундным таймаутом.** В логе 30.09 старт писал `PostgreSQL fetchval timed out after 30.0 seconds (layer=query)` и следом `Fetchval timed out, will reconnect without retrying`. Причина — `HistoryTimescaleV2.refresh_history_settings_nodes` считал полный anti-join `events_history` × `events_ts` (`SELECT count(*) ... WHERE NOT EXISTS (...)`), который на проде разворачивался в Parallel Hash Anti Join по всем 34 чанкам гипертаблицы (~1.2 ГБ, ~514k строк). Запрос шёл через `_fetchval`, не укладывался в `db_query_timeout_sec` и по ветке «таймаут» вызывал `_force_reconnect`: пул уничтожался и пересоздавался, а вся остальная историзация вставала на `_reconnect_lock` — и всё это ради косметического OPC UA узла `EventsBackfillComplete`.
+- **`expose_history_settings_nodes` выполнял refresh дважды.** Базовый `expose` сам зовёт `refresh_history_settings_nodes`, и виртуальная диспетчеризация уводила вызов в V2-override; следом `_expose_events_v2_capability_nodes` звал refresh ещё раз. За один старт anti-join исполнялся два раза. Теперь refresh откладывается до конца `expose` и выполняется один раз.
+- **Оценка прогресса бэкфила считается по watermark, а не полным сканом.** Алгоритм бэкфила и так watermark-овый (`uapg_backfill_state.last_legacy_id`, `WHERE id > last_legacy_id ORDER BY id LIMIT n`), поэтому полный anti-join для ответа «готово / сколько осталось» не нужен. Готовность определяется ограниченной пробой: есть ли среди первых `events_backfill_probe_rows` строк выше watermark хоть одна без пары в `events_ts` — ровно то, что нашёл бы следующий батч `run_events_backfill()`. Стоимость не зависит от размера `events_history`. Голое «есть строки с `id > watermark`» здесь не подошло бы: dual-write кладёт новое событие сразу в обе таблицы, и флаг сбрасывался бы после каждой записи. Оборотная сторона: пропуск дальше `events_backfill_probe_rows` строк от watermark (например, после сбоя dual-write) пробой не виден — узел информационный.
+- **Тот же anti-join исполнялся на каждом чтении событий.** `read_event_history` считал неперенесённые строки по `source_id` без ограничения по времени — только чтобы выставить `partial`, который дальше попадает лишь в DEBUG-лог. Теперь используется общая кэшированная оценка (TTL `events_backfill_status_ttl_sec`, по умолчанию 30 с): в типовом случае чтение не делает ни одного дополнительного запроса. Оценка стала глобальной, а не по источнику, то есть консервативнее — `partial=true`, если отстал любой источник.
+- **Служебная проба физически не может уронить пул.** Она идёт по отдельному пути в обход `_run_db_operation`/`_fetchval`, с собственным коротким бюджетом (минимум из 5 с и `db_query_timeout_sec`), и любая её ошибка только пишется в DEBUG и считается в счётчике. Неудачная проба тоже попадает под TTL, иначе на медленной БД каждое чтение ждало бы свой таймаут заново.
+- **Два полных скана на каждый батч бэкфила.** `EventsBackfillWorker.run_batch` считал тот же anti-join плюс `count(*)` всей `events_history`, причём на сыром пуле — мимо `_fetchval`, то есть вообще без таймаута и без обработки обрыва. Оба запроса заменены одним, целиком обслуживаемым индексом по `id`. Все запросы воркера получили явный `timeout`, так что батч больше не может висеть бесконечно.
+- **Смысл метрик бэкфила уточнён.** `backfill_lag_rows` — число строк, которых sweep ещё не касался (`id > last_legacy_id`); это надмножество прежнего точного anti-join, так как новые строки dual-write тоже попадают в счёт, но батч, дошедший до хвоста, оставляет значение около нуля. `v2_coverage_pct` — позиция watermark в диапазоне `id` (`min(id)`/`max(id)`), где `min(id)` учитывает уже вычищенный retention-политикой хвост. Набор ключей, возвращаемых `run_events_backfill()`, не изменился.
+
+### Добавлено
+
+- **Индекс `idx_events_history_id` по `events_history(id)`**, создаётся на старте в V2-режимах через существующий `_ensure_index` (проверка по `pg_indexes`, таймаут или lock не валят процесс, повтор на следующем старте). `id` — `BIGSERIAL` без PRIMARY KEY, и без индекса полным сканом по всем чанкам шли не только проба готовности, но и keyset-батч бэкфила (`WHERE id > $1 ORDER BY id LIMIT n`), и гидрация каждого чтения событий (`WHERE id = ANY($1::bigint[])` в `EventStoreV2._hydrate_events`). На горячем стенде индекс можно создать заранее вручную, чтобы не держать ShareLock на всей гипертаблице во время сборки:
+
+  ```sql
+  CREATE INDEX idx_events_history_id ON "<schema>".events_history (id)
+      WITH (timescaledb.transaction_per_chunk);
+  ```
+
+- **Параметры `events_backfill_probe_rows` (1000) и `events_backfill_status_ttl_sec` (30 с)** конструктора `HistoryTimescaleV2` — глубина пробы готовности бэкфила и время жизни её результата.
+- **Секция `events_v2` в `get_performance_metrics()`** (а значит и узлы OPC UA `HistoryMetrics`: `EventsV2StorageMode`, `EventsV2StorageReady`, `EventsV2BackfillProbeFailuresTotal`, `EventsV2BackfillProbeRows`, `EventsV2BackfillStatusTtlSec`). Счётчик `backfill_probe_failures_total` показывает, сколько раз проба готовности не получила ответа (таймаут или обрыв); ненулевое значение при отсутствующем `idx_events_history_id` — прямое указание создать индекс вручную.
+
+
 ## [0.2.15] - 2026-09-14
 
 Чат `98383d56-2906-440e-b09f-925f492a4033`, план `flush_retry_and_init_41edcfaa.plan.md`.

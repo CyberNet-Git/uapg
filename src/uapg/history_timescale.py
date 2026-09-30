@@ -1111,6 +1111,8 @@ class HistoryTimescale(HistoryStorageInterface):
             "db_reconnects_total": 0,
             "db_reconnect_skipped_total": 0,
             "db_pool_wait_timeouts_total": 0,
+            # Считается только в HistoryTimescaleV2 (проба готовности бэкфила).
+            "events_backfill_probe_failures_total": 0,
         }
 
     @staticmethod
