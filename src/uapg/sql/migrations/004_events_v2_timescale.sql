@@ -1,4 +1,9 @@
 -- Timescale advanced policies for events_ts
+--
+-- Период хранения здесь — лишь значение по умолчанию для баз, где миграции
+-- применяют без бэкенда: при старте SchemaBootstrap приводит политику
+-- events_ts к global_retention_period, чтобы слой поиска не переживал сами
+-- события (см. apply_event_search_retention).
 
 DO $$
 BEGIN

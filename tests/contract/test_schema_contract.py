@@ -27,6 +27,58 @@ SCHEMA = "public"
 pytestmark = pytest.mark.integration
 
 
+_INTERVAL_UNITS = {
+    "year": 365 * 86400,
+    "years": 365 * 86400,
+    "mon": 30 * 86400,
+    "mons": 30 * 86400,
+    "month": 30 * 86400,
+    "months": 30 * 86400,
+    "week": 7 * 86400,
+    "weeks": 7 * 86400,
+    "day": 86400,
+    "days": 86400,
+    "hour": 3600,
+    "hours": 3600,
+    "min": 60,
+    "mins": 60,
+    "minute": 60,
+    "minutes": 60,
+    "sec": 1,
+    "secs": 1,
+    "second": 1,
+    "seconds": 1,
+}
+
+
+def _interval_seconds(value: Any) -> Any:
+    """Длительность интервала PostgreSQL в секундах.
+
+    Месяц и год считаются как 30 и 365 дней: политики хранения такими единицами
+    не задаются, а сравнение должно быть полным, а не падать на незнакомом виде.
+    """
+    if not isinstance(value, str):
+        return value
+    total = 0.0
+    tokens = value.replace("@", " ").split()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if ":" in token:
+            sign = -1 if token.startswith("-") else 1
+            parts = token.lstrip("+-").split(":")
+            scale = (3600, 60, 1)
+            total += sign * sum(float(p) * s for p, s in zip(parts, scale[: len(parts)]))
+            index += 1
+            continue
+        unit = tokens[index + 1].rstrip(",") if index + 1 < len(tokens) else ""
+        if unit not in _INTERVAL_UNITS:
+            return value
+        total += float(token) * _INTERVAL_UNITS[unit]
+        index += 2
+    return total
+
+
 def _diff_named(kind: str, baseline: Dict[str, Any], current: Dict[str, Any]) -> List[str]:
     diffs = []
     for key in sorted(set(baseline) - set(current)):
@@ -78,6 +130,11 @@ def diff_schema(baseline: Dict[str, Any], current: Dict[str, Any]) -> List[str]:
     def _job_key(job: Dict[str, Any]) -> str:
         config = dict(job["config"] or {})
         config.pop("hypertable_id", None)
+        # drop_after сравнивается по длительности, а не по написанию: «365 days»
+        # и «8760:00:00» — одна и та же политика, а вот 30 дней вместо 365 —
+        # уже расхождение, и его тест обязан увидеть.
+        if "drop_after" in config:
+            config["drop_after"] = _interval_seconds(config["drop_after"])
         return json.dumps(
             {"proc": job["proc"], "hypertable": job["hypertable"], "config": config},
             sort_keys=True,

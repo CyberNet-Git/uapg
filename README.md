@@ -137,7 +137,7 @@ storage = HistoryTimescaleV2(
 | Таймауты | `db_query_timeout_sec`, `db_command_timeout_sec`, `db_pool_create_timeout_sec`, `db_pool_close_timeout_sec`, `db_lock_wait_timeout_sec`, `history_flush_timeout_sec`, `history_worker_stall_timeout_sec` |
 | Keepalive | `db_tcp_keepalive_idle_sec`, `db_tcp_keepalive_interval_sec`, `db_tcp_keepalive_count`, `db_tcp_user_timeout_sec` |
 | Кэши | `history_last_values_cache_enabled`, `history_last_values_cache_max_size_mb`, `history_last_values_init_batch_size`, `history_metadata_cache_enabled`, `history_metadata_cache_init_max_rows` |
-| Хранение | `global_retention_period` — политика TimescaleDB; меняется без перезапуска через `reapply_global_retention_policy()` |
+| Хранение | `global_retention_period` — политика TimescaleDB для всех таблиц истории, включая слой поиска событий; меняется без перезапуска через `reapply_global_retention_policy()` |
 
 Таймаут `0` или `None` означает «без ограничения».
 
@@ -172,6 +172,11 @@ await storage.refresh_history_metrics_nodes()               # обновлять
 Таблицы ядра: `variables_history` и `events_history` (гипертаблицы TimescaleDB),
 `variable_metadata`, `event_sources`, `event_types`, `variables_last_value`. Слой
 поиска событий: `events_ts` и по таблице `evt_<тип>` на каждый тип события.
+
+Период хранения один на все гипертаблицы и задаётся `global_retention_period`:
+отдельной политики у слоя поиска нет и быть не должно — строка поиска без своего
+события в `events_history` означала бы, что фильтр его находит, а `HistoryRead`
+не отдаёт. При старте политика сверяется с настройкой и исправляется.
 
 ## Переход с 0.2.x
 

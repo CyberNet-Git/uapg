@@ -28,6 +28,11 @@ HYPERTABLES: Sequence[Tuple[str, str, str, int]] = (
 
 RETENTION_TABLES: Sequence[str] = ("variables_history", "events_history")
 
+# Слой поиска событий живёт ровно столько же, сколько сами события: строка
+# поиска без своей полезной нагрузки в events_history — это молча потерянное
+# событие, поэтому отдельного периода хранения у него нет.
+EVENT_SEARCH_RETENTION_TABLES: Sequence[str] = ("events_ts",)
+
 DEFAULT_SPACE_PARTITIONS = 32
 
 
@@ -168,7 +173,69 @@ class SchemaBootstrap:
             return
 
         for table in RETENTION_TABLES:
+            await self._set_retention_policy(table, period)
+
+    async def apply_event_search_retention(self, period: Optional[timedelta]) -> None:
+        """Согласовать политику слоя поиска событий с глобальной.
+
+        Миграция 004 ставила слою поиска свои 365 дней, никак не связанные с
+        ``global_retention_period``. При меньшем глобальном периоде появлялось
+        окно, в котором строка поиска есть, а самого события в
+        ``events_history`` уже нет: ``HistoryRead`` молча отдавал меньше
+        событий, чем нашёл фильтр. Отдельно период слоя поиска не настраивается,
+        источник истины один, поэтому расхождение исправляется в обе стороны —
+        включая снятие политики, когда глобальный период не задан.
+        """
+        if period is not None and period.total_seconds() <= 0:
+            return
+        if not await self.timescaledb_available():
+            return
+
+        for table in EVENT_SEARCH_RETENTION_TABLES:
+            if not await self._table_exists(table):
+                continue
+            await self._set_retention_policy(table, period)
+
+    async def _set_retention_policy(self, table: str, period: Optional[timedelta]) -> None:
+        """Привести политику таблицы к ``period``; ``None`` — снять политику.
+
+        Политика переустанавливается только при расхождении: лишняя пара
+        remove/add сбрасывала бы расписание фоновой задачи на каждом старте.
+        """
+        try:
+            current = await self._retention_period(table)
+        except Exception as exc:
+            self.logger.warning("Политика хранения %s не прочитана: %s", table, exc)
+            return
+        if current == period:
+            return
+        if current is not None:
+            await self._remove_retention_policy(table)
+        if period is not None:
             await self._add_retention_policy(table, int(period.total_seconds()))
+            self.logger.info("Политика хранения %s: %s", table, period)
+
+    async def _retention_period(self, table: str) -> Optional[timedelta]:
+        value = await self._db.fetchval(
+            "SELECT (config->>'drop_after')::interval"
+            "  FROM timescaledb_information.jobs"
+            " WHERE proc_name = 'policy_retention'"
+            "   AND hypertable_schema = $1"
+            "   AND hypertable_name = $2",
+            self._schema,
+            table,
+        )
+        return value if isinstance(value, timedelta) else None
+
+    async def _table_exists(self, table: str) -> bool:
+        found = await self._db.fetchval(
+            "SELECT 1 FROM pg_class c"
+            "  JOIN pg_namespace n ON n.oid = c.relnamespace"
+            " WHERE n.nspname = $1 AND c.relname = $2",
+            self._schema,
+            table,
+        )
+        return found is not None
 
     async def _add_retention_policy(self, table: str, seconds: int) -> None:
         try:
@@ -185,6 +252,19 @@ class SchemaBootstrap:
         except Exception as exc:
             self.logger.warning("Политика хранения для %s не применена: %s", table, exc)
 
+    async def _remove_retention_policy(self, table: str) -> None:
+        try:
+            await self._db.execute(
+                "SELECT remove_retention_policy("
+                "  format('%I.%I', $1::text, $2::text)::regclass,"
+                "  if_exists => TRUE"
+                ")",
+                self._schema,
+                table,
+            )
+        except Exception as exc:
+            self.logger.warning("Политика хранения для %s не снята: %s", table, exc)
+
     async def reapply_retention(
         self,
         period: Optional[timedelta],
@@ -199,24 +279,19 @@ class SchemaBootstrap:
         if not await self.timescaledb_available():
             return
 
-        for table in RETENTION_TABLES:
-            try:
-                await self._db.execute(
-                    "SELECT remove_retention_policy("
-                    "  format('%I.%I', $1::text, $2::text)::regclass,"
-                    "  if_exists => TRUE"
-                    ")",
-                    self._schema,
-                    table,
-                )
-            except Exception as exc:
-                self.logger.warning("Политика хранения для %s не снята: %s", table, exc)
+        tables = list(RETENTION_TABLES)
+        for table in EVENT_SEARCH_RETENTION_TABLES:
+            if await self._table_exists(table):
+                tables.append(table)
+
+        for table in tables:
+            await self._remove_retention_policy(table)
 
         if period is None or period.total_seconds() <= 0:
             return
 
         seconds = int(period.total_seconds())
-        for table in RETENTION_TABLES:
+        for table in tables:
             await self._add_retention_policy(table, seconds)
             if drop_immediately:
                 await self._drop_old_chunks(table, seconds)

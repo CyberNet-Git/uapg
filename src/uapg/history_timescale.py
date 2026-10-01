@@ -390,6 +390,11 @@ class HistoryTimescale(HistoryStorageInterface):  # type: ignore[misc]
         if not self._v2_ready:
             self.logger.warning("Слой поиска событий не готов: события пишутся по-старому")
             return
+        # Таблицы слоя поиска создаются миграциями, поэтому их политика хранения
+        # согласуется здесь, а не в ensure_core_schema.
+        await self._bootstrap.apply_event_search_retention(
+            self._settings.global_retention_period
+        )
         self._event_tables = TypedEventTables(
             self._db, self._schema, self._events_config, logger=self.logger
         )
