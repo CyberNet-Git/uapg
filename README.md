@@ -12,7 +12,7 @@ UAPG - это модуль для хранения исторических да
 - **Режимы** — `UAPG_EVENTS_STORAGE_MODE`: `legacy` | `dual` (по умолчанию) | `v2`
 - **SQL push-down** — `FilterPlan` JSON, `uapg_read_events_v2`, typed ILIKE по колонкам registry
 - **Schema registry** — auto DDL при `new_historized_event`, advisory lock
-- **Backfill** — `run_events_backfill()` для миграции legacy → v2
+- **Backfill** — `run_events_backfill()` для миграции legacy → v2: один вызов SQL-функции `uapg_backfill_events_batch` на батч плюс перенос в typed-таблицы по курсору `uapg_backfill_state[events_typed]` (дойдя до хвоста, курсор начинает круг заново). Прогресс и узел `EventsBackfillComplete` считаются по watermark и требуют индекса `idx_events_history_id` (создаётся на старте, глубина пробы — `events_backfill_probe_rows`, время жизни оценки — `events_backfill_status_ttl_sec`)
 - **Timescale** — compression/retention на `events_ts`, optional CAGG `uapg_events_hourly`
 - **Roadmap** — skeleton variables V2 + OPC UA Aggregation (ADR-003, migrations `101_*`, `102_*`)
 
@@ -358,6 +358,7 @@ await history.refresh_history_metrics_nodes()
 - `last_batch_size`, `avg_flush_duration_ms`, `max_flush_duration_ms` - показывает фактическую эффективность batch flush.
 - `insert_history_*`, `upsert_last_value_*` - помогает отделить запись истории от обновления последних значений.
 - `timeouts_total`, `reconnects_total` - показывает проблемы доступности PostgreSQL.
+- `events_v2.backfill_probe_failures_total` (HistoryTimescaleV2) - проба готовности бэкфила не получила ответа; ненулевое значение обычно означает, что индекс `idx_events_history_id` не создан, и его стоит создать вручную.
 
 Per-variable и per-event retention cleanup в write path не выполняется. Для автоматического удаления старых данных используйте глобальную TimescaleDB retention policy через `global_retention_period` или отдельные административные cleanup-команды.
 

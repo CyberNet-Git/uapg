@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.2.17] - 2026-09-30
+
+### Исправлено
+
+- **Typed-бэкфил не переносил исторические события вообще.** `EventsBackfillWorker._backfill_typed_rows` выбирал строки `ORDER BY et.legacy_row_id DESC LIMIT n` без курсора: каждый вызов брал одни и те же самые свежие N строк и до старых не доходил никогда, сколько бы раз ни вызывался `run_events_backfill()`. Добавлен восходящий курсор — отдельная строка `domain = 'events_typed'` в уже существующей `uapg_backfill_state` (схема таблицы не меняется). Дойдя до хвоста, курсор сбрасывается в 0: следующий круг подхватывает строки тех типов, у которых typed-таблица появилась позже. Повторная вставка безвредна — `insert_typed_row` делает `ON CONFLICT (event_id, event_timestamp) DO NOTHING`.
+- **Сортировка всей гипертаблицы `events_ts` на каждый батч.** Восходящий keyset (`legacy_row_id > $1 ORDER BY et.legacy_row_id LIMIT n`) обслуживается частичным индексом `idx_events_ts_legacy_row`; в плане `Index Scan` вместо `Sort` по всем чанкам. Проверка существования typed-таблицы переписана с `NOT EXISTS (SELECT 1 FROM information_schema.tables ...) IS FALSE` (двойное отрицание плюс коррелированный подзапрос к системному представлению на каждую строку) на `to_regclass(format('%I.%I', ...))`, а `physical_table` берётся из JOIN с `event_type_storage` — построчный `registry.get_storage_table()` больше не нужен.
+- **Батч бэкфила делал 1+2N обращений к БД.** `ProcedureGateway.backfill_events_batch` переписывал на Python логику, которая уже была в SQL, и на каждую строку выполнял `SELECT 1 FROM events_ts WHERE legacy_row_id = $1` и отдельный INSERT: при `batch_size=500` до 1001 обращения. Теперь один вызов SQL-функции.
+- **`uapg_backfill_events_batch` был мёртвым кодом с построчным циклом.** Процедура из `003_events_v2_functions.sql` не вызывалась нигде и сама шла `FOR ... LOOP`. Новая миграция `005_events_v2_backfill.sql` заменяет её функцией того же имени (`RETURNS TABLE (last_legacy_id, rows_processed, rows_inserted)`) с одним set-based `INSERT ... SELECT` — по образцу `uapg_save_event_v2`, которую гейтвей вызывает так же. Правка вынесена в отдельный файл потому, что `003` на существующих БД уже отмечен применённым в `uapg_schema_migrations` и повторно не выполняется. Семантика watermark сохранена: `last_legacy_id` двигается до максимального `id` батча (включая строки, уже записанные dual-write), `rows_processed` растёт только на фактически вставленные.
+- **Построчные обращения в typed-бэкфиле.** `event_data` тянется на весь батч одним `WHERE id = ANY($1::bigint[])` (индекс `idx_events_history_id`) вместо N запросов `WHERE id = $1`; избыточная построчная проверка существования в typed-таблице удалена; `ensure_columns_from_typed_values` вызывается один раз на таблицу по объединению ключей батча, а не на каждую строку — иначе advisory lock, `CREATE TABLE IF NOT EXISTS` и запрос к `information_schema.columns` выполнялись N раз. Итого на батч ~N+3 обращения вместо ~3N+2.
+- **Одна битая строка роняла весь батч.** Ошибка декодирования `event_data` или вставки одной строки теперь пишется в лог на WARNING и считается в `typed_rows_failed`; остальные строки батча обрабатываются. Циклический проход вернётся к строке на следующем круге.
+
+### Добавлено
+
+- **Миграция `005_events_v2_backfill.sql`** — функция `uapg_backfill_events_batch` вместо процедуры и seed-строка курсора `events_typed` в `uapg_backfill_state`.
+- **Ключи `typed_rows_inserted` и `typed_rows_failed`** в результате `run_events_backfill()`. Прежние четыре ключа (`last_legacy_id`, `rows_processed`, `backfill_lag_rows`, `v2_coverage_pct`) не изменились.
+- **Параметр `ensure_columns` у `EventSchemaRegistry.insert_typed_row`** (по умолчанию `True`, поведение записи не меняется) — для батчевых вызовов, которые досоздают колонки один раз на батч.
+- **Параметр `timeout` у `ProcedureGateway.backfill_events_batch`** — воркер передаёт свой `db_query_timeout_sec`, чтобы батч не висел бесконечно на сыром пуле.
+
+## [0.2.16] - 2026-09-30
+
+### Исправлено
+
+- **Старт сервера больше не рвёт пул 30-секундным таймаутом.** В логе 30.09 старт писал `PostgreSQL fetchval timed out after 30.0 seconds (layer=query)` и следом `Fetchval timed out, will reconnect without retrying`. Причина — `HistoryTimescaleV2.refresh_history_settings_nodes` считал полный anti-join `events_history` × `events_ts` (`SELECT count(*) ... WHERE NOT EXISTS (...)`), который на проде разворачивался в Parallel Hash Anti Join по всем 34 чанкам гипертаблицы (~1.2 ГБ, ~514k строк). Запрос шёл через `_fetchval`, не укладывался в `db_query_timeout_sec` и по ветке «таймаут» вызывал `_force_reconnect`: пул уничтожался и пересоздавался, а вся остальная историзация вставала на `_reconnect_lock` — и всё это ради косметического OPC UA узла `EventsBackfillComplete`.
+- **`expose_history_settings_nodes` выполнял refresh дважды.** Базовый `expose` сам зовёт `refresh_history_settings_nodes`, и виртуальная диспетчеризация уводила вызов в V2-override; следом `_expose_events_v2_capability_nodes` звал refresh ещё раз. За один старт anti-join исполнялся два раза. Теперь refresh откладывается до конца `expose` и выполняется один раз.
+- **Оценка прогресса бэкфила считается по watermark, а не полным сканом.** Алгоритм бэкфила и так watermark-овый (`uapg_backfill_state.last_legacy_id`, `WHERE id > last_legacy_id ORDER BY id LIMIT n`), поэтому полный anti-join для ответа «готово / сколько осталось» не нужен. Готовность определяется ограниченной пробой: есть ли среди первых `events_backfill_probe_rows` строк выше watermark хоть одна без пары в `events_ts` — ровно то, что нашёл бы следующий батч `run_events_backfill()`. Стоимость не зависит от размера `events_history`. Голое «есть строки с `id > watermark`» здесь не подошло бы: dual-write кладёт новое событие сразу в обе таблицы, и флаг сбрасывался бы после каждой записи. Оборотная сторона: пропуск дальше `events_backfill_probe_rows` строк от watermark (например, после сбоя dual-write) пробой не виден — узел информационный.
+- **Тот же anti-join исполнялся на каждом чтении событий.** `read_event_history` считал неперенесённые строки по `source_id` без ограничения по времени — только чтобы выставить `partial`, который дальше попадает лишь в DEBUG-лог. Теперь используется общая кэшированная оценка (TTL `events_backfill_status_ttl_sec`, по умолчанию 30 с): в типовом случае чтение не делает ни одного дополнительного запроса. Оценка стала глобальной, а не по источнику, то есть консервативнее — `partial=true`, если отстал любой источник.
+- **Служебная проба физически не может уронить пул.** Она идёт по отдельному пути в обход `_run_db_operation`/`_fetchval`, с собственным коротким бюджетом (минимум из 5 с и `db_query_timeout_sec`), и любая её ошибка только пишется в DEBUG и считается в счётчике. Неудачная проба тоже попадает под TTL, иначе на медленной БД каждое чтение ждало бы свой таймаут заново.
+- **Два полных скана на каждый батч бэкфила.** `EventsBackfillWorker.run_batch` считал тот же anti-join плюс `count(*)` всей `events_history`, причём на сыром пуле — мимо `_fetchval`, то есть вообще без таймаута и без обработки обрыва. Оба запроса заменены одним, целиком обслуживаемым индексом по `id`. Все запросы воркера получили явный `timeout`, так что батч больше не может висеть бесконечно.
+- **Смысл метрик бэкфила уточнён.** `backfill_lag_rows` — число строк, которых sweep ещё не касался (`id > last_legacy_id`); это надмножество прежнего точного anti-join, так как новые строки dual-write тоже попадают в счёт, но батч, дошедший до хвоста, оставляет значение около нуля. `v2_coverage_pct` — позиция watermark в диапазоне `id` (`min(id)`/`max(id)`), где `min(id)` учитывает уже вычищенный retention-политикой хвост. Набор ключей, возвращаемых `run_events_backfill()`, не изменился.
+
+### Добавлено
+
+- **Индекс `idx_events_history_id` по `events_history(id)`**, создаётся на старте в V2-режимах через существующий `_ensure_index` (проверка по `pg_indexes`, таймаут или lock не валят процесс, повтор на следующем старте). `id` — `BIGSERIAL` без PRIMARY KEY, и без индекса полным сканом по всем чанкам шли не только проба готовности, но и keyset-батч бэкфила (`WHERE id > $1 ORDER BY id LIMIT n`), и гидрация каждого чтения событий (`WHERE id = ANY($1::bigint[])` в `EventStoreV2._hydrate_events`). На горячем стенде индекс можно создать заранее вручную, чтобы не держать ShareLock на всей гипертаблице во время сборки:
+
+  ```sql
+  CREATE INDEX idx_events_history_id ON "<schema>".events_history (id)
+      WITH (timescaledb.transaction_per_chunk);
+  ```
+
+- **Параметры `events_backfill_probe_rows` (1000) и `events_backfill_status_ttl_sec` (30 с)** конструктора `HistoryTimescaleV2` — глубина пробы готовности бэкфила и время жизни её результата.
+- **Секция `events_v2` в `get_performance_metrics()`** (а значит и узлы OPC UA `HistoryMetrics`: `EventsV2StorageMode`, `EventsV2StorageReady`, `EventsV2BackfillProbeFailuresTotal`, `EventsV2BackfillProbeRows`, `EventsV2BackfillStatusTtlSec`). Счётчик `backfill_probe_failures_total` показывает, сколько раз проба готовности не получила ответа (таймаут или обрыв); ненулевое значение при отсутствующем `idx_events_history_id` — прямое указание создать индекс вручную.
+
+
 ## [0.2.15] - 2026-09-14
 
 Чат `98383d56-2906-440e-b09f-925f492a4033`, план `flush_retry_and_init_41edcfaa.plan.md`.

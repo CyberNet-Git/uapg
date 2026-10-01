@@ -111,55 +111,30 @@ class ProcedureGateway:
         )
 
     async def backfill_events_batch(
-        self, batch_size: int, last_legacy_id: int, rows_processed: int
+        self,
+        batch_size: int,
+        last_legacy_id: int,
+        rows_processed: int,
+        *,
+        timeout: Optional[float] = None,
     ) -> Tuple[int, int]:
-        rows = await self._pool.fetch(
+        """Один батч legacy → events_ts.
+
+        Раньше метод повторял на Python логику SQL-объекта и делал это построчно:
+        keyset-SELECT плюс `SELECT 1` и INSERT на каждую строку — 1+2N round-trip на батч.
+        Функция `uapg_backfill_events_batch` (миграция 005) делает то же одним
+        set-based INSERT ... SELECT и сама двигает uapg_backfill_state.
+        """
+        row = await self._pool.fetchrow(
             f'''
-            SELECT eh.id, eh.source_id, eh.event_type_id, eh.event_timestamp
-            FROM "{self._schema}".events_history eh
-            WHERE eh.id > $1
-            ORDER BY eh.id
-            LIMIT $2
+            SELECT last_legacy_id, rows_processed
+            FROM "{self._schema}".uapg_backfill_events_batch($1, $2, $3)
             ''',
-            last_legacy_id,
             batch_size,
+            last_legacy_id,
+            rows_processed,
+            timeout=timeout,
         )
-        new_last = last_legacy_id
-        new_processed = rows_processed
-        for row in rows:
-            exists = await self._pool.fetchval(
-                f'''
-                SELECT 1 FROM "{self._schema}".events_ts
-                WHERE legacy_row_id = $1
-                LIMIT 1
-                ''',
-                row["id"],
-            )
-            if not exists:
-                await self._pool.execute(
-                    f'''
-                    INSERT INTO "{self._schema}".events_ts (
-                        source_id, event_type_id, event_timestamp, schema_version, legacy_row_id
-                    ) VALUES ($1, $2, $3, 1, $4)
-                    ON CONFLICT DO NOTHING
-                    ''',
-                    row["source_id"],
-                    row["event_type_id"],
-                    row["event_timestamp"],
-                    row["id"],
-                )
-                new_processed += 1
-            new_last = int(row["id"])
-        await self._pool.execute(
-            f'''
-            INSERT INTO "{self._schema}".uapg_backfill_state (domain, last_legacy_id, rows_processed)
-            VALUES ('events', $1, $2)
-            ON CONFLICT (domain) DO UPDATE SET
-                last_legacy_id = EXCLUDED.last_legacy_id,
-                rows_processed = EXCLUDED.rows_processed,
-                updated_at = NOW()
-            ''',
-            new_last,
-            new_processed,
-        )
-        return new_last, new_processed
+        if row is None:
+            return last_legacy_id, rows_processed
+        return int(row["last_legacy_id"]), int(row["rows_processed"])
