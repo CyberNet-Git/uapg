@@ -20,6 +20,18 @@ API: Dict[str, str] = {
     "module_all removed: DatabaseManager": "админ-утилиты вынесены из пакета",
     "module_all removed: create_database_standalone": "админ-утилиты вынесены из пакета",
     "module_all removed: backup_database_standalone": "админ-утилиты вынесены из пакета",
+    # Перенесено из 0.2.16: эталон снят с 0.2.15, где этих параметров и метрик
+    # ещё не было. Глубина пробы готовности переноса и время жизни её результата.
+    "constructor changed: HistoryTimescaleV2: "
+    "(self, *args, events_storage_mode=None, events_v2_config=None, **kwargs) -> "
+    "(self, *args, events_storage_mode=None, events_v2_config=None, "
+    "events_backfill_probe_rows=1000, events_backfill_status_ttl_sec=30.0, **kwargs)":
+        "параметры пробы переноса, добавлены в 0.2.16",
+    "metric_paths_v2 added: events_v2.storage_mode": "раздел метрик из 0.2.16",
+    "metric_paths_v2 added: events_v2.storage_ready": "раздел метрик из 0.2.16",
+    "metric_paths_v2 added: events_v2.backfill_probe_failures_total": "раздел метрик из 0.2.16",
+    "metric_paths_v2 added: events_v2.backfill_probe_rows": "раздел метрик из 0.2.16",
+    "metric_paths_v2 added: events_v2.backfill_status_ttl_sec": "раздел метрик из 0.2.16",
 }
 
 # --- поведение записи ---
@@ -40,6 +52,19 @@ SCHEMA: Dict[str, str] = {
     # останется и вреда не принесёт, новые базы получают один.
     "indexes events_history removed: CREATE INDEX idx_events_history_event_type_source "
     "ON {schema}.events_history USING btree (event_type_id, source_id)": "дубль индекса",
+    # Добавлено в 0.2.16: events_history.id — BIGSERIAL без PRIMARY KEY, и без
+    # индекса по нему батч переноса, восстановление полей события и проба
+    # готовности шли полным сканом всех чанков.
+    "indexes events_history added: CREATE INDEX idx_events_history_id "
+    "ON {schema}.events_history USING btree (id)": "индекс по id, добавлен в 0.2.16",
+    # Миграция 005 (0.2.17) заменила процедуру с построчным циклом функцией с
+    # одним INSERT ... SELECT.
+    "routines removed: uapg_backfill_events_batch(IN p_batch_size integer, "
+    "INOUT p_last_legacy_id bigint, INOUT p_rows_processed bigint)":
+        "процедура заменена функцией в миграции 005",
+    "routines added: uapg_backfill_events_batch(p_batch_size integer, "
+    "p_last_legacy_id bigint, p_rows_processed bigint)":
+        "функция из миграции 005 вместо построчной процедуры",
 }
 
 # Объекты миграций 101/102 (variables v2 по ADR-003): создавались в каждой базе,

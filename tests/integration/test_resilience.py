@@ -164,3 +164,55 @@ async def _is_dead(conn: asyncpg.Connection) -> bool:
         return False
     except Exception:
         return True
+
+
+async def test_settings_refresh_probes_backfill_once_per_ttl(pg_database: str) -> None:
+    """Обновление витрины настроек не должно сканировать историю на каждый вызов.
+
+    В 0.2.15 узел EventsBackfillComplete считался полным anti-join по
+    events_history: на проде он не укладывался в таймаут запроса и через общий
+    путь обработки ошибок пересоздавал пул прямо на старте сервера.
+    """
+    from uapg import HistoryTimescaleV2
+
+    storage = HistoryTimescaleV2(
+        **connect_kwargs(pg_database),
+        events_backfill_status_ttl_sec=300.0,
+    )
+    await storage.init()
+    try:
+        calls = 0
+        original = storage._event_search.pending_backfill  # type: ignore[union-attr]
+
+        async def counting(*args: object, **kwargs: object) -> object:
+            nonlocal calls
+            calls += 1
+            return await original(*args, **kwargs)  # type: ignore[operator]
+
+        storage._event_search.pending_backfill = counting  # type: ignore[union-attr, assignment]
+        storage._backfill_complete_cached = None
+
+        assert await storage._backfill_complete() is True
+        for _ in range(5):
+            await storage._backfill_complete()
+        assert calls == 1, "результат пробы обязан кэшироваться на время ttl"
+    finally:
+        await storage.stop()
+
+
+async def test_failed_probe_does_not_recreate_the_pool(pg_database: str) -> None:
+    """Служебная проба не имеет права утащить за собой пул соединений."""
+    from uapg import HistoryTimescaleV2
+
+    storage = HistoryTimescaleV2(**connect_kwargs(pg_database))
+    await storage.init()
+    try:
+        reconnects_before = storage._db._metrics.reconnects_total
+        # Запрос с заведомой ошибкой вместо пробы: путь должен это проглотить.
+        assert await storage._event_search.pending_backfill(  # type: ignore[union-attr]
+            1000, timeout=0.001
+        ) in (None, True, False)
+        assert await storage._db.fetchval("SELECT 1") == 1
+        assert storage._db._metrics.reconnects_total == reconnects_before
+    finally:
+        await storage.stop()

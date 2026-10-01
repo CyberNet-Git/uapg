@@ -16,6 +16,7 @@ import importlib.metadata as importlib_metadata
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Coroutine, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -202,6 +203,10 @@ class HistoryTimescale(HistoryStorageInterface):  # type: ignore[misc]
 
         self._events_mode = StorageMode.LEGACY
         self._events_config = EventsV2Config()
+        self._events_backfill_probe_rows = 1000
+        self._events_backfill_status_ttl_sec = 30.0
+        self._backfill_complete_cached: Optional[bool] = None
+        self._backfill_checked_at = 0.0
         self._v2_ready = False
         self._event_tables: Optional[TypedEventTables] = None
         self._event_registry: Optional[EventSchemaRegistry] = None
@@ -247,10 +252,17 @@ class HistoryTimescale(HistoryStorageInterface):  # type: ignore[misc]
         self._failed_saves: Dict[str, int] = {"value": 0, "event": 0}
 
     def _configure_events(
-        self, mode: StorageMode, config: Optional[EventsV2Config] = None
+        self,
+        mode: StorageMode,
+        config: Optional[EventsV2Config] = None,
+        *,
+        backfill_probe_rows: int = 1000,
+        backfill_status_ttl_sec: float = 30.0,
     ) -> None:
         self._events_mode = mode
         self._events_config = config or EventsV2Config()
+        self._events_backfill_probe_rows = max(1, int(backfill_probe_rows))
+        self._events_backfill_status_ttl_sec = max(0.0, float(backfill_status_ttl_sec))
 
     @property
     def _schema(self) -> str:
@@ -1324,12 +1336,41 @@ class HistoryTimescale(HistoryStorageInterface):  # type: ignore[misc]
         }
 
     async def _backfill_complete(self) -> bool:
-        if not self._v2_ready:
+        """Перенесены ли все события в слой поиска.
+
+        Оценка кэшируется и делается ограниченной пробой: полный anti-join по
+        events_history на проде разворачивался в скан всех чанков гипертаблицы,
+        не укладывался в таймаут запроса и пересоздавал пул — ради одного
+        косметического узла OPC UA.
+        """
+        if not self._v2_ready or self._event_search is None:
             return True
-        try:
-            return await self._events.backfill_lag() == 0
-        except Exception:
-            return False
+        now = time.monotonic()
+        if (
+            self._backfill_complete_cached is not None
+            and now - self._backfill_checked_at < self._events_backfill_status_ttl_sec
+        ):
+            return self._backfill_complete_cached
+
+        pending = await self._event_search.pending_backfill(
+            self._events_backfill_probe_rows, timeout=self._probe_timeout_sec()
+        )
+        if pending is None:
+            # Проба не удалась — «готово» за факт не выдаём. Время всё равно
+            # отмечаем, иначе на медленной БД каждое обновление витрины ждало бы
+            # свой таймаут заново.
+            self._backfill_complete_cached = bool(self._backfill_complete_cached)
+        else:
+            self._backfill_complete_cached = not pending
+        self._backfill_checked_at = now
+        return self._backfill_complete_cached
+
+    def _probe_timeout_sec(self) -> float:
+        """Короткий бюджет служебной пробы: она не должна занимать весь таймаут запроса."""
+        budget = self._settings.timeouts.query_sec
+        if budget is None or budget <= 0:
+            return 5.0
+        return min(5.0, float(budget))
 
     async def expose_history_metrics_nodes(
         self,

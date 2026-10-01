@@ -83,7 +83,10 @@ storage = HistoryTimescaleV2(
 
 События, записанные до включения слоя поиска, переносятся порциями:
 `await storage.run_events_backfill(batch_size=500)` — вызывать, пока
-`backfill_lag_rows` не станет нулём.
+`backfill_lag_rows` не станет нулём. Прогресс отслеживается по отметке в
+`uapg_backfill_state`, а не полным сопоставлением таблиц, поэтому не зависит от
+размера истории; глубину пробы и время жизни её результата задают
+`events_backfill_probe_rows` и `events_backfill_status_ttl_sec`.
 
 ## Что поддерживается из OPC UA Part 11
 

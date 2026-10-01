@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -70,6 +71,8 @@ class EventSearchStore:
         self._registry = registry
         self.logger = logger or logging.getLogger("uapg.storage.event_search")
         self._sql = load_queries("search.sql", schema)
+        # Сколько раз служебная проба готовности переноса не выполнилась.
+        self.probe_failures = 0
         # event_type_id -> (таблица, версия схемы), чтобы не спрашивать реестр на каждом событии.
         self._types: Dict[int, Tuple[Optional[str], int]] = {}
 
@@ -365,70 +368,129 @@ class EventSearchStore:
 
     # ------------------------------------------------------------------ перенос
 
+    # Домены курсоров в uapg_backfill_state: отдельный для переноса в events_ts и
+    # отдельный для заполнения типизированных таблиц.
+    EVENTS_DOMAIN = "events"
+    TYPED_DOMAIN = "events_typed"
+
+    async def pending_backfill(self, probe_rows: int, *, timeout: Optional[float] = None) -> Optional[bool]:
+        """Осталась ли у переноса работа. ``None`` — проба не удалась.
+
+        Ограниченная проба над watermark вместо полного anti-join: последний на
+        проде разворачивался в Parallel Hash Anti Join по всем чанкам
+        гипертаблицы, не укладывался в таймаут запроса и через общий путь
+        обработки ошибок пересоздавал пул — ради косметического узла OPC UA.
+        """
+        value = await self._db.probe_fetchval(
+            self._sql["backfill_pending"], max(1, int(probe_rows)), timeout=timeout
+        )
+        if value is None:
+            self.probe_failures += 1
+            return None
+        return bool(value)
+
+    async def _state(self, domain: str) -> Tuple[int, int]:
+        row = await self._db.fetchrow(self._sql["backfill_state"], domain)
+        if row is None:
+            return 0, 0
+        return int(row["last_legacy_id"]), int(row["rows_processed"])
+
+    async def _set_state(self, domain: str, last_id: int, processed: int) -> None:
+        await self._db.execute(self._sql["set_backfill_state"], domain, int(last_id), int(processed))
+
     async def backfill(self, batch_size: int = 500) -> Dict[str, Any]:
         """Перенести очередную порцию событий из устаревшего хранения в слой поиска."""
-        state = await self._db.fetchrow(self._sql["backfill_state"])
-        last_id = int(state["last_legacy_id"]) if state else 0
-        processed = int(state["rows_processed"]) if state else 0
+        last_id, processed = await self._state(self.EVENTS_DOMAIN)
+        row = await self._db.fetchrow(self._sql["backfill_batch"], batch_size, last_id, processed)
+        if row is not None:
+            last_id = int(row["last_legacy_id"])
+            processed = int(row["rows_processed"])
 
-        result = await self._db.fetchrow(self._sql["backfill_batch"], batch_size, last_id, processed)
-        if result is not None:
-            last_id = int(result["p_last_legacy_id"])
-            processed = int(result["p_rows_processed"])
+        typed_inserted, typed_failed = await self._backfill_typed(batch_size)
 
-        await self._backfill_typed(batch_size)
-
-        totals = await self._db.fetchrow(self._sql["backfill_totals"])
-        total = int(totals["total"]) if totals else 0
-        lag = int(totals["lag"]) if totals else 0
-        coverage = round(100.0 * (total - lag) / total, 2) if total else 0.0
+        stats = await self._db.fetchrow(self._sql["backfill_stats"], last_id)
+        lag = int((stats["lag_rows"] if stats else 0) or 0)
         return {
             "last_legacy_id": last_id,
             "rows_processed": processed,
+            # Строки, которых перенос ещё не касался. Надмножество точного
+            # отставания: сюда попадают и свежие события двойной записи, но
+            # дойдя до хвоста, значение остаётся около нуля.
             "backfill_lag_rows": lag,
-            "v2_coverage_pct": coverage,
+            "v2_coverage_pct": _coverage_pct(
+                last_id,
+                lag,
+                stats["min_id"] if stats else None,
+                stats["max_id"] if stats else None,
+            ),
+            "typed_rows_inserted": typed_inserted,
+            "typed_rows_failed": typed_failed,
         }
 
-    async def _backfill_typed(self, batch_size: int) -> None:
-        """Заполнить типизированные таблицы для уже перенесённых событий.
+    async def _backfill_typed(self, batch_size: int) -> Tuple[int, int]:
+        """Заполнить типизированные таблицы по восходящему курсору.
 
-        В 0.2.15 здесь каждый раз выбирались одни и те же последние строки: когда
-        они оказывались перенесены, более старые не переносились никогда.
-        Анти-соединение с таблицей поиска выбирает именно недостающие строки.
+        Дойдя до хвоста, курсор сбрасывается в ноль: следующий круг подхватит
+        события тех типов, у которых таблица поиска появилась позже. Повторная
+        вставка безвредна — она идёт с ON CONFLICT DO NOTHING.
         """
-        storage = await self._db.fetch(self._sql["types_with_storage"])
-        for row in storage:
-            table = str(row["physical_table"])
-            if not await self._tables.known_columns(table):
+        cursor, _ = await self._state(self.TYPED_DOMAIN)
+        rows = await self._db.fetch(
+            self._sql["typed_backfill_rows"], int(cursor), self._schema, int(batch_size)
+        )
+        if not rows:
+            if cursor:
+                await self._set_state(self.TYPED_DOMAIN, 0, 0)
+            return 0, 0
+
+        # Поля всех событий батча — одним запросом, а не по одному на событие.
+        payloads = await self._events.read_payloads([int(r["legacy_row_id"]) for r in rows])
+
+        inserted = 0
+        failed = 0
+        for row in rows:
+            fields = payloads.get(int(row["legacy_row_id"]))
+            if not fields:
                 continue
-            missing = await self._db.fetch(
-                f'''
-                SELECT et.event_id, et.event_timestamp, et.source_id, eh.event_data
-                FROM "{self._schema}".events_ts et
-                JOIN "{self._schema}".events_history eh ON eh.id = et.legacy_row_id
-                LEFT JOIN "{self._schema}"."{table}" t
-                  ON t.event_id = et.event_id AND t.event_timestamp = et.event_timestamp
-                WHERE et.event_type_id = $1 AND t.event_id IS NULL
-                ORDER BY et.event_id
-                LIMIT $2
-                ''',
-                int(row["event_type_id"]),
-                batch_size,
-            )
-            for event in missing:
-                raw = event["event_data"]
-                values = decode_event_data(json.loads(raw) if isinstance(raw, str) else (raw or {}))
+            try:
                 await self._tables.insert_row(
-                    table,
-                    event_id=int(event["event_id"]),
-                    event_timestamp=event["event_timestamp"],
-                    source_id=int(event["source_id"]),
-                    values=values,
+                    str(row["physical_table"]),
+                    event_id=int(row["event_id"]),
+                    event_timestamp=row["event_timestamp"],
+                    source_id=int(row["source_id"]),
+                    values=fields,
                 )
+                inserted += 1
+            except Exception as exc:
+                failed += 1
+                self.logger.warning(
+                    "Событие %s не перенесено в таблицу поиска: %s", row["event_id"], exc
+                )
+
+        await self._set_state(self.TYPED_DOMAIN, int(rows[-1]["legacy_row_id"]), inserted)
+        return inserted, failed
+
+
+def _coverage_pct(
+    last_legacy_id: int,
+    lag_rows: int,
+    min_id: Optional[int],
+    max_id: Optional[int],
+) -> float:
+    """Где стоит watermark в диапазоне идентификаторов events_history.
+
+    Минимум учитывается из-за политики хранения: без него покрытие завышалось бы
+    на величину уже удалённого хвоста.
+    """
+    if max_id is None or min_id is None or lag_rows == 0:
+        return 100.0
+    span = int(max_id) - int(min_id) + 1
+    if span <= 0:
+        return 100.0
+    done = min(max(last_legacy_id - int(min_id) + 1, 0), span)
+    return round(100.0 * done / span, 2)
 
 
 def _shift_params(sql: str, offset: int) -> str:
     """Сдвинуть номера параметров $N на offset."""
-    import re
-
     return re.sub(r"\$(\d+)", lambda m: f"${int(m.group(1)) + offset}", sql)

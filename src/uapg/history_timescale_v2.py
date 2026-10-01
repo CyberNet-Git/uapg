@@ -27,14 +27,34 @@ class HistoryTimescaleV2(HistoryTimescale):
         *args: Any,
         events_storage_mode: Optional[StorageMode] = None,
         events_v2_config: Optional[EventsV2Config] = None,
+        events_backfill_probe_rows: int = 1000,
+        events_backfill_status_ttl_sec: float = 30.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self._configure_events(events_storage_mode or get_events_storage_mode(), events_v2_config)
+        self._configure_events(
+            events_storage_mode or get_events_storage_mode(),
+            events_v2_config,
+            backfill_probe_rows=events_backfill_probe_rows,
+            backfill_status_ttl_sec=events_backfill_status_ttl_sec,
+        )
 
     @property
     def events_storage_mode(self) -> StorageMode:
         return self._events_mode
+
+    def get_performance_metrics(self) -> dict:
+        metrics = super().get_performance_metrics()
+        metrics["events_v2"] = {
+            "storage_mode": self._events_mode.value,
+            "storage_ready": bool(self._v2_ready),
+            "backfill_probe_failures_total": (
+                self._event_search.probe_failures if self._event_search is not None else 0
+            ),
+            "backfill_probe_rows": int(self._events_backfill_probe_rows),
+            "backfill_status_ttl_sec": float(self._events_backfill_status_ttl_sec),
+        }
+        return metrics
 
     async def run_events_backfill(self, batch_size: int = 500) -> Dict[str, Any]:
         """Перенести очередную порцию событий из устаревшего хранения в слой поиска."""

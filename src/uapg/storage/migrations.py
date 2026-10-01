@@ -28,6 +28,7 @@ EVENT_MIGRATIONS: Sequence[str] = (
     "002_events_v2_tables.sql",
     "003_events_v2_functions.sql",
     "004_events_v2_timescale.sql",
+    "005_events_v2_backfill.sql",
 )
 
 # Признак готовности слоя v2. Проверка намеренно простая и не должна меняться:

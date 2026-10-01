@@ -203,6 +203,28 @@ class Database:
             )
             return False
 
+    async def probe_fetchval(
+        self,
+        sql: str,
+        *args: Any,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """Служебный запрос «по возможности»: значение нужное, но не критичное.
+
+        Намеренно в обход повторов и реконнекта: такие пробы обслуживают витрину
+        настроек и диагностику, и их таймаут не имеет права пересоздать пул и
+        подвесить на реконнект всю историзацию. При любой ошибке возвращается
+        ``None`` — вызывающий решает, что это значит.
+        """
+        budget = timeout if timeout is not None else self._timeouts.query_sec
+        try:
+            handle = await self._ensure_pool()
+            async with handle.pool.acquire(timeout=budget) as conn:
+                return await conn.fetchval(sql, *args, timeout=budget)
+        except Exception as exc:
+            self.logger.debug("Служебная проба не выполнена: %r", exc)
+            return None
+
     # ------------------------------------------------------------------ внутреннее
 
     async def _run_on_connection(

@@ -39,6 +39,12 @@ CREATE INDEX idx_events_event_type_id
 CREATE INDEX idx_events_timestamp
     ON "{schema}".events_history (event_timestamp);
 
+-- events_history.id — BIGSERIAL без PRIMARY KEY. Без индекса по нему полным
+-- сканом всех чанков идут и батч переноса в слой поиска, и восстановление
+-- полей события по идентификаторам, и проба готовности переноса.
+CREATE INDEX idx_events_history_id
+    ON "{schema}".events_history (id);
+
 CREATE INDEX idx_events_data_gin
     ON "{schema}".events_history USING GIN (event_data);
 

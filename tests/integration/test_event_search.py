@@ -295,3 +295,71 @@ class TestTypedDdl:
         assert held == 0
         columns = await h.tables._load_columns("evt_t_2_events_sensorevent")
         assert {f"extra_{i}" for i in range(8)} <= columns
+
+
+class TestBackfillProgress:
+    """Перенос считает прогресс по watermark, а не полным anti-join.
+
+    Полный anti-join по events_history на проде разворачивался в скан всех чанков
+    гипертаблицы, не укладывался в таймаут запроса и пересоздавал пул.
+    """
+
+    async def test_probe_sees_pending_rows_and_clears_after_backfill(self, h: Harness) -> None:
+        await h.events.flush(
+            [h.item("sensor", BASE + timedelta(seconds=i), dev_eui=f"P{i}") for i in range(4)]
+        )
+        assert await h.store.pending_backfill(1000) is True
+
+        await h.store.backfill(batch_size=100)
+        assert await h.store.pending_backfill(1000) is False
+
+    async def test_dual_written_events_do_not_look_pending(self, h: Harness) -> None:
+        """Событие двойной записи попадает в оба хранилища сразу — переносить нечего."""
+        await h.store.flush([h.item("sensor", BASE, dev_eui="D")])
+        assert await h.store.pending_backfill(1000) is False
+
+    async def test_probe_failure_is_reported_not_guessed(self, h: Harness) -> None:
+        await h.db.stop()
+        assert await h.store.pending_backfill(1000) is None
+        assert h.store.probe_failures == 1
+
+    async def test_watermark_and_coverage_advance(self, h: Harness) -> None:
+        await h.events.flush(
+            [h.item("sensor", BASE + timedelta(seconds=i), dev_eui=f"W{i}") for i in range(10)]
+        )
+        first = await h.store.backfill(batch_size=4)
+        assert first["rows_processed"] == 4
+        assert first["backfill_lag_rows"] == 6
+        assert 0 < first["v2_coverage_pct"] < 100
+
+        while (await h.store.backfill(batch_size=4))["backfill_lag_rows"]:
+            pass
+        last = await h.store.backfill(batch_size=4)
+        assert last["backfill_lag_rows"] == 0
+        assert last["v2_coverage_pct"] == 100.0
+
+    async def test_repeated_backfill_does_not_duplicate(self, h: Harness) -> None:
+        await h.events.flush(
+            [h.item("sensor", BASE + timedelta(seconds=i), dev_eui=f"R{i}") for i in range(5)]
+        )
+        for _ in range(3):
+            await h.store.backfill(batch_size=100)
+        assert await h.db.fetchval("SELECT count(*) FROM events_ts") == 5
+        assert await h.db.fetchval("SELECT count(*) FROM evt_t_2_events_sensorevent") == 5
+
+    async def test_typed_cursor_wraps_to_pick_up_late_tables(self, h: Harness) -> None:
+        """Тип, у которого таблица поиска появилась позже, подхватывается следующим кругом."""
+        await h.events.flush(
+            [h.item("alarm", BASE + timedelta(seconds=i), severity=i) for i in range(3)]
+        )
+        await h.db.execute("DROP TABLE evt_t_2_events_alarmevent")
+        h.tables.forget("evt_t_2_events_alarmevent")
+
+        await h.store.backfill(batch_size=100)        # таблицы нет — строки пропущены
+        await h.registry.sync_event_type(
+            h.type_ids["alarm"], ALARM_TYPE, h.registry.describe_fields(["Message", "Severity"])
+        )
+        for _ in range(3):                             # курсор доходит до хвоста и начинает круг
+            await h.store.backfill(batch_size=100)
+
+        assert await h.db.fetchval("SELECT count(*) FROM evt_t_2_events_alarmevent") == 3
