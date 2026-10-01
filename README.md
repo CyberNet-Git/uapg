@@ -180,7 +180,7 @@ await storage.refresh_history_metrics_nodes()               # обновлять
 
 ## Переход с 0.2.x
 
-Схема БД не меняется: 3.0 работает с существующей базой без миграции. Публичный
+Схема БД не меняется: 0.3 работает с существующей базой без миграции. Публичный
 API `HistoryTimescale` и `HistoryTimescaleV2` сохранён.
 
 Из пакета удалены `HistoryPgSQL` (бэкенд без TimescaleDB), `DatabaseManager`,

@@ -21,6 +21,6 @@ from .history_timescale_v2 import HistoryTimescaleV2
 try:
     __version__ = version("uapg")
 except PackageNotFoundError:  # pragma: no cover - запуск из исходников без установки
-    __version__ = "3.0.0"
+    __version__ = "0.3.0-pre1"
 
 __all__ = ["HistoryTimescale", "HistoryTimescaleV2"]
