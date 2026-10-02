@@ -157,7 +157,17 @@ class HistoryTimescaleV2(HistoryTimescale):
             self._backfill_worker._pool = pool
 
     async def _force_reconnect(self, failed_pool=None) -> None:
-        await super()._force_reconnect(failed_pool)
+        try:
+            await super()._force_reconnect(failed_pool)
+        finally:
+            # При неудаче super() уже закрыл старый пул и оставил self._pool = None.
+            # Без перепривязки EventStoreV2 продолжает acquire на закрытом объекте.
+            self._rebind_v2_pool()
+
+    async def _ensure_pool(self) -> None:
+        await super()._ensure_pool()
+        # Пул для записи может появиться здесь, минуя успешный _force_reconnect.
+        # Если self._pool уже открыт, базовый метод сразу выходит — ссылки V2 всё равно обновляем.
         self._rebind_v2_pool()
 
     def _backfill_probe_timeout_sec(self) -> float:
@@ -403,6 +413,9 @@ class HistoryTimescaleV2(HistoryTimescale):
     ) -> Tuple[List[Any], Optional[datetime]]:
         if not should_read_v2(self._events_storage_mode) or not self._event_store:
             return await super().read_event_history(source_id, start, end, nb_values, evfilter)
+
+        # Чтение не ждёт следующего flush: само поднимает пул и перепривязывает EventStoreV2.
+        await self._ensure_pool()
 
         start_time, end_time, order, limit = self._get_bounds(start, end, nb_values)
         source_db_id = await self._resolve_source_db_id(source_id)
