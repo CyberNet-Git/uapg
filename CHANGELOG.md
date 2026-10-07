@@ -35,6 +35,22 @@
 - Без trgm-индекса новая форма запроса сама по себе не ускоряет случай «совпадений нет» (фильтр всё равно неиндексируем) — обе правки нужны вместе.
 - У typed-таблиц `evt_*` по-прежнему нет retention-политики: у `events_history` она есть через `_setup_retention_policy`, у `events_ts` — через миграцию 004, а `evt_*` растут неограниченно вместе с GIN-индексом. Это отдельная работа.
 
+### Тесты
+
+- **Прогон доведён до зелёного: было 24 падения из 153, стало 162 проходящих теста.** Все падения были дефектами самих тестов — legacy-набор отстал от кода; в продукте ничего менять не потребовалось. Каждая правка проверена мутацией: сломанный `stop()`, потеря `VariantType` в кодеке payload и пропущенный `pool.release` действительно роняют соответствующие тесты.
+- **`pytest.ini` использовал секцию `[tool:pytest]`**, которая валидна только в `setup.cfg`. Из-за этого не применялись ни `addopts` (включая `--asyncio-mode=auto` и `--strict-markers`), ни объявленные маркеры: pytest молча работал с дефолтами, и каждому async-тесту требовался явный `@pytest.mark.asyncio`.
+- **`tests/test_connection_pool.py`** (7 падений): `patch('asyncpg.create_pool')` подставляет `MagicMock`, и `await` его результата падает с `TypeError` — нужен `AsyncMock`. Двойник пула не поддерживал `pool._closed` (его смотрит `_ensure_pool`), `await pool.close()` и вход в `pool.acquire()` как в асинхронный контекст. Ожидаемые параметры пула (`command_timeout=60`, `statement_cache_size=0`) и дефолты `min_size`/`max_size` (5/20) не соответствовали `_build_pool_params` и конструктору (1/10).
+- **`tests/test_history_pgsql.py`** (8 падений): тесты работали с `history._db` — одним соединением из архитектуры до пула. Переведены на `_pool`; `test_init` больше не ходит на реальный 127.0.0.1:5432. Порядок аргументов `ua.NodeId(1, "TestVariable")` был перепутан (identifier и namespace), `ua.DataValue(StatusCode_=...)` — устаревшее имя поля asyncua. `_list_to_sql_str` в коде нет — тест заменён проверкой `_format_node_id`. Тесты `Buffer` лезли в `buffer.data`/`buffer.pos` (теперь `_data`/`_pos`) — переписаны на поведение `read`/`skip`/`copy`.
+- **`tests/test_sql_syntax.py`** (5 падений) проверял `HistoryPgSQL._format_event` — метод, собиравший колонку на каждое поле события. Такой схемы давно нет: payload целиком уходит в JSONB-колонку `_eventdata` как карта `field -> "base64:<variant>"`. Файл заменён на `tests/test_event_payload_codec.py`, который держит под тестом round-trip `_event_to_binary_map` ↔ `_binary_map_to_event_values` (именно на этом пути в 0.2.15 ломались значения полей при HistoryRead), обработку `None` и неподходящих значений, `_extract_variant_values` и фактическую форму INSERT события.
+- **`tests/test_db_manager.py`** (3 падения): `get_database_info` без конфигурации возвращает причину отказа, а не пустой словарь; тест патчил `uapg.db_manager.psycopg2`, хотя модуль импортирует `psycopg`; `DatabaseManager.migrate_schema` не существует — тест переписан на `migrate_to_timescale` (нет конфигурации, повторная миграция, успешный путь, ошибка подключения).
+- **`tests/test_flush_event_batch_v2_mode.py`**: двойник `_run_db_operation` не принимал `timeout`/`layer`, добавленные в 0.2.14, а двойник соединения реализовывал асинхронный контекст, хотя `_flush_on_connection` берёт соединение через `await pool.acquire(timeout=...)` и управляет транзакцией явно (`start`/`commit`/`rollback`).
+- **Прогон тестов больше не меняет файлы в рабочем дереве.** `DatabaseManager` с параметрами по умолчанию пишет `db_config.enc` и `.db_key` в текущий каталог, и один из тестов создавал менеджер без явных путей — после каждого прогона `db_config.enc` в корне репозитория оказывался изменённым.
+
+### Известное, не исправлено
+
+- **`DatabaseManager.create_database` несовместим с настоящим psycopg3.** Модуль импортирует `psycopg` (v3), но использует API psycopg2: `psycopg.ISOLATION_LEVEL_AUTOCOMMIT` в psycopg3 отсутствует, поэтому на живой установке вызов упадёт в собственный `except` и вернёт `False`. В тестах это не видно, потому что `conftest.py` подменяет модуль `psycopg` на `Mock`. Вдобавок `requirements-db-manager.txt` требует `psycopg2-binary`, которого код не импортирует. Нужна отдельная правка: `conn.autocommit = True` вместо `set_isolation_level` и согласование зависимости.
+
+
 ## [0.2.17] - 2026-09-30
 
 ### Исправлено

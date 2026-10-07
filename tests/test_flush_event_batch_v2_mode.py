@@ -13,23 +13,22 @@ from uapg.history_timescale_v2 import HistoryTimescaleV2
 from uapg.v2.storage_mode import StorageMode
 
 
-class _FakeConnCM:
-    def __init__(self, conn):
-        self._conn = conn
+class _FakeTransaction:
+    """_flush_on_connection управляет транзакцией явно: start/commit/rollback."""
 
-    async def __aenter__(self):
-        return self._conn
+    def __init__(self) -> None:
+        self.started = False
+        self.committed = False
+        self.rolled_back = False
 
-    async def __aexit__(self, *args):
-        return False
+    async def start(self) -> None:
+        self.started = True
 
+    async def commit(self) -> None:
+        self.committed = True
 
-class _FakeTxCM:
-    async def __aenter__(self):
-        return None
-
-    async def __aexit__(self, *args):
-        return False
+    async def rollback(self) -> None:
+        self.rolled_back = True
 
 
 @pytest.mark.asyncio
@@ -50,14 +49,19 @@ async def test_flush_event_batch_v2_mode_calls_save_event_dual():
     history._db_query_timeout_sec = 5.0
     history._typed_values_from_json = MagicMock(return_value={"serial": "X"})
 
+    transaction = _FakeTransaction()
     conn = MagicMock()
-    conn.transaction = MagicMock(return_value=_FakeTxCM())
+    conn.transaction = MagicMock(return_value=transaction)
     pool = MagicMock()
-    pool.acquire = MagicMock(return_value=_FakeConnCM(conn))
+    # _flush_on_connection берёт соединение через await pool.acquire(timeout=...)
+    # и возвращает его через await pool.release(conn).
+    pool.acquire = AsyncMock(return_value=conn)
+    pool.release = AsyncMock()
     history._pool = pool
     history._ensure_pool = AsyncMock()
 
-    async def _run(coro, _name):
+    async def _run(coro, _name, **_kwargs):
+        # Настоящий _run_db_operation зовётся с timeout= и layer=.
         return await coro
 
     history._run_db_operation = _run
@@ -84,3 +88,7 @@ async def test_flush_event_batch_v2_mode_calls_save_event_dual():
         assert args[1] == 7
         assert args[3] == item.event_data_json
         conn.execute.assert_not_called()
+        # Батч завершился коммитом, а не откатом.
+        assert transaction.started and transaction.committed
+        assert not transaction.rolled_back
+        pool.release.assert_awaited_once_with(conn)

@@ -25,27 +25,45 @@ class TestHistoryPgSQL:
         )
     
     @pytest.fixture
-    def mock_connection(self):
-        """Фикстура для мок-соединения с базой данных."""
+    def mock_pool(self):
+        """Мок пула: _ensure_pool смотрит на _closed, stop() ждёт await close()."""
+        pool = MagicMock()
+        pool._closed = False
+        pool.close = AsyncMock()
+        return pool
+
+    @pytest.fixture
+    def mock_connection(self, mock_pool):
+        """Соединение, которое отдаёт pool.acquire() как асинхронный контекст."""
         mock_conn = AsyncMock()
-        mock_conn.execute = AsyncMock()
-        mock_conn.fetch = AsyncMock()
-        mock_conn.close = AsyncMock()
+        mock_pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_pool.acquire.return_value.__aexit__ = AsyncMock(return_value=None)
         return mock_conn
-    
-    @pytest.mark.asyncio
-    async def test_init(self, history, mock_connection):
-        """Тест инициализации соединения."""
-        with patch('asyncpg.connect', return_value=mock_connection):
+
+    @pytest.fixture
+    def connected(self, history, mock_pool, mock_connection):
+        """История с подставленным пулом — без обращения к настоящей БД."""
+        history._pool = mock_pool
+        history._initialized = True
+        return history
+
+    async def test_init(self, history, mock_pool):
+        """Тест инициализации: создаётся пул соединений."""
+        with patch('asyncpg.create_pool', new=AsyncMock(return_value=mock_pool)), patch.object(
+            HistoryPgSQL, '_create_metadata_tables', AsyncMock()
+        ), patch.object(HistoryPgSQL, '_reconnect_monitor', AsyncMock()):
             await history.init()
-            assert history._db == mock_connection
-    
-    @pytest.mark.asyncio
-    async def test_stop(self, history, mock_connection):
-        """Тест закрытия соединения."""
-        history._db = mock_connection
+
+        assert history._pool is mock_pool
+
+    async def test_stop(self, history, mock_pool):
+        """Тест закрытия: закрывается пул, ссылка сбрасывается."""
+        history._pool = mock_pool
+
         await history.stop()
-        mock_connection.close.assert_called_once()
+
+        mock_pool.close.assert_awaited_once()
+        assert history._pool is None
     
     def test_get_table_name(self, history):
         """Тест генерации имени таблицы."""
@@ -94,48 +112,44 @@ class TestHistoryPgSQL:
         assert order == "DESC"
         assert limit == 10000
     
-    def test_list_to_sql_str(self, history):
-        """Тест преобразования списка в SQL строку."""
-        test_list = ["column1", "column2", "column3"]
-        result = history._list_to_sql_str(test_list)
-        expected = '"column1", "column2", "column3"'
-        assert result == expected
+    def test_format_node_id(self, history):
+        """Строковое представление NodeId — то, по чему узлы ищутся в метаданных."""
+        assert history._format_node_id(ua.NodeId("TestVariable", 1)) == "ns=1;s=TestVariable"
+        assert history._format_node_id(ua.NodeId(42, 2)) == "ns=2;i=42"
     
-    @pytest.mark.asyncio
-    async def test_new_historized_node(self, history, mock_connection):
+    async def test_new_historized_node(self, connected, mock_connection):
         """Тест создания таблицы для историзации узла."""
-        history._db = mock_connection
-        node_id = ua.NodeId(1, "TestVariable")
-        
-        await history.new_historized_node(node_id, timedelta(days=1), 1000)
-        
+        node_id = ua.NodeId("TestVariable", 1)
+
+        await connected.new_historized_node(node_id, timedelta(days=1), 1000)
+
         # Проверяем, что были вызваны SQL команды
-        assert mock_connection.execute.call_count >= 3
+        assert mock_connection.execute.await_count >= 3
+        assert connected._datachanges_period[node_id] == (timedelta(days=1), 1000)
     
-    @pytest.mark.asyncio
-    async def test_save_node_value(self, history, mock_connection):
+    async def test_save_node_value(self, connected, mock_connection):
         """Тест сохранения значения узла."""
-        history._db = mock_connection
-        node_id = ua.NodeId(1, "TestVariable")
-        history._datachanges_period[node_id] = (timedelta(days=1), 1000)
+        node_id = ua.NodeId("TestVariable", 1)
+        connected._datachanges_period[node_id] = (timedelta(days=1), 1000)
         
         datavalue = ua.DataValue(
             Value=ua.Variant(42.0, ua.VariantType.Double),
             SourceTimestamp=datetime.now(timezone.utc),
             ServerTimestamp=datetime.now(timezone.utc),
-            StatusCode_=ua.StatusCode(ua.StatusCodes.Good)
+            StatusCode=ua.StatusCode(ua.StatusCodes.Good),
         )
         
-        await history.save_node_value(node_id, datavalue)
-        
-        # Проверяем, что был вызван INSERT
-        mock_connection.execute.assert_called()
+        await connected.save_node_value(node_id, datavalue)
+
+        # Проверяем, что был вызван INSERT в таблицу переменных
+        mock_connection.execute.assert_awaited()
+        assert any(
+            'INSERT INTO "var_1_TestVariable"' in call.args[0]
+            for call in mock_connection.execute.await_args_list
+        )
     
-    @pytest.mark.asyncio
-    async def test_read_node_history(self, history, mock_connection):
+    async def test_read_node_history(self, connected, mock_connection):
         """Тест чтения истории узла."""
-        history._db = mock_connection
-        
         # Мокаем результат запроса
         mock_row = {
             'servertimestamp': datetime.now(timezone.utc),
@@ -145,11 +159,11 @@ class TestHistoryPgSQL:
         }
         mock_connection.fetch.return_value = [mock_row]
         
-        node_id = ua.NodeId(1, "TestVariable")
+        node_id = ua.NodeId("TestVariable", 1)
         start_time = datetime.now(timezone.utc) - timedelta(hours=1)
         end_time = datetime.now(timezone.utc)
-        
-        results, continuation = await history.read_node_history(
+
+        results, continuation = await connected.read_node_history(
             node_id, start_time, end_time, 100
         )
         
@@ -160,27 +174,30 @@ class TestHistoryPgSQL:
 class TestBuffer:
     """Тесты для класса Buffer."""
     
-    def test_buffer_init(self):
-        """Тест инициализации буфера."""
+    def test_buffer_read_consumes_sequentially(self):
+        """Чтение отдаёт куски подряд и двигает позицию."""
         from uapg.history_pgsql import Buffer
-        data = b"test_data"
-        buffer = Buffer(data)
-        assert buffer.data == data
-        assert buffer.pos == 0
-    
-    def test_buffer_read(self):
-        """Тест чтения из буфера."""
+        buffer = Buffer(b"test_data")
+
+        assert buffer.read(4) == b"test"
+        assert buffer.read(4) == b"_dat"
+        assert buffer.read(4) == b"a"
+        assert buffer.read(4) == b""
+
+    def test_buffer_skip_and_copy(self):
+        """skip двигает позицию, copy отдаёт остаток как новый буфер."""
         from uapg.history_pgsql import Buffer
-        data = b"test_data"
-        buffer = Buffer(data)
-        
-        result = buffer.read(4)
-        assert result == b"test"
-        assert buffer.pos == 4
-        
-        result = buffer.read(4)
-        assert result == b"_dat"
-        assert buffer.pos == 8
+        buffer = Buffer(b"test_data")
+
+        buffer.skip(5)
+        assert buffer.read(4) == b"data"
+
+        buffer = Buffer(b"test_data")
+        buffer.skip(5)
+        tail = buffer.copy()
+        assert tail.read(9) == b"data"
+        # Исходный буфер остался на своей позиции.
+        assert buffer.read(4) == b"data"
 
 
 if __name__ == "__main__":

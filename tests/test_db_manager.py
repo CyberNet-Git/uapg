@@ -10,6 +10,14 @@ from unittest.mock import Mock, patch, AsyncMock
 
 from uapg.db_manager import DatabaseManager
 
+_CONN_CONFIG = {
+    'user': 'test_user',
+    'password': 'test_password',
+    'database': 'test_db',
+    'host': 'localhost',
+    'port': 5432,
+}
+
 
 class TestDatabaseManager:
     """Тесты для класса DatabaseManager."""
@@ -113,43 +121,55 @@ class TestDatabaseManager:
             exported_data = json.load(f)
         assert exported_data == test_config
         
-        # Импорт в новый менеджер
-        new_manager = DatabaseManager("new_password")
+        # Импорт в новый менеджер. Пути задаём явно: с значениями по умолчанию
+        # DatabaseManager пишет db_config.enc и .db_key в текущий каталог, то есть
+        # прогон тестов менял файлы в корне репозитория.
+        new_manager = DatabaseManager(
+            "new_password",
+            str(Path(self.temp_dir) / "imported_config.enc"),
+            str(Path(self.temp_dir) / ".imported_key"),
+        )
         success = new_manager.import_config(str(export_path))
         assert success
         assert new_manager.config == test_config
     
-    @pytest.mark.asyncio
     async def test_get_database_info_no_config(self):
-        """Тест получения информации о БД без конфигурации."""
+        """Без конфигурации возвращается причина, а не пустой словарь."""
         info = await self.db_manager.get_database_info()
-        assert info == {}
+        assert info == {"error": "No database configuration found"}
     
-    @pytest.mark.asyncio
     async def test_create_database_mock(self):
-        """Тест создания базы данных с моком."""
-        with patch('uapg.db_manager.psycopg2.connect') as mock_connect, \
-             patch('uapg.db_manager.asyncpg.connect') as mock_async_connect:
-            
-            # Мок для psycopg2
-            mock_conn = Mock()
-            mock_cursor = Mock()
-            mock_conn.cursor.return_value = mock_cursor
-            mock_connect.return_value = mock_conn
-            
-            # Мок для asyncpg
-            mock_async_conn = AsyncMock()
-            mock_async_connect.return_value = mock_async_conn
-            
+        """Тест создания базы данных с моком.
+
+        Административные команды идут через psycopg, схема — через asyncpg.
+
+        ВНИМАНИЕ: conftest подменяет модуль psycopg на Mock, поэтому этот тест
+        не проверяет совместимость с настоящим psycopg3. В create_database
+        используется psycopg.ISOLATION_LEVEL_AUTOCOMMIT, которого в psycopg3 нет
+        (это API psycopg2), так что на живой установке вызов упадёт в собственный
+        except и вернёт False. Чинится отдельно.
+        """
+        mock_cursor = Mock()
+        mock_conn = Mock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_async_conn = AsyncMock()
+        mock_async_connect = AsyncMock(return_value=mock_async_conn)
+
+        with patch('uapg.db_manager.psycopg.connect', return_value=mock_conn) as mock_connect, \
+             patch('uapg.db_manager.asyncpg.connect', new=mock_async_connect):
             success = await self.db_manager.create_database(
                 user="test_user",
                 password="test_password",
                 database="test_db"
             )
-            
+
             assert success
             mock_connect.assert_called_once()
-            mock_async_connect.assert_called_once()
+            mock_async_connect.assert_awaited()
+            # CREATE USER и CREATE DATABASE выполняются через курсор psycopg.
+            statements = " ".join(call.args[0] for call in mock_cursor.execute.call_args_list)
+            assert "CREATE USER test_user" in statements
+            assert "CREATE DATABASE test_db" in statements
     
     @pytest.mark.asyncio
     async def test_backup_database_mock(self):
@@ -199,37 +219,55 @@ class TestDatabaseManager:
             assert success
             mock_connect.assert_called_once()
     
-    @pytest.mark.asyncio
-    async def test_migrate_schema_mock(self):
-        """Тест миграции схемы с моком."""
-        # Устанавливаем конфигурацию
-        self.db_manager.config = {
-            'user': 'test_user',
-            'password': 'test_password',
-            'database': 'test_db',
-            'host': 'localhost',
-            'port': 5432
-        }
-        
-        with patch('uapg.db_manager.asyncpg.connect') as mock_connect:
-            mock_conn = AsyncMock()
-            mock_connect.return_value = mock_conn
-            
-            # Мок для запросов
-            mock_conn.fetchval.return_value = "1.0"
-            
-            migration_scripts = [
-                {
-                    'version': '1.1',
-                    'description': 'Test migration',
-                    'sql': 'CREATE INDEX test_idx ON test_table;'
-                }
-            ]
-            
-            success = await self.db_manager.migrate_schema('1.1', migration_scripts)
-            
-            assert success
-            mock_connect.assert_called_once()
+    async def test_migrate_to_timescale_requires_config(self):
+        """Без конфигурации миграция не выполняется и возвращает False."""
+        self.db_manager.config = {}
+
+        assert await self.db_manager.migrate_to_timescale() is False
+
+    async def test_migrate_to_timescale_is_noop_when_already_migrated(self):
+        """Повторная миграция не трогает схему, если архитектура уже целевая."""
+        self.db_manager.config = dict(_CONN_CONFIG)
+        mock_conn = AsyncMock()
+        mock_conn.fetchval.return_value = "timescale_hypertables"
+
+        with patch('uapg.db_manager.asyncpg.connect', new=AsyncMock(return_value=mock_conn)):
+            assert await self.db_manager.migrate_to_timescale() is True
+
+        mock_conn.execute.assert_not_awaited()
+        mock_conn.close.assert_awaited_once()
+
+    async def test_migrate_to_timescale_mock(self):
+        """Миграция со старой архитектуры: таблицы, данные, версия схемы."""
+        self.db_manager.config = dict(_CONN_CONFIG)
+        mock_conn = AsyncMock()
+        mock_conn.fetchval.return_value = "1.0"
+
+        with patch('uapg.db_manager.asyncpg.connect', new=AsyncMock(return_value=mock_conn)), \
+             patch.object(DatabaseManager, '_create_timescale_tables', AsyncMock()) as tables, \
+             patch.object(DatabaseManager, '_create_timescale_metadata_tables', AsyncMock()) as meta, \
+             patch.object(DatabaseManager, '_migrate_data_to_timescale', AsyncMock()) as data:
+            success = await self.db_manager.migrate_to_timescale()
+
+        assert success
+        tables.assert_awaited_once()
+        meta.assert_awaited_once()
+        data.assert_awaited_once()
+        # Версия схемы помечена как перенесённая на hypertables.
+        inserts = " ".join(call.args[0] for call in mock_conn.execute.await_args_list)
+        assert "INSERT INTO schema_version" in inserts
+        assert "timescale_hypertables" in inserts
+        assert self.db_manager.config['architecture'] == 'timescale_hypertables'
+        assert self.db_manager.config['version'] == '2.0'
+
+    async def test_migrate_to_timescale_returns_false_on_error(self):
+        """Ошибка подключения не выбрасывается наружу, а возвращается как False."""
+        self.db_manager.config = dict(_CONN_CONFIG)
+
+        with patch(
+            'uapg.db_manager.asyncpg.connect', new=AsyncMock(side_effect=OSError("down"))
+        ):
+            assert await self.db_manager.migrate_to_timescale() is False
 
 
 class TestStandaloneFunctions:
