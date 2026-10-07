@@ -180,13 +180,22 @@ class EventStoreV2:
                     cursor_ts,
                     cursor_event_id,
                 )
-            common_fields = await self._common_pushdown_fields(event_type_ids, typed_fields)
+            # Схемы полей читаются одним запросом: раньше _common_pushdown_fields и
+            # _event_type_ids_with_fields делали по запросу на тип, каждый свой проход.
+            schema_fields = await self._registry.get_schema_fields_for_event_types(
+                event_type_ids
+            )
+            common_fields = self._common_pushdown_fields(
+                event_type_ids, typed_fields, schema_fields
+            )
             if common_fields:
-                eligible_type_ids = await self._event_type_ids_with_fields(
+                eligible_type_ids = self._event_type_ids_with_fields(
                     event_type_ids,
                     common_fields,
+                    schema_fields,
                 )
                 if eligible_type_ids:
+                    tables = await self._registry.get_storage_tables(eligible_type_ids)
                     return await self._read_typed_multi_rows(
                         source_db_id,
                         eligible_type_ids,
@@ -198,6 +207,7 @@ class EventStoreV2:
                         common_fields,
                         cursor_ts,
                         cursor_event_id,
+                        tables=tables,
                     )
 
         rows = await self._gateway.read_events_v2(
@@ -212,10 +222,11 @@ class EventStoreV2:
         )
         return list(rows), False
 
-    async def _common_pushdown_fields(
+    def _common_pushdown_fields(
         self,
         event_type_ids: List[int],
         typed_fields: Set[str],
+        schema_fields: Dict[int, Set[str]],
     ) -> Optional[Set[str]]:
         aliases = self._registry.events_config.field_aliases
         configured = expand_sql_filter_fields(
@@ -224,30 +235,27 @@ class EventStoreV2:
         )
         allowed_sets: List[Set[str]] = []
         for type_id in event_type_ids:
-            schema_fields = await self._registry.get_schema_fields_for_event_type(int(type_id))
-            if not schema_fields:
+            fields = schema_fields.get(int(type_id)) or set()
+            if not fields:
                 return None
-            if configured:
-                allowed_sets.append(schema_fields & configured)
-            else:
-                allowed_sets.append(schema_fields)
+            allowed_sets.append(fields & configured if configured else fields)
 
         common = typed_fields.copy()
         for allowed in allowed_sets:
             common &= allowed
         return common if common else None
 
-    async def _event_type_ids_with_fields(
+    def _event_type_ids_with_fields(
         self,
         event_type_ids: List[int],
         required_fields: Set[str],
+        schema_fields: Dict[int, Set[str]],
     ) -> List[int]:
-        eligible: List[int] = []
-        for type_id in event_type_ids:
-            schema_fields = await self._registry.get_schema_fields_for_event_type(int(type_id))
-            if required_fields.issubset(schema_fields):
-                eligible.append(int(type_id))
-        return eligible
+        return [
+            int(type_id)
+            for type_id in event_type_ids
+            if required_fields.issubset(schema_fields.get(int(type_id)) or set())
+        ]
 
     async def _resolve_event_type_ids(
         self,
@@ -337,6 +345,76 @@ class EventStoreV2:
             '''
         return clause, [cursor_ts, cursor_event_id]
 
+    def _typed_branch_sql(
+        self,
+        table: str,
+        event_type_param: int,
+        plan: Dict[str, Any],
+        *,
+        order: str,
+        limit_param: int,
+        param_offset: int,
+        cursor_ts: Optional[datetime],
+        cursor_event_id: Optional[int],
+    ) -> Tuple[str, List[Any], int]:
+        """Одна ветка выборки, работающая только по typed-таблице.
+
+        Фильтр, курсор, порядок и LIMIT стоят внутри ветки. Раньше ORDER BY и LIMIT
+        были только снаружи UNION ALL (в ветки PostgreSQL их не заносит), а фильтр
+        применялся после JOIN с events_ts — поэтому каждая ветка материализовала всё
+        окно, а оба нужных индекса оказывались на разных отношениях.
+
+        $1 — source_id, $2/$3 — границы окна; они общие для всех ветвей.
+        """
+        args: List[Any] = []
+        where_sql, params, _ = sql_where_from_plan(
+            plan, table_alias="t", param_offset=param_offset
+        )
+        branch = f'''
+                SELECT t.event_id, t.event_timestamp, ${event_type_param}::bigint AS event_type_id
+                FROM "{self._schema}"."{table}" t
+                WHERE t.source_id = $1
+                  AND t.event_timestamp BETWEEN $2 AND $3
+        '''
+        if where_sql:
+            branch += f"                  AND {where_sql}\n"
+            args.extend(params)
+            param_offset += len(params)
+
+        cursor_sql, cursor_params = self._cursor_clause(
+            order,
+            table_alias="t",
+            cursor_ts=cursor_ts,
+            cursor_event_id=cursor_event_id,
+            param_index=param_offset,
+        )
+        if cursor_sql:
+            branch += cursor_sql
+            args.extend(cursor_params)
+            param_offset += len(cursor_params)
+
+        order_sql = "DESC" if order.upper() == "DESC" else "ASC"
+        branch += (
+            f"                ORDER BY t.event_timestamp {order_sql}, t.event_id {order_sql}\n"
+            f"                LIMIT ${limit_param}\n"
+        )
+        return branch, args, param_offset
+
+    def _merge_typed_branches(self, branches: List[str], order: str, limit_param: int) -> str:
+        """Слияние ветвей и добор legacy_row_id из events_ts для ≤limit строк по PK."""
+        order_sql = "DESC" if order.upper() == "DESC" else "ASC"
+        union_sql = " UNION ALL ".join(f"({branch})" for branch in branches)
+        return f'''
+            SELECT m.event_id, m.event_timestamp, m.event_type_id, e.legacy_row_id
+            FROM ({union_sql}) m
+            INNER JOIN "{self._schema}".events_ts e
+              ON e.source_id = $1
+             AND e.event_timestamp = m.event_timestamp
+             AND e.event_id = m.event_id
+            ORDER BY m.event_timestamp {order_sql}, m.event_id {order_sql}
+            LIMIT ${limit_param}
+        '''
+
     async def _read_typed_rows(
         self,
         source_db_id: int,
@@ -354,40 +432,20 @@ class EventStoreV2:
             return [], True
 
         typed_plan = EventFilterPlanner().strip_event_type(plan)
-        where_sql, params, next_idx = sql_where_from_plan(
+        # $1 source_id, $2/$3 окно, $4 limit, $5 event_type_id, дальше фильтр и курсор.
+        args: List[Any] = [source_db_id, start, end, limit, int(event_type_id)]
+        branch, branch_args, _ = self._typed_branch_sql(
+            table,
+            5,
             typed_plan,
-            table_alias="t",
-            param_offset=5,
-        )
-        order_sql = "DESC" if order.upper() == "DESC" else "ASC"
-        args: List[Any] = [source_db_id, event_type_id, start, end]
-        sql = f'''
-            SELECT e.event_id, e.event_timestamp, e.event_type_id, e.legacy_row_id
-            FROM "{self._schema}".events_ts e
-            INNER JOIN "{self._schema}"."{table}" t
-              ON t.event_id = e.event_id AND t.event_timestamp = e.event_timestamp
-            WHERE e.source_id = $1
-              AND e.event_type_id = $2
-              AND e.event_timestamp BETWEEN $3 AND $4
-        '''
-        if where_sql:
-            sql += f" AND {where_sql}"
-            args.extend(params)
-            next_idx = len(args) + 1
-
-        cursor_sql, cursor_params = self._cursor_clause(
-            order,
+            order=order,
+            limit_param=4,
+            param_offset=6,
             cursor_ts=cursor_ts,
             cursor_event_id=cursor_event_id,
-            param_index=next_idx,
         )
-        if cursor_sql:
-            sql += cursor_sql
-            args.extend(cursor_params)
-
-        sql += f" ORDER BY e.event_timestamp {order_sql}, e.event_id {order_sql} LIMIT ${len(args) + 1}"
-        args.append(limit)
-
+        args.extend(branch_args)
+        sql = self._merge_typed_branches([branch], order, 4)
         rows = await self._pool.fetch(sql, *args)
         return list(rows), False
 
@@ -403,61 +461,41 @@ class EventStoreV2:
         common_fields: Set[str],
         cursor_ts: Optional[datetime],
         cursor_event_id: Optional[int],
+        tables: Optional[Dict[int, str]] = None,
     ) -> Tuple[List[Any], bool]:
         typed_plan = EventFilterPlanner().strip_event_type(plan)
         filtered_plan = self._filter_plan_fields(typed_plan, common_fields)
-        order_sql = "DESC" if order.upper() == "DESC" else "ASC"
-        branches: List[str] = []
-        branch_args: List[Any] = [source_db_id, start, end]
-        param_idx = 4
+        if tables is None:
+            tables = await self._registry.get_storage_tables(event_type_ids)
 
+        # $1 source_id, $2/$3 окно, $4 limit — общие для всех ветвей.
+        args: List[Any] = [source_db_id, start, end, limit]
+        param_offset = 5
+        branches: List[str] = []
         for event_type_id in event_type_ids:
-            table = await self._registry.get_storage_table(int(event_type_id))
+            table = tables.get(int(event_type_id))
             if not table:
                 continue
-            event_type_param_idx = param_idx
-            branch_args.append(int(event_type_id))
-            param_idx += 1
-            where_sql, params, _ = sql_where_from_plan(
-                filtered_plan, table_alias="t", param_offset=param_idx
+            event_type_param = param_offset
+            args.append(int(event_type_id))
+            param_offset += 1
+            branch, branch_args, param_offset = self._typed_branch_sql(
+                table,
+                event_type_param,
+                filtered_plan,
+                order=order,
+                limit_param=4,
+                param_offset=param_offset,
+                cursor_ts=cursor_ts,
+                cursor_event_id=cursor_event_id,
             )
-            branch = f'''
-                SELECT e.event_id, e.event_timestamp, e.event_type_id, e.legacy_row_id
-                FROM "{self._schema}".events_ts e
-                INNER JOIN "{self._schema}"."{table}" t
-                  ON t.event_id = e.event_id AND t.event_timestamp = e.event_timestamp
-                WHERE e.source_id = $1
-                  AND e.event_type_id = ${event_type_param_idx}
-                  AND e.event_timestamp BETWEEN $2 AND $3
-            '''
-            if where_sql:
-                branch += f" AND {where_sql}"
-                branch_args.extend(params)
-                param_idx = len(branch_args) + 1
+            args.extend(branch_args)
             branches.append(branch)
 
         if not branches:
             return [], True
 
-        union_sql = " UNION ALL ".join(branches)
-        cursor_sql, cursor_params = self._cursor_clause(
-            order,
-            table_alias="merged",
-            cursor_ts=cursor_ts,
-            cursor_event_id=cursor_event_id,
-            param_index=param_idx,
-        )
-        args = branch_args + cursor_params
-        limit_idx = len(args) + 1
-        sql = f'''
-            SELECT merged.event_id, merged.event_timestamp, merged.event_type_id, merged.legacy_row_id
-            FROM ({union_sql}) merged
-            WHERE TRUE
-            {cursor_sql}
-            ORDER BY merged.event_timestamp {order_sql}, merged.event_id {order_sql}
-            LIMIT ${limit_idx}
-        '''
-        args.append(limit)
+        sql = self._merge_typed_branches(branches, order, 4)
         rows = await self._pool.fetch(sql, *args)
         return list(rows), False
 

@@ -64,6 +64,8 @@ class HistoryTimescaleV2(HistoryTimescale):
         events_v2_config: Optional[EventsV2Config] = None,
         events_backfill_probe_rows: int = 1000,
         events_backfill_status_ttl_sec: float = 30.0,
+        events_trgm_index_enabled: bool = True,
+        events_trgm_index_timeout_sec: float = 300.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -84,6 +86,13 @@ class HistoryTimescaleV2(HistoryTimescale):
         self._events_backfill_complete: Optional[bool] = None
         self._events_backfill_checked_at = 0.0
         self._defer_settings_refresh = False
+        # btree по текстовой колонке не обслуживает ILIKE '%...%': фильтр
+        # push-down упирался в полный просмотр окна по каждому типу.
+        self._events_trgm_index_enabled = bool(events_trgm_index_enabled)
+        self._events_trgm_index_timeout_sec = max(1.0, float(events_trgm_index_timeout_sec))
+        self._trgm_extension_available = False
+        self._trgm_indexes_created = 0
+        self._trgm_indexes_missing = 0
 
     @property
     def events_storage_mode(self) -> StorageMode:
@@ -140,6 +149,7 @@ class HistoryTimescaleV2(HistoryTimescale):
             self.logger,
             query_timeout_sec=self._db_query_timeout_sec,
         )
+        await self._ensure_trgm_indexes()
         self.logger.info("HistoryTimescaleV2 initialized (mode=%s)", self._events_storage_mode.value)
 
     def _rebind_v2_pool(self) -> None:
@@ -186,6 +196,94 @@ class HistoryTimescaleV2(HistoryTimescale):
             self.logger.debug("Events backfill probe skipped: %s", e)
             return None
 
+    async def _best_effort_execute(self, sql: str, timeout: float) -> bool:
+        """Служебный DDL со своим бюджетом, без _force_reconnect при неудаче.
+
+        Сборка GIN на большой typed-таблице не укладывается в db_query_timeout_sec,
+        а _execute на таймауте пересоздаёт пул и останавливает историзацию.
+        """
+        pool = self._pool
+        if pool is None:
+            return False
+        try:
+            async with pool.acquire(timeout=timeout) as conn:
+                await conn.execute(sql, timeout=timeout)
+            return True
+        except Exception as e:
+            self.logger.warning("Statement skipped (%s): %r", sql.split("\n", 1)[0][:120], e)
+            return False
+
+    async def _ensure_pg_trgm(self) -> bool:
+        available = bool(
+            await self._probe_fetchval("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
+        )
+        if available:
+            return True
+        await self._best_effort_execute(
+            "CREATE EXTENSION IF NOT EXISTS pg_trgm",
+            self._backfill_probe_timeout_sec(),
+        )
+        return bool(
+            await self._probe_fetchval("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
+        )
+
+    async def _ensure_trgm_indexes(self) -> None:
+        """Догоняющий проход: GIN trgm для текстовых колонок из indexed_fields.
+
+        _ensure_physical_table создаёт индекс по колонке только когда колонка
+        только что добавлена, поэтому для уже существующих колонок (как techplace
+        на стенде) индекс сам не появится.
+        """
+        self._trgm_extension_available = False
+        self._trgm_indexes_missing = 0
+        if not self._v2_ready or self._registry is None:
+            return
+        if not self._events_trgm_index_enabled:
+            self.logger.info("Events V2 trgm indexes disabled (events_trgm_index_enabled=False)")
+            return
+        try:
+            planned = await self._registry.plan_trgm_indexes()
+        except Exception as e:
+            self.logger.warning("Cannot plan events V2 trgm indexes: %r", e)
+            return
+        self._trgm_extension_available = await self._ensure_pg_trgm()
+        if not self._trgm_extension_available:
+            self._trgm_indexes_missing = len(planned)
+            if planned:
+                self.logger.warning(
+                    "pg_trgm is not installed: %d trgm index(es) not created, "
+                    "substring search (ILIKE) will scan the whole window. "
+                    "Run as superuser: CREATE EXTENSION pg_trgm;",
+                    len(planned),
+                )
+            return
+        if not planned:
+            self.logger.debug("Events V2 trgm indexes already in place")
+            return
+        failed = 0
+        for item in planned:
+            ok = await self._best_effort_execute(
+                item["ddl"], self._events_trgm_index_timeout_sec
+            )
+            if ok:
+                self._trgm_indexes_created += 1
+            else:
+                failed += 1
+                self._perf_inc("events_trgm_index_failures_total")
+        self._trgm_indexes_missing = failed
+        self.logger.info(
+            "Events V2 trgm indexes: created %d, failed %d (of %d planned)",
+            self._trgm_indexes_created,
+            failed,
+            len(planned),
+        )
+        if failed:
+            self.logger.warning(
+                "Some trgm indexes were not created; a hot stand can build them "
+                "without blocking writes, e.g.: %s",
+                planned[0]["ddl"].replace("CREATE INDEX", "CREATE INDEX CONCURRENTLY", 1),
+            )
+
     async def _is_events_backfill_complete(self, *, force: bool = False) -> bool:
         """Есть ли у бэкфила работа. Результат кэшируется на events_backfill_status_ttl_sec."""
         if not self._v2_ready or self._pool is None:
@@ -227,6 +325,13 @@ class HistoryTimescaleV2(HistoryTimescale):
             ),
             "backfill_probe_rows": int(self._events_backfill_probe_rows),
             "backfill_status_ttl_sec": float(self._events_backfill_status_ttl_sec),
+            "trgm_index_enabled": bool(self._events_trgm_index_enabled),
+            "trgm_extension_available": bool(self._trgm_extension_available),
+            "trgm_indexes_created_total": int(self._trgm_indexes_created),
+            "trgm_indexes_missing": int(self._trgm_indexes_missing),
+            "trgm_index_failures_total": self._performance_counters.get(
+                "events_trgm_index_failures_total", 0
+            ),
         }
         return metrics
 

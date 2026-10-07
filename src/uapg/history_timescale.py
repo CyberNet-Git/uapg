@@ -1113,6 +1113,7 @@ class HistoryTimescale(HistoryStorageInterface):
             "db_pool_wait_timeouts_total": 0,
             # Считается только в HistoryTimescaleV2 (проба готовности бэкфила).
             "events_backfill_probe_failures_total": 0,
+            "events_trgm_index_failures_total": 0,
         }
 
     @staticmethod

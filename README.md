@@ -10,7 +10,8 @@ UAPG - это модуль для хранения исторических да
 
 - **HistoryTimescaleV2** — dual-write в legacy `events_history` и v2 (`events_ts` + typed tables `evt_<slug>`)
 - **Режимы** — `UAPG_EVENTS_STORAGE_MODE`: `legacy` | `dual` (по умолчанию) | `v2`
-- **SQL push-down** — `FilterPlan` JSON, `uapg_read_events_v2`, typed ILIKE по колонкам registry
+- **SQL push-down** — `FilterPlan` JSON, `uapg_read_events_v2`, typed ILIKE по колонкам registry; каждая ветка `UNION ALL` несёт свой `ORDER BY`/`LIMIT` и курсор, `events_ts` присоединяется после слияния ради `legacy_row_id`
+- **Подстрочный поиск** — для текстовых колонок из `indexed_fields` на старте создаётся GIN-индекс `pg_trgm`: btree не обслуживает `ILIKE '%...%'`. Требуется расширение `pg_trgm` (`CREATE EXTENSION pg_trgm;` под суперпользователем); без него поиск по подстроке просматривает всё окно, о чём сообщают WARNING на старте и метрика `events_v2.trgm_indexes_missing`. Отключается параметром `events_trgm_index_enabled=False`
 - **Schema registry** — auto DDL при `new_historized_event`, advisory lock
 - **Backfill** — `run_events_backfill()` для миграции legacy → v2: один вызов SQL-функции `uapg_backfill_events_batch` на батч плюс перенос в typed-таблицы по курсору `uapg_backfill_state[events_typed]` (дойдя до хвоста, курсор начинает круг заново). Прогресс и узел `EventsBackfillComplete` считаются по watermark и требуют индекса `idx_events_history_id` (создаётся на старте, глубина пробы — `events_backfill_probe_rows`, время жизни оценки — `events_backfill_status_ttl_sec`)
 - **Timescale** — compression/retention на `events_ts`, optional CAGG `uapg_events_hourly`
@@ -359,6 +360,7 @@ await history.refresh_history_metrics_nodes()
 - `insert_history_*`, `upsert_last_value_*` - помогает отделить запись истории от обновления последних значений.
 - `timeouts_total`, `reconnects_total` - показывает проблемы доступности PostgreSQL.
 - `events_v2.backfill_probe_failures_total` (HistoryTimescaleV2) - проба готовности бэкфила не получила ответа; ненулевое значение обычно означает, что индекс `idx_events_history_id` не создан, и его стоит создать вручную.
+- `events_v2.trgm_indexes_missing`, `events_v2.trgm_extension_available` (HistoryTimescaleV2) - показывает, обслуживается ли поиск по подстроке индексом. Ненулевое `trgm_indexes_missing` или `trgm_extension_available = false` означают, что `ILIKE '%...%'` идёт просмотром окна.
 
 Per-variable и per-event retention cleanup в write path не выполняется. Для автоматического удаления старых данных используйте глобальную TimescaleDB retention policy через `global_retention_period` или отдельные административные cleanup-команды.
 

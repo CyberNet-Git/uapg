@@ -15,6 +15,7 @@ MIGRATION_ORDER = [
     "003_events_v2_functions.sql",
     "004_events_v2_timescale.sql",
     "005_events_v2_backfill.sql",
+    "006_events_v2_read.sql",
     "101_variables_v2_tables.sql",
     "102_variables_v2_functions.sql",
 ]

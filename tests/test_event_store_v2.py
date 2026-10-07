@@ -37,6 +37,8 @@ def _make_store() -> Tuple[EventStoreV2, AsyncMock, AsyncMock]:
     registry.events_config = events_config
     registry.get_allowed_fields = AsyncMock(return_value={"serial", "dev_eui"})
     registry.get_storage_table = AsyncMock(return_value=None)
+    registry.get_storage_tables = AsyncMock(return_value={})
+    registry.get_schema_fields_for_event_types = AsyncMock(return_value={})
 
     gateway = MagicMock(spec=ProcedureGateway)
     gateway.read_events_v2 = AsyncMock(return_value=[])
@@ -145,7 +147,9 @@ def test_read_typed_multi_rows_builds_union() -> None:
 
 async def _read_typed_multi_rows_builds_union() -> None:
     store, _gateway, pool = _make_store()
-    store._registry.get_storage_table = AsyncMock(side_effect=lambda tid: f"evt_{tid}")
+    store._registry.get_storage_tables = AsyncMock(
+        return_value={10: "evt_10", 11: "evt_11"}
+    )
     pool.fetch = AsyncMock(return_value=[_row(1, datetime(2026, 6, 1, tzinfo=timezone.utc))])
 
     await store._read_typed_multi_rows(
@@ -163,10 +167,17 @@ async def _read_typed_multi_rows_builds_union() -> None:
 
     sql = pool.fetch.await_args.args[0]
     assert "UNION ALL" in sql
-    assert "e.event_type_id = $4" in sql
-    assert 't."serial" ILIKE $5' in sql
-    assert "e.event_type_id = $6" in sql
-    assert 't."serial" ILIKE $7' in sql
+    # $1 source, $2/$3 окно, $4 limit — общие; дальше тип и фильтр на ветку.
+    assert "$5::bigint AS event_type_id" in sql
+    assert 't."serial" ILIKE $6' in sql
+    assert "$7::bigint AS event_type_id" in sql
+    assert 't."serial" ILIKE $8' in sql
+    # LIMIT и ORDER BY внутри каждой ветки — ради раннего выхода.
+    assert sql.count("LIMIT $4") == 3
+    assert sql.count("ORDER BY t.event_timestamp DESC, t.event_id DESC") == 2
+    # Ветка идёт только по typed-таблице; events_ts присоединяется после слияния.
+    assert "events_ts e" in sql.split(") m", 1)[1]
+    assert "events_ts" not in sql.split(") m", 1)[0]
 
 
 async def _read_events_keeps_event_type_ids_after_replan() -> None:
@@ -231,8 +242,9 @@ async def _read_events_keeps_event_type_ids_after_replan() -> None:
     assert resolve_calls["count"] == 2
     gateway.read_events_v2.assert_not_awaited()
     sql = pool.fetch.await_args.args[0]
-    assert "event_type_id = $2" in sql
-    assert 't."dev_eui" ILIKE $5' in sql
+    assert "$5::bigint AS event_type_id" in sql
+    assert 't."dev_eui" ILIKE $6' in sql
+    assert "LIMIT $4" in sql
 
 
 def test_read_events_resolves_event_type_ids_for_field_only_filter() -> None:
@@ -241,7 +253,12 @@ def test_read_events_resolves_event_type_ids_for_field_only_filter() -> None:
 
 async def _read_events_resolves_event_type_ids_for_field_only_filter() -> None:
     store, gateway, pool = _make_store()
-    store._registry.get_storage_table = AsyncMock(side_effect=lambda tid: f"evt_{tid}")
+    store._registry.get_storage_tables = AsyncMock(
+        return_value={10: "evt_10", 11: "evt_11"}
+    )
+    store._registry.get_schema_fields_for_event_types = AsyncMock(
+        return_value={10: {"dev_eui", "serial"}, 11: {"dev_eui", "serial"}}
+    )
     union_row = _row(1, datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc), legacy_row_id=0)
     pool.fetch = AsyncMock(side_effect=[
         [{"event_type_id": 10}, {"event_type_id": 11}],
