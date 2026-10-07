@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -20,9 +21,37 @@ from .v2.storage_mode import (
     StorageMode,
     get_events_storage_mode,
     should_read_v2,
-    should_write_legacy,
     should_write_v2,
 )
+
+# Проба «остались ли у бэкфила неперенесённые строки»: смотрим только первые
+# probe_rows строк выше watermark — ровно то, что нашёл бы следующий батч
+# run_events_backfill(). Стоимость O(probe_rows) по idx_events_history_id и не
+# зависит от размера events_history.
+#
+# Голое «EXISTS (id > watermark)» здесь не годится: dual-write кладёт новое
+# событие сразу и в events_history, и в events_ts, поэтому флаг сбрасывался бы
+# в false после каждой записи, хотя переносить нечего.
+_EVENTS_BACKFILL_PENDING_SQL = '''
+SELECT EXISTS (
+    SELECT 1
+    FROM (
+        SELECT eh.id
+        FROM "{schema}".events_history eh
+        WHERE eh.id > COALESCE((
+            SELECT bs.last_legacy_id
+            FROM "{schema}".uapg_backfill_state bs
+            WHERE bs.domain = 'events'
+        ), 0)
+        ORDER BY eh.id
+        LIMIT $1
+    ) probe
+    WHERE NOT EXISTS (
+        SELECT 1 FROM "{schema}".events_ts et
+        WHERE et.legacy_row_id = probe.id
+    )
+)
+'''
 
 
 class HistoryTimescaleV2(HistoryTimescale):
@@ -33,6 +62,8 @@ class HistoryTimescaleV2(HistoryTimescale):
         *args: Any,
         events_storage_mode: Optional[StorageMode] = None,
         events_v2_config: Optional[EventsV2Config] = None,
+        events_backfill_probe_rows: int = 1000,
+        events_backfill_status_ttl_sec: float = 30.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -45,6 +76,14 @@ class HistoryTimescaleV2(HistoryTimescale):
         self._backfill_worker: Optional[EventsBackfillWorker] = None
         self._typed_tables: Dict[int, str] = {}
         self._schema_versions: Dict[int, int] = {}
+        # Прогресс бэкфила оценивается по watermark uapg_backfill_state, а не
+        # полным anti-join по events_history: на проде это Parallel Hash Anti Join
+        # по всем чанкам гипертаблицы, который не укладывается в db_query_timeout_sec.
+        self._events_backfill_probe_rows = max(1, int(events_backfill_probe_rows))
+        self._events_backfill_status_ttl_sec = max(0.0, float(events_backfill_status_ttl_sec))
+        self._events_backfill_complete: Optional[bool] = None
+        self._events_backfill_checked_at = 0.0
+        self._defer_settings_refresh = False
 
     @property
     def events_storage_mode(self) -> StorageMode:
@@ -66,6 +105,14 @@ class HistoryTimescaleV2(HistoryTimescale):
         if not self._v2_ready:
             self.logger.warning("Events V2 tables not ready; falling back to legacy semantics")
             return
+        # events_history.id — BIGSERIAL без PK: без индекса полным сканом по всем
+        # чанкам идут и keyset-батч бэкфила, и гидрация чтений (WHERE id = ANY(...)),
+        # и watermark-проба готовности. _ensure_index идемпотентен и переживает
+        # таймаут/lock: недостающий индекс будет создан на следующем старте.
+        await self._ensure_index(
+            "idx_events_history_id",
+            f'CREATE INDEX idx_events_history_id ON "{self._schema}".events_history (id)',
+        )
         await self._ensure_pool()
         self._gateway = ProcedureGateway(self._schema, self._pool, self.logger)
         self._registry = EventSchemaRegistry(
@@ -91,8 +138,107 @@ class HistoryTimescaleV2(HistoryTimescale):
             self._registry,
             self._binary_map_to_event_values,
             self.logger,
+            query_timeout_sec=self._db_query_timeout_sec,
         )
         self.logger.info("HistoryTimescaleV2 initialized (mode=%s)", self._events_storage_mode.value)
+
+    def _rebind_v2_pool(self) -> None:
+        """Синхронизировать кэшированные pool-ссылки V2 с актуальным self._pool.
+
+        EventStoreV2 / ProcedureGateway / EventsBackfillWorker получают объект pool
+        при init и иначе продолжают ходить в закрытый пул после _force_reconnect.
+        """
+        pool = self._pool
+        if self._gateway is not None:
+            self._gateway._pool = pool
+        if self._event_store is not None:
+            self._event_store._pool = pool
+        if self._backfill_worker is not None:
+            self._backfill_worker._pool = pool
+
+    async def _force_reconnect(self, failed_pool=None) -> None:
+        try:
+            await super()._force_reconnect(failed_pool)
+        finally:
+            # При неудаче super() уже закрыл старый пул и оставил self._pool = None.
+            # Без перепривязки EventStoreV2 продолжает acquire на закрытом объекте.
+            self._rebind_v2_pool()
+
+    async def _ensure_pool(self) -> None:
+        await super()._ensure_pool()
+        # Пул для записи может появиться здесь, минуя успешный _force_reconnect.
+        # Если self._pool уже открыт, базовый метод сразу выходит — ссылки V2 всё равно обновляем.
+        self._rebind_v2_pool()
+
+    def _backfill_probe_timeout_sec(self) -> float:
+        """Короткий бюджет служебной пробы: она не должна занимать весь query timeout."""
+        base = self._db_query_timeout_sec
+        if base is None or float(base) <= 0:
+            return 5.0
+        return min(5.0, float(base))
+
+    async def _probe_fetchval(self, query: str, *args: Any) -> Any:
+        """Best-effort fetchval для служебных проб.
+
+        Сознательно в обход _run_db_operation/_fetchval: значение нужно только для
+        витрины настроек и DEBUG-лога, поэтому его таймаут не имеет права рвать пул
+        через _force_reconnect и вешать на реконнект всю историзацию.
+        """
+        pool = self._pool
+        if pool is None:
+            return None
+        timeout = self._backfill_probe_timeout_sec()
+        try:
+            async with pool.acquire(timeout=timeout) as conn:
+                return await conn.fetchval(query, *args, timeout=timeout)
+        except Exception as e:
+            self._perf_inc("events_backfill_probe_failures_total")
+            self.logger.debug("Events backfill probe skipped: %s", e)
+            return None
+
+    async def _is_events_backfill_complete(self, *, force: bool = False) -> bool:
+        """Есть ли у бэкфила работа. Результат кэшируется на events_backfill_status_ttl_sec."""
+        if not self._v2_ready or self._pool is None:
+            return True
+        now = time.monotonic()
+        if (
+            not force
+            and self._events_backfill_complete is not None
+            and now - self._events_backfill_checked_at < self._events_backfill_status_ttl_sec
+        ):
+            return self._events_backfill_complete
+        has_pending = await self._probe_fetchval(
+            _EVENTS_BACKFILL_PENDING_SQL.format(schema=self._schema),
+            int(self._events_backfill_probe_rows),
+        )
+        if has_pending is None:
+            # Проба не удалась — не выдаём «готово» за факт. Отметку времени всё
+            # равно обновляем, иначе на медленной БД каждый HistoryRead ждал бы
+            # свой таймаут пробы заново.
+            fallback = (
+                self._events_backfill_complete
+                if self._events_backfill_complete is not None
+                else False
+            )
+            self._events_backfill_complete = fallback
+            self._events_backfill_checked_at = now
+            return fallback
+        self._events_backfill_complete = not bool(has_pending)
+        self._events_backfill_checked_at = now
+        return self._events_backfill_complete
+
+    def get_performance_metrics(self) -> dict:
+        metrics = super().get_performance_metrics()
+        metrics["events_v2"] = {
+            "storage_mode": self._events_storage_mode.value,
+            "storage_ready": bool(self._v2_ready),
+            "backfill_probe_failures_total": self._performance_counters.get(
+                "events_backfill_probe_failures_total", 0
+            ),
+            "backfill_probe_rows": int(self._events_backfill_probe_rows),
+            "backfill_status_ttl_sec": float(self._events_backfill_status_ttl_sec),
+        }
+        return metrics
 
     async def new_historized_event(
         self,
@@ -103,10 +249,10 @@ class HistoryTimescaleV2(HistoryTimescale):
     ) -> None:
         from .opc_node_id import coerce_node_id
 
-        source_nid = coerce_node_id(source_id)
         evtypes_raw = evtypes
         evtypes_nid = [coerce_node_id(event_type) for event_type in evtypes_raw]
-        await super().new_historized_event(source_nid, evtypes_nid, period, count)
+        # Legacy path introspects fields from asyncua Node (see HistoryTimescale.new_historized_event).
+        await super().new_historized_event(source_id, evtypes_raw, period, count)
         if not should_write_v2(self._events_storage_mode) or not self._registry or not self._gateway:
             return
         for raw_event_type in evtypes_raw:
@@ -142,56 +288,55 @@ class HistoryTimescaleV2(HistoryTimescale):
             await super()._flush_event_batch(items)
             return
 
+        flush_timeout = self._flush_op_timeout_sec()
         for attempt in (1, 2):
             await self._ensure_pool()
             failed_pool = self._pool
             try:
 
                 async def _op() -> None:
-                    async with failed_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
-                        async with conn.transaction():
-                            for it in items:
-                                if should_write_legacy(self._events_storage_mode):
-                                    typed_values = self._typed_values_from_json(it.event_data_json)
-                                    table = self._typed_tables.get(it.event_type_id)
-                                    if table is None and self._registry:
-                                        table = await self._registry.get_storage_table(it.event_type_id)
-                                    schema_version = self._schema_versions.get(it.event_type_id, 1)
-                                    gateway = ProcedureGateway(self._schema, conn, self.logger)
-                                    store = EventStoreV2(
-                                        self._schema,
-                                        conn,
-                                        self._registry,
-                                        gateway,
-                                        self.logger,
-                                    )
-                                    await store.save_event_dual(
-                                        it.source_db_id,
-                                        it.event_type_id,
-                                        it.event_timestamp,
-                                        it.event_data_json,
-                                        typed_values,
-                                        table,
-                                        schema_version,
-                                    )
-                                else:
-                                    await conn.execute(
-                                        f'''
-                                        INSERT INTO "{self._schema}".events_ts
-                                        (source_id, event_type_id, event_timestamp, schema_version)
-                                        VALUES ($1, $2, $3, $4)
-                                        ''',
-                                        it.source_db_id,
-                                        it.event_type_id,
-                                        it.event_timestamp,
-                                        self._schema_versions.get(it.event_type_id, 1),
-                                    )
+                    async with self._flush_on_connection(failed_pool) as conn:
+                        for it in items:
+                            # Always persist OPC payload via uapg_save_event_v2
+                            # (events_history.event_data + events_ts.legacy_row_id).
+                            # Mode=v2 previously inserted only into events_ts without
+                            # event_data → HistoryRead returned empty field values.
+                            typed_values = self._typed_values_from_json(it.event_data_json)
+                            table = self._typed_tables.get(it.event_type_id)
+                            if table is None and self._registry:
+                                table = await self._registry.get_storage_table(it.event_type_id)
+                            schema_version = self._schema_versions.get(it.event_type_id, 1)
+                            gateway = ProcedureGateway(self._schema, conn, self.logger)
+                            store = EventStoreV2(
+                                self._schema,
+                                conn,
+                                self._registry,
+                                gateway,
+                                self.logger,
+                            )
+                            await store.save_event_dual(
+                                it.source_db_id,
+                                it.event_type_id,
+                                it.event_timestamp,
+                                it.event_data_json,
+                                typed_values,
+                                table,
+                                schema_version,
+                            )
 
-                await self._run_db_operation(_op(), "flush event batch v2")
+                await self._run_db_operation(
+                    _op(),
+                    "flush event batch v2",
+                    timeout=flush_timeout,
+                    layer="flush",
+                )
                 return
             except Exception as e:
                 if attempt == 1:
-                    self.logger.error("Flush event batch v2 failed, reconnecting: %s", e)
+                    self.logger.error(
+                        "Flush event batch v2 failed, will reconnect and retry: %s",
+                        e,
+                    )
                     await self._force_reconnect(failed_pool)
                 else:
                     self.logger.error("Flush event batch v2 failed after reconnect: %s", e)
@@ -269,6 +414,9 @@ class HistoryTimescaleV2(HistoryTimescale):
         if not should_read_v2(self._events_storage_mode) or not self._event_store:
             return await super().read_event_history(source_id, start, end, nb_values, evfilter)
 
+        # Чтение не ждёт следующего flush: само поднимает пул и перепривязывает EventStoreV2.
+        await self._ensure_pool()
+
         start_time, end_time, order, limit = self._get_bounds(start, end, nb_values)
         source_db_id = await self._resolve_source_db_id(source_id)
         if source_db_id is None:
@@ -276,19 +424,10 @@ class HistoryTimescaleV2(HistoryTimescale):
 
         partial = False
         if self._backfill_worker:
-            lag = await self._pool.fetchval(
-                f'''
-                SELECT count(*)::bigint
-                FROM "{self._schema}".events_history eh
-                WHERE eh.source_id = $1
-                  AND NOT EXISTS (
-                      SELECT 1 FROM "{self._schema}".events_ts et
-                      WHERE et.legacy_row_id = eh.id
-                  )
-                ''',
-                source_db_id,
-            )
-            partial = int(lag or 0) > 0
+            # Раньше здесь был anti-join по всем строкам источника на каждый
+            # HistoryRead. Оценка стала глобальной и кэшированной: она консервативнее
+            # (partial=true, если отстал любой источник) и влияет только на DEBUG-лог.
+            partial = not await self._is_events_backfill_complete()
 
         results, cont, is_partial = await self._event_store.read_events(
             source_db_id,
@@ -387,8 +526,16 @@ class HistoryTimescaleV2(HistoryTimescale):
         *,
         parent: Any = None,
     ) -> None:
-        await super().expose_history_settings_nodes(server, namespace_index, parent=parent)
-        await self._expose_events_v2_capability_nodes(server, namespace_index, parent=parent)
+        # Базовый expose сам зовёт refresh, и через виртуальную диспетчеризацию
+        # попадает в V2-override — вместе с refresh после capability-узлов это
+        # давало две пробы бэкфила на один старт. Откладываем до конца.
+        self._defer_settings_refresh = True
+        try:
+            await super().expose_history_settings_nodes(server, namespace_index, parent=parent)
+            await self._expose_events_v2_capability_nodes(server, namespace_index, parent=parent)
+        finally:
+            self._defer_settings_refresh = False
+        await self.refresh_history_settings_nodes()
 
     async def _expose_events_v2_capability_nodes(
         self,
@@ -435,6 +582,8 @@ class HistoryTimescaleV2(HistoryTimescale):
         await self.refresh_history_settings_nodes()
 
     async def refresh_history_settings_nodes(self) -> None:
+        if self._defer_settings_refresh:
+            return
         await super().refresh_history_settings_nodes()
         nodes = self._opcua_history_settings_nodes
         if not nodes:
@@ -444,22 +593,7 @@ class HistoryTimescaleV2(HistoryTimescale):
             and self._events_storage_mode != StorageMode.LEGACY
             and bool(self._events_v2_config.sql_filter_fields)
         )
-        backfill_complete = True
-        if self._v2_ready and self._pool:
-            try:
-                lag = await self._pool.fetchval(
-                    f'''
-                    SELECT count(*)::bigint
-                    FROM "{self._schema}".events_history eh
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM "{self._schema}".events_ts et
-                        WHERE et.legacy_row_id = eh.id
-                    )
-                    '''
-                )
-                backfill_complete = int(lag or 0) == 0
-            except Exception:
-                backfill_complete = False
+        backfill_complete = await self._is_events_backfill_complete()
 
         values = {
             "EventsStorageVersion": ua.Variant("v2" if self._v2_ready else "v1", ua.VariantType.String),

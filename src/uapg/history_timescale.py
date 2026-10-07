@@ -10,8 +10,10 @@ import json
 import asyncio
 import random
 import logging
+import socket
 import time
 import importlib.metadata as importlib_metadata
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, List, Optional, Tuple, Union, Dict, Callable, Coroutine
@@ -91,6 +93,13 @@ def _empty_timing_stats() -> Dict[str, float]:
     }
 
 
+DEFAULT_DROP_LOG_INTERVAL_SEC = 60.0
+DEFAULT_WORKER_RESTART_MAX_BACKOFF_SEC = 30.0
+DEFAULT_FLUSH_TIMEOUT_SEC = 120.0
+DEFAULT_WORKER_STALL_TIMEOUT_SEC = 300.0
+DEFAULT_DB_APPLICATION_NAME = "uapg-history"
+
+
 def _observe_timing(stats: Dict[str, float], duration_ms: float) -> None:
     count = int(stats.get("count", 0)) + 1
     total = float(stats.get("total_ms", 0.0)) + duration_ms
@@ -118,6 +127,10 @@ class HistoryWriteBuffer:
         queue_max_size: int,
         durability_mode: str,
         flush_func: Callable[[List[Any]], Coroutine[Any, Any, None]],
+        drop_log_interval_sec: float = DEFAULT_DROP_LOG_INTERVAL_SEC,
+        worker_restart_max_backoff_sec: float = DEFAULT_WORKER_RESTART_MAX_BACKOFF_SEC,
+        flush_timeout_sec: float = DEFAULT_FLUSH_TIMEOUT_SEC,
+        stall_timeout_sec: float = DEFAULT_WORKER_STALL_TIMEOUT_SEC,
     ) -> None:
         self._name = name
         self._logger = logger.getChild(f"buffer.{name}") if logger else logging.getLogger(f"HistoryWriteBuffer.{name}")
@@ -130,6 +143,25 @@ class HistoryWriteBuffer:
         self._task: Optional[asyncio.Task] = None
         self._stopped = False
         self._stats: Dict[str, Any] = self._new_stats()
+        # Надзор за воркером
+        self._ever_started = False
+        self._worker_exit_reason: str = ""
+        self._worker_restarts_total = 0
+        self._worker_restart_attempt = 0
+        self._worker_restart_max_backoff_sec = max(1.0, float(worker_restart_max_backoff_sec))
+        self._restart_handle: Optional[asyncio.TimerHandle] = None
+        self._last_flush_monotonic: Optional[float] = None
+        self._last_enqueue_monotonic: Optional[float] = None
+        # Ограничение и надзор за самим флашем: воркер может быть жив и при этом
+        # висеть в await к БД, и тогда обычной проверки task.done() недостаточно.
+        self._flush_timeout_sec = max(0.0, float(flush_timeout_sec))
+        self._stall_timeout_sec = max(0.0, float(stall_timeout_sec))
+        self._flush_started_monotonic: Optional[float] = None
+        self._worker_stall_restarts_total = 0
+        # Ограничение частоты лога об отбрасывании
+        self._drop_log_interval_sec = max(0.0, float(drop_log_interval_sec))
+        self._drop_log_last_monotonic: Optional[float] = None
+        self._drops_since_last_log = 0
 
     @staticmethod
     def _new_stats() -> Dict[str, Any]:
@@ -142,6 +174,8 @@ class HistoryWriteBuffer:
             "last_batch_size": 0,
             "max_batch_size_seen": 0,
             "flush_errors_total": 0,
+            "flush_timeouts_total": 0,
+            "flush_dropped_items_total": 0,
             "last_flush_error": "",
             "flush_duration": _empty_timing_stats(),
         }
@@ -163,12 +197,33 @@ class HistoryWriteBuffer:
             "last_batch_size": int(self._stats["last_batch_size"]),
             "max_batch_size_seen": int(self._stats["max_batch_size_seen"]),
             "flush_errors_total": int(self._stats["flush_errors_total"]),
+            "flush_timeouts_total": int(self._stats["flush_timeouts_total"]),
+            "flush_dropped_items_total": int(self._stats["flush_dropped_items_total"]),
             "last_flush_error": str(self._stats["last_flush_error"]),
             "last_flush_duration_ms": float(flush_duration["last_ms"]),
             "max_flush_duration_ms": float(flush_duration["max_ms"]),
             "avg_flush_duration_ms": float(flush_duration["avg_ms"]),
             "total_flush_duration_ms": float(flush_duration["total_ms"]),
+            # Надзор за воркером: worker_alive отличает мёртвый воркер от живого,
+            # а seconds_since_last_flush — живого, но залипшего в ожидании БД.
+            "worker_alive": self.is_worker_alive(),
+            "worker_restarts_total": int(self._worker_restarts_total),
+            "worker_stall_restarts_total": int(self._worker_stall_restarts_total),
+            "last_worker_exit_reason": str(self._worker_exit_reason),
+            "seconds_since_last_flush": self._seconds_since(self._last_flush_monotonic),
+            "seconds_since_last_enqueue": self._seconds_since(self._last_enqueue_monotonic),
+            "seconds_in_current_flush": self._seconds_since(self._flush_started_monotonic),
         }
+
+    @staticmethod
+    def _seconds_since(marker: Optional[float]) -> float:
+        """-1 означает «ещё ни разу не было», иначе ноль был бы неотличим от свежего."""
+        if marker is None:
+            return -1.0
+        return max(0.0, time.monotonic() - marker)
+
+    def is_worker_alive(self) -> bool:
+        return self._task is not None and not self._task.done()
 
     def reset_stats(self) -> None:
         self._stats = self._new_stats()
@@ -176,7 +231,9 @@ class HistoryWriteBuffer:
     def start(self) -> None:
         if self._task is None or self._task.done():
             self._stopped = False
+            self._ever_started = True
             self._task = asyncio.create_task(self._worker(), name=f"HistoryWriteBuffer-{self._name}")
+            self._task.add_done_callback(self._on_worker_done)
             self._logger.info(
                 "HistoryWriteBuffer '%s' started (max_batch_size=%s, max_batch_interval_sec=%.3f, queue_max_size=%s, durability_mode=%s)",
                 self._name,
@@ -186,8 +243,132 @@ class HistoryWriteBuffer:
                 self._durability_mode,
             )
 
+    def _on_worker_done(self, task: "asyncio.Task") -> None:
+        """
+        Воркер не должен завершаться, пока буфер не остановлен. Раньше такое
+        завершение было полностью бесшумным: очередь переполнялась, и
+        единственным следом оставался поток «queue is full».
+        """
+        if self._stopped or task is not self._task:
+            return
+
+        if task.cancelled():
+            reason = "cancelled"
+            self._logger.critical(
+                "HistoryWriteBuffer '%s' worker was cancelled while buffer is running; restarting",
+                self._name,
+            )
+        else:
+            exc = task.exception()
+            if exc is None:
+                reason = "returned"
+                self._logger.critical(
+                    "HistoryWriteBuffer '%s' worker exited unexpectedly; restarting",
+                    self._name,
+                )
+            else:
+                reason = f"{type(exc).__name__}: {exc}"
+                self._logger.critical(
+                    "HistoryWriteBuffer '%s' worker died: %r; restarting",
+                    self._name,
+                    exc,
+                    exc_info=exc,
+                )
+
+        self._worker_exit_reason = reason
+        self._worker_restarts_total += 1
+        self._worker_restart_attempt += 1
+        delay = min(
+            self._worker_restart_max_backoff_sec,
+            float(2 ** min(self._worker_restart_attempt - 1, 16)),
+        )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._logger.error(
+                "HistoryWriteBuffer '%s' cannot schedule worker restart: no running loop",
+                self._name,
+            )
+            return
+
+        self._task = None
+        self._restart_handle = loop.call_later(delay, self._restart_worker)
+        self._logger.warning(
+            "HistoryWriteBuffer '%s' worker restart scheduled in %.1fs (restarts=%d)",
+            self._name,
+            delay,
+            self._worker_restarts_total,
+        )
+
+    def _restart_worker(self) -> None:
+        self._restart_handle = None
+        if self._stopped:
+            return
+        self.start()
+
+    def ensure_worker_running(self) -> None:
+        """Дешёвая проверка с пути записи: во время инцидента именно она замечает,
+        что воркер умер, раньше любого внешнего мониторинга.
+
+        Буфер, который ни разу не запускали, не поднимаем: это не авария, а
+        сознательный выбор вызывающего кода."""
+        if not self._ever_started or self._stopped:
+            return
+        if self.is_worker_alive():
+            self._restart_if_stalled()
+            return
+        if self._restart_handle is not None:
+            return
+        self._logger.critical(
+            "HistoryWriteBuffer '%s' worker is not running on enqueue path; starting it",
+            self._name,
+        )
+        self.start()
+
+    def _restart_if_stalled(self) -> None:
+        """
+        Живой воркер, застрявший в await к БД, — отдельный класс отказа: task.done()
+        остаётся False, ошибок нет, а очередь тем временем переполняется. Единственный
+        надёжный признак — флаш, который идёт дольше любого разумного времени.
+
+        Отменяем задачу и сразу поднимаем новую, не дожидаясь завершения старой:
+        её cleanup может висеть на том же мёртвом сокете.
+        """
+        if self._stall_timeout_sec <= 0:
+            return
+        started = self._flush_started_monotonic
+        if started is None:
+            return
+        stuck_for = time.monotonic() - started
+        if stuck_for < self._stall_timeout_sec:
+            return
+
+        stalled_task = self._task
+        self._worker_stall_restarts_total += 1
+        self._worker_exit_reason = f"stalled in flush for {stuck_for:.0f}s"
+        self._logger.critical(
+            "HistoryWriteBuffer '%s' worker is stuck in flush for %.0fs (queue=%d); "
+            "cancelling and restarting it",
+            self._name,
+            stuck_for,
+            self._queue.qsize(),
+        )
+
+        self._flush_started_monotonic = None
+        self._task = None
+        if stalled_task is not None:
+            stalled_task.cancel()
+        if self._restart_handle is not None:
+            self._restart_handle.cancel()
+            self._restart_handle = None
+        self.start()
+
     async def stop(self) -> None:
         self._stopped = True
+        if self._restart_handle is not None:
+            self._restart_handle.cancel()
+            self._restart_handle = None
         if self._task:
             # Даем воркеру возможность дописать оставшиеся элементы
             try:
@@ -208,6 +389,8 @@ class HistoryWriteBuffer:
         future: Optional[asyncio.Future] = None
         sync_mode = sync or self._durability_mode == "sync"
         self._stats["enqueue_attempts_total"] += 1
+        self._last_enqueue_monotonic = time.monotonic()
+        self.ensure_worker_running()
 
         if sync_mode:
             loop = asyncio.get_running_loop()
@@ -224,13 +407,54 @@ class HistoryWriteBuffer:
             self._stats["enqueued_total"] += 1
         except asyncio.QueueFull:
             self._stats["dropped_total"] += 1
-            self._logger.error("HistoryWriteBuffer '%s' queue is full, dropping item in async mode", self._name)
+            self._log_drop()
             if future and not future.done():
                 future.set_exception(RuntimeError("HistoryWriteBuffer queue is full"))
             return
 
         if sync_mode and future is not None:
             await future
+
+    def _log_drop(self) -> None:
+        """
+        Отбрасывание логируется с ограничением частоты: при переполнении поток
+        сообщений идёт со скоростью записи и сам по себе становится проблемой
+        (в одном инциденте — 618 МБ логов). Точный счёт остаётся в dropped_total.
+        """
+        self._drops_since_last_log += 1
+        now = time.monotonic()
+        last = self._drop_log_last_monotonic
+
+        if (
+            last is not None
+            and self._drop_log_interval_sec > 0
+            and (now - last) < self._drop_log_interval_sec
+        ):
+            return
+
+        dropped_in_window = self._drops_since_last_log
+        self._drops_since_last_log = 0
+        self._drop_log_last_monotonic = now
+
+        if last is None:
+            self._logger.error(
+                "HistoryWriteBuffer '%s' queue is full (queue_max_size=%s), dropping items in async mode; "
+                "далее не чаще раза в %.0f с",
+                self._name,
+                self._queue.maxsize,
+                self._drop_log_interval_sec,
+            )
+        else:
+            self._logger.error(
+                "HistoryWriteBuffer '%s' queue is full: отброшено %d элементов за %.0f с "
+                "(dropped_total=%s, worker_alive=%s, seconds_since_last_flush=%.1f)",
+                self._name,
+                dropped_in_window,
+                now - last,
+                self._stats["dropped_total"],
+                self.is_worker_alive(),
+                self._seconds_since(self._last_flush_monotonic),
+            )
 
     async def _worker(self) -> None:
         """
@@ -239,44 +463,70 @@ class HistoryWriteBuffer:
         """
         pending: List[Any] = []
 
-        while not self._stopped or not self._queue.empty():
-            try:
-                if not pending:
-                    try:
-                        item = await asyncio.wait_for(self._queue.get(), timeout=self._max_batch_interval_sec)
-                    except asyncio.TimeoutError:
-                        continue
-                    pending.append(item)
+        try:
+            while not self._stopped or not self._queue.empty():
+                try:
+                    if not pending:
+                        try:
+                            item = await asyncio.wait_for(self._queue.get(), timeout=self._max_batch_interval_sec)
+                        except asyncio.TimeoutError:
+                            continue
+                        pending.append(item)
 
-                # Добираем пачку до max_batch_size без ожидания
-                while len(pending) < self._max_batch_size:
-                    try:
-                        pending.append(self._queue.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
+                    # Добираем пачку до max_batch_size без ожидания
+                    while len(pending) < self._max_batch_size:
+                        try:
+                            pending.append(self._queue.get_nowait())
+                        except asyncio.QueueEmpty:
+                            break
 
-                await self._flush_pending(pending)
-                pending.clear()
+                    await self._flush_pending(pending)
+                    pending.clear()
 
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self._logger.error("HistoryWriteBuffer '%s' worker error: %s", self._name, e, exc_info=True)
+                except asyncio.CancelledError:
+                    # Отмена незакрытого буфера — авария: очередь останется без слива
+                    if not self._stopped:
+                        self._worker_exit_reason = "cancelled"
+                        self._logger.critical(
+                            "HistoryWriteBuffer '%s' worker cancelled while running, %d items pending",
+                            self._name,
+                            len(pending) + self._queue.qsize(),
+                        )
+                    raise
+                except Exception as e:
+                    self._logger.error("HistoryWriteBuffer '%s' worker error: %s", self._name, e, exc_info=True)
 
-        # Финальный флаш оставшихся данных
-        if pending:
-            try:
-                await self._flush_pending(pending)
-            except Exception as e:
-                self._logger.error("HistoryWriteBuffer '%s' final flush error: %s", self._name, e, exc_info=True)
+            # Финальный флаш оставшихся данных
+            if pending:
+                try:
+                    await self._flush_pending(pending)
+                except Exception as e:
+                    self._logger.error("HistoryWriteBuffer '%s' final flush error: %s", self._name, e, exc_info=True)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:
+            # Без этого воркер умирал молча: никто не ждёт task, и трассировка теряется
+            self._worker_exit_reason = f"{type(e).__name__}: {e}"
+            self._logger.critical(
+                "HistoryWriteBuffer '%s' worker terminated by %r",
+                self._name,
+                e,
+                exc_info=True,
+            )
+            raise
 
     async def _flush_pending(self, batch: List[Any]) -> None:
         if not batch:
             return
 
         started_at = time.perf_counter()
+        self._flush_started_monotonic = time.monotonic()
         try:
-            await self._flush_func(batch)
+            if self._flush_timeout_sec > 0:
+                async with asyncio.timeout(self._flush_timeout_sec):
+                    await self._flush_func(batch)
+            else:
+                await self._flush_func(batch)
             duration_ms = (time.perf_counter() - started_at) * 1000.0
             batch_size = len(batch)
             self._stats["flush_batches_total"] += 1
@@ -287,6 +537,9 @@ class HistoryWriteBuffer:
                 batch_size,
             )
             _observe_timing(self._stats["flush_duration"], duration_ms)
+            # Отметка успеха: по ней видно «данные не доезжают», даже когда воркер жив
+            self._last_flush_monotonic = time.monotonic()
+            self._worker_restart_attempt = 0
             # Уведомляем ожидающих о завершении
             now = time.time()
             for item in batch:
@@ -295,8 +548,19 @@ class HistoryWriteBuffer:
                     fut.set_result(now)
         except Exception as e:
             duration_ms = (time.perf_counter() - started_at) * 1000.0
+            duration_sec = duration_ms / 1000.0
             batch_size = len(batch)
+            timed_out = isinstance(e, (asyncio.TimeoutError, TimeoutError))
+            if timed_out:
+                self._stats["flush_timeouts_total"] += 1
+                # Не подменять текст внутреннего таймаута (query/flush/command)
+                # ярлыком внешнего бюджета буфера: иначе в логе «120s» при срабатывании 30 с.
+                if not str(e).strip():
+                    e = TimeoutError(
+                        f"flush timed out after {duration_sec:.1f}s (layer=buffer)"
+                    )
             self._stats["flush_errors_total"] += 1
+            self._stats["flush_dropped_items_total"] += batch_size
             self._stats["last_flush_error"] = str(e)
             self._stats["last_batch_size"] = batch_size
             self._stats["max_batch_size_seen"] = max(
@@ -305,16 +569,19 @@ class HistoryWriteBuffer:
             )
             _observe_timing(self._stats["flush_duration"], duration_ms)
             self._logger.error(
-                "HistoryWriteBuffer '%s' flush failed for %d items: %s",
+                "HistoryWriteBuffer '%s' flush failed for %d items after %.1fs: %s",
                 self._name,
                 len(batch),
+                duration_sec,
                 e,
-                exc_info=True,
+                exc_info=not timed_out,
             )
             for item in batch:
                 fut: Optional[asyncio.Future] = getattr(item, "future", None)
                 if fut is not None and not fut.done():
                     fut.set_exception(e)
+        finally:
+            self._flush_started_monotonic = None
 
 try:
     from asyncua.common.events import get_event_properties_from_type_node
@@ -537,6 +804,16 @@ class HistoryTimescale(HistoryStorageInterface):
         history_metadata_cache_init_max_rows: int = 500000,
         db_query_timeout_sec: Optional[float] = 30.0,
         db_pool_close_timeout_sec: float = 5.0,
+        db_pool_create_timeout_sec: float = 30.0,
+        db_lock_wait_timeout_sec: float = 60.0,
+        db_command_timeout_sec: Optional[float] = 60.0,
+        db_tcp_keepalive_idle_sec: int = 30,
+        db_tcp_keepalive_interval_sec: int = 10,
+        db_tcp_keepalive_count: int = 3,
+        db_tcp_user_timeout_sec: float = 60.0,
+        history_flush_timeout_sec: float = DEFAULT_FLUSH_TIMEOUT_SEC,
+        history_worker_stall_timeout_sec: float = DEFAULT_WORKER_STALL_TIMEOUT_SEC,
+        db_application_name: str = DEFAULT_DB_APPLICATION_NAME,
         **kwargs
     ) -> None:
         """
@@ -583,6 +860,24 @@ class HistoryTimescale(HistoryStorageInterface):
             else float(db_query_timeout_sec)
         )
         self._db_pool_close_timeout_sec = max(0.1, float(db_pool_close_timeout_sec))
+        # Пересоздание пула держит оба замка: без этих границ любой flush,
+        # вошедший в _ensure_pool, ждёт его неограниченно долго.
+        self._db_pool_create_timeout_sec = max(1.0, float(db_pool_create_timeout_sec))
+        self._db_lock_wait_timeout_sec = max(1.0, float(db_lock_wait_timeout_sec))
+        # command_timeout действует внутри asyncpg и покрывает в том числе BEGIN,
+        # COMMIT и ROLLBACK, которые контекст транзакции шлёт без явного timeout.
+        self._db_command_timeout_sec = (
+            None
+            if db_command_timeout_sec is None or float(db_command_timeout_sec) <= 0
+            else float(db_command_timeout_sec)
+        )
+        self._db_tcp_keepalive_idle_sec = max(0, int(db_tcp_keepalive_idle_sec))
+        self._db_tcp_keepalive_interval_sec = max(1, int(db_tcp_keepalive_interval_sec))
+        self._db_tcp_keepalive_count = max(1, int(db_tcp_keepalive_count))
+        self._db_tcp_user_timeout_sec = max(0.0, float(db_tcp_user_timeout_sec))
+        self._history_flush_timeout_sec = max(0.0, float(history_flush_timeout_sec))
+        self._history_worker_stall_timeout_sec = max(0.0, float(history_worker_stall_timeout_sec))
+        self._db_application_name = str(db_application_name or "").strip() or DEFAULT_DB_APPLICATION_NAME
         # Последнее время, когда мы писали агрегированное сообщение о длительной недоступности БД
         self._last_reconnect_outage_log_at = None
         self._failed_value_saves_counter = 0
@@ -814,6 +1109,10 @@ class HistoryTimescale(HistoryStorageInterface):
             "save_event_errors_total": 0,
             "db_operation_timeouts_total": 0,
             "db_reconnects_total": 0,
+            "db_reconnect_skipped_total": 0,
+            "db_pool_wait_timeouts_total": 0,
+            # Считается только в HistoryTimescaleV2 (проба готовности бэкфила).
+            "events_backfill_probe_failures_total": 0,
         }
 
     @staticmethod
@@ -882,6 +1181,8 @@ class HistoryTimescale(HistoryStorageInterface):
             "db": {
                 "timeouts_total": self._performance_counters["db_operation_timeouts_total"],
                 "reconnects_total": self._performance_counters["db_reconnects_total"],
+                "reconnects_skipped_total": self._performance_counters["db_reconnect_skipped_total"],
+                "pool_wait_timeouts_total": self._performance_counters["db_pool_wait_timeouts_total"],
             },
             "retention": {
                 "per_variable_cleanup_enabled": False,
@@ -895,6 +1196,14 @@ class HistoryTimescale(HistoryStorageInterface):
                 "history_write_durability_mode": str(self._history_write_durability_mode),
                 "history_write_read_consistency_mode": str(self._history_write_read_consistency_mode),
                 "db_query_timeout_sec": self._db_query_timeout_sec,
+                "db_pool_create_timeout_sec": float(self._db_pool_create_timeout_sec),
+                "db_lock_wait_timeout_sec": float(self._db_lock_wait_timeout_sec),
+                "db_command_timeout_sec": self._db_command_timeout_sec,
+                "db_tcp_keepalive_idle_sec": int(self._db_tcp_keepalive_idle_sec),
+                "db_tcp_user_timeout_sec": float(self._db_tcp_user_timeout_sec),
+                "history_flush_timeout_sec": float(self._history_flush_timeout_sec),
+                "history_worker_stall_timeout_sec": float(self._history_worker_stall_timeout_sec),
+                "db_application_name": str(self._db_application_name),
             },
         }
 
@@ -912,11 +1221,21 @@ class HistoryTimescale(HistoryStorageInterface):
             "last_batch_size": 0,
             "max_batch_size_seen": 0,
             "flush_errors_total": 0,
+            "flush_timeouts_total": 0,
+            "flush_dropped_items_total": 0,
             "last_flush_error": "",
             "last_flush_duration_ms": 0.0,
             "max_flush_duration_ms": 0.0,
             "avg_flush_duration_ms": 0.0,
             "total_flush_duration_ms": 0.0,
+            # Набор ключей обязан совпадать с get_stats(): по нему создаются узлы OPC UA
+            "worker_alive": False,
+            "worker_restarts_total": 0,
+            "worker_stall_restarts_total": 0,
+            "last_worker_exit_reason": "",
+            "seconds_since_last_flush": -1.0,
+            "seconds_since_last_enqueue": -1.0,
+            "seconds_in_current_flush": -1.0,
         }
 
     def reset_performance_metrics(self) -> None:
@@ -1033,6 +1352,7 @@ class HistoryTimescale(HistoryStorageInterface):
             await self._ensure_pool()
 
             if not self._initialized:
+                await self._terminate_stale_backends()
                 await self._create_metadata_tables()
                 self._initialized = True
 
@@ -1051,6 +1371,8 @@ class HistoryTimescale(HistoryStorageInterface):
                         queue_max_size=self._history_write_queue_max_size,
                         durability_mode=self._history_write_durability_mode,
                         flush_func=self._flush_variable_batch,
+                        flush_timeout_sec=self._buffer_flush_timeout_sec(),
+                        stall_timeout_sec=self._history_worker_stall_timeout_sec,
                     )
                     self._value_write_buffer.start()
 
@@ -1063,6 +1385,8 @@ class HistoryTimescale(HistoryStorageInterface):
                         queue_max_size=self._history_write_queue_max_size,
                         durability_mode=self._history_write_durability_mode,
                         flush_func=self._flush_event_batch,
+                        flush_timeout_sec=self._buffer_flush_timeout_sec(),
+                        stall_timeout_sec=self._history_worker_stall_timeout_sec,
                     )
                     self._event_write_buffer.start()
 
@@ -1347,7 +1671,12 @@ class HistoryTimescale(HistoryStorageInterface):
             'host': self._conn_params['host'],
             'port': self._conn_params['port'],
             'min_size': self._min_size,
-            'max_size': self._max_size
+            'max_size': self._max_size,
+            # Ограничение установки каждого соединения; общий бюджет create_pool
+            # задаётся отдельно в _create_pool_with_timeout
+            'timeout': self._db_pool_create_timeout_sec,
+            'command_timeout': self._effective_command_timeout_sec(),
+            'init': self._configure_connection,
         }
 
         exclude_params = {'user', 'password', 'database', 'host', 'port', 'min_size', 'max_size', 'sslmode', 'schema'}
@@ -1360,22 +1689,155 @@ class HistoryTimescale(HistoryStorageInterface):
         elif self._conn_params.get('sslmode') in ('require', 'verify-ca', 'verify-full'):
             pool_params['ssl'] = True
 
+        server_settings = dict(pool_params.get('server_settings') or {})
+        if self._db_application_name:
+            server_settings['application_name'] = self._db_application_name
+        if server_settings:
+            pool_params['server_settings'] = server_settings
+
         return pool_params
+
+    async def _configure_connection(self, conn: asyncpg.Connection) -> None:
+        """
+        Включает TCP keepalive на сокете соединения.
+
+        Прикладных таймаутов недостаточно: если сокет к БД умер молча, отмена
+        зависшего запроса сама уходит в тот же мёртвый сокет (asyncpg шлёт ROLLBACK
+        при выходе из транзакции), и ожидание не заканчивается никогда. Обрыв должен
+        обнаруживаться на уровне ОС, а не приложения.
+        """
+        if self._db_tcp_keepalive_idle_sec <= 0:
+            return
+        try:
+            sock = conn._transport.get_extra_info("socket")
+            if sock is None or sock.family not in (socket.AF_INET, socket.AF_INET6):
+                return
+
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            for opt_name, value in (
+                ("TCP_KEEPIDLE", self._db_tcp_keepalive_idle_sec),
+                ("TCP_KEEPINTVL", self._db_tcp_keepalive_interval_sec),
+                ("TCP_KEEPCNT", self._db_tcp_keepalive_count),
+            ):
+                opt = getattr(socket, opt_name, None)
+                if opt is not None:
+                    sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+
+            # TCP_USER_TIMEOUT ограничивает время неподтверждённой отправки и потому
+            # ловит обрыв даже посреди активной записи, когда keepalive не работает.
+            user_timeout = getattr(socket, "TCP_USER_TIMEOUT", None)
+            if user_timeout is not None and self._db_tcp_user_timeout_sec > 0:
+                sock.setsockopt(
+                    socket.IPPROTO_TCP,
+                    user_timeout,
+                    int(self._db_tcp_user_timeout_sec * 1000),
+                )
+        except Exception as e:
+            # Настройка сокета не должна мешать работе с БД
+            self.logger.warning("Failed to set TCP keepalive on database socket: %r", e)
 
     @staticmethod
     def _is_pool_open(pool: Optional[asyncpg.Pool]) -> bool:
         return pool is not None and not pool._closed and not getattr(pool, "_closing", False)
 
-    async def _run_db_operation(self, awaitable: Any, operation: str) -> Any:
-        timeout = self._db_query_timeout_sec
+    def _effective_command_timeout_sec(self) -> Optional[float]:
+        """
+        command_timeout пула не должен быть короче бюджета флаша: иначе asyncpg
+        оборвёт INSERT раньше прикладного history_flush_timeout_sec.
+        """
+        candidates = [
+            value
+            for value in (self._db_command_timeout_sec, self._history_flush_timeout_sec)
+            if value is not None and float(value) > 0
+        ]
+        return max(candidates) if candidates else None
+
+    def _flush_op_timeout_sec(self) -> Optional[float]:
+        if self._history_flush_timeout_sec > 0:
+            return float(self._history_flush_timeout_sec)
+        return self._db_query_timeout_sec
+
+    def _buffer_flush_timeout_sec(self) -> float:
+        """Внешний потолок буфера: две попытки флаша плюс ожидание замка реконнекта."""
+        flush = self._history_flush_timeout_sec
+        if flush <= 0:
+            return 0.0
+        return 2.0 * flush + float(self._db_lock_wait_timeout_sec)
+
+    def _terminate_connection(self, conn: Any) -> None:
+        if conn is None:
+            return
+        try:
+            conn.terminate()
+        except Exception as e:
+            self.logger.warning("Failed to terminate PostgreSQL connection after failed flush: %r", e)
+
+    @asynccontextmanager
+    async def _flush_on_connection(self, pool: asyncpg.Pool):
+        """
+        Соединение для флаша: при таймауте/отмене рвём сокет, а не ждём ROLLBACK
+        на уже закрытом коннекте (asyncpg: cannot call Transaction.__aexit__).
+        """
+        timeout = self._flush_op_timeout_sec()
+        conn = await pool.acquire(timeout=timeout)
+        terminated = False
+        transaction = conn.transaction()
+        try:
+            await transaction.start()
+            try:
+                yield conn
+                await transaction.commit()
+            except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError):
+                terminated = True
+                self._terminate_connection(conn)
+                raise
+            except Exception:
+                try:
+                    await transaction.rollback()
+                except Exception as rollback_err:
+                    self.logger.warning(
+                        "Rollback after failed flush failed: %r; terminating connection",
+                        rollback_err,
+                    )
+                    terminated = True
+                    self._terminate_connection(conn)
+                raise
+        finally:
+            if not terminated:
+                try:
+                    await pool.release(conn)
+                except Exception as e:
+                    self.logger.warning("Failed to release PostgreSQL connection after flush: %r", e)
+                    self._terminate_connection(conn)
+
+    async def _run_db_operation(
+        self,
+        awaitable: Any,
+        operation: str,
+        *,
+        timeout: Optional[float] = None,
+        layer: str = "query",
+    ) -> Any:
+        if timeout is None:
+            timeout = self._db_query_timeout_sec
         try:
             if timeout is None or timeout <= 0:
                 return await awaitable
             return await asyncio.wait_for(awaitable, timeout=timeout)
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             self._perf_inc("db_operation_timeouts_total")
-            self.logger.error("PostgreSQL %s timed out after %.1f seconds", operation, timeout)
-            raise
+            if str(e).strip():
+                self.logger.error("PostgreSQL %s timed out: %s", operation, e)
+                raise
+            self.logger.error(
+                "PostgreSQL %s timed out after %.1f seconds (layer=%s)",
+                operation,
+                timeout,
+                layer,
+            )
+            raise TimeoutError(
+                f"{operation} timed out after {timeout:.1f}s (layer={layer})"
+            ) from None
 
     async def _close_pool_with_timeout(self, pool: Optional[asyncpg.Pool], reason: str) -> None:
         if pool is None:
@@ -1392,6 +1854,43 @@ class HistoryTimescale(HistoryStorageInterface):
         except Exception as e:
             self.logger.warning("Error closing PostgreSQL pool during %s: %r", reason, e, exc_info=True)
 
+    @asynccontextmanager
+    async def _bounded_lock(self, lock: asyncio.Lock, what: str):
+        """
+        Захват замка с ограничением по времени. Без него ожидание замка,
+        удерживаемого зависшим реконнектом, не заканчивается никогда, а наружу
+        это выглядит как «историзация молча перестала писать».
+        """
+        try:
+            async with asyncio.timeout(self._db_lock_wait_timeout_sec):
+                await lock.acquire()
+        except TimeoutError:
+            self._perf_inc("db_pool_wait_timeouts_total")
+            self.logger.error(
+                "Timed out after %.1fs waiting for %s; database operation aborted",
+                self._db_lock_wait_timeout_sec,
+                what,
+            )
+            raise
+        try:
+            yield
+        finally:
+            lock.release()
+
+    async def _create_pool_with_timeout(self, reason: str) -> asyncpg.Pool:
+        pool_params = self._build_pool_params()
+        try:
+            async with asyncio.timeout(self._db_pool_create_timeout_sec):
+                return await asyncpg.create_pool(**pool_params)
+        except TimeoutError:
+            self._perf_inc("db_pool_wait_timeouts_total")
+            self.logger.error(
+                "Timed out after %.1fs creating PostgreSQL pool during %s",
+                self._db_pool_create_timeout_sec,
+                reason,
+            )
+            raise
+
     async def _ensure_pool(self) -> None:
         """
         Гарантирует наличие рабочего пула соединений.
@@ -1403,15 +1902,14 @@ class HistoryTimescale(HistoryStorageInterface):
         if self._is_pool_open(self._pool):
             return
         if self._reconnect_lock.locked():
-            async with self._reconnect_lock:
+            async with self._bounded_lock(self._reconnect_lock, "reconnect lock"):
                 pass
             if self._is_pool_open(self._pool):
                 return
-        async with self._pool_lock:
+        async with self._bounded_lock(self._pool_lock, "pool lock"):
             if self._is_pool_open(self._pool):
                 return
-            pool_params = self._build_pool_params()
-            self._pool = await asyncpg.create_pool(**pool_params)
+            self._pool = await self._create_pool_with_timeout("ensure_pool")
             self.logger.info("Connection pool created")
 
     async def _is_pool_healthy(self) -> bool:
@@ -1830,18 +2328,21 @@ class HistoryTimescale(HistoryStorageInterface):
         Старый пул закрывается синхронно, чтобы избежать гонок состояний
         внутри asyncpg (ошибки вида «another operation is in progress»).
         """
-        async with self._reconnect_lock:
+        async with self._bounded_lock(self._reconnect_lock, "reconnect lock (force_reconnect)"):
             if self._stopping:
                 raise RuntimeError("HistoryTimescale is stopping")
             old_pool: Optional[asyncpg.Pool] = None
-            async with self._pool_lock:
+            async with self._bounded_lock(self._pool_lock, "pool lock (force_reconnect)"):
                 try:
                     if (
                         failed_pool is not None
                         and self._pool is not failed_pool
                         and self._is_pool_open(self._pool)
                     ):
-                        self.logger.debug("Skipping PostgreSQL reconnect: pool was already replaced")
+                        self._perf_inc("db_reconnect_skipped_total")
+                        self.logger.warning(
+                            "Skipping PostgreSQL reconnect: pool was already replaced"
+                        )
                         return
                     if self._pool:
                         old_pool = self._pool
@@ -1858,16 +2359,91 @@ class HistoryTimescale(HistoryStorageInterface):
 
             # Создаём новый пул под блокировкой, без использования _ensure_pool,
             # чтобы избежать рекурсивного захвата замка.
-            async with self._pool_lock:
+            async with self._bounded_lock(self._pool_lock, "pool lock (recreate)"):
                 try:
-                    pool_params = self._build_pool_params()
-                    self._pool = await asyncpg.create_pool(**pool_params)
+                    self._pool = await self._create_pool_with_timeout("force_reconnect")
                     self._perf_inc("db_reconnects_total")
                     self.logger.info("Connection pool recreated successfully after failure")
                 except Exception as e:
                     # Невозможно восстановить подключение к БД — критический уровень и проброс исключения наверх
                     self.logger.critical(f"Force reconnect failed, database remains unavailable: {e}")
                     raise
+
+    async def _terminate_stale_backends(self) -> None:
+        """
+        Снимает чужие сессии с тем же application_name.
+
+        Нужно после SIGKILL контейнера: старый backend может держать INSERT
+        часами и блокировать CREATE INDEX / новые записи. Своё соединение
+        и сессии других приложений не трогаем.
+        """
+        app_name = self._db_application_name
+        if not app_name:
+            return
+        try:
+            rows = await self._fetch(
+                """
+                SELECT pid
+                FROM pg_stat_activity
+                WHERE application_name = $1
+                  AND pid <> pg_backend_pid()
+                  AND datname = current_database()
+                """,
+                app_name,
+            )
+        except Exception as e:
+            self.logger.warning("Failed to list stale PostgreSQL backends: %s", e)
+            return
+        for row in rows:
+            pid = row["pid"]
+            try:
+                await self._execute("SELECT pg_terminate_backend($1)", pid)
+                self.logger.warning(
+                    "Terminated stale PostgreSQL backend pid=%s application_name=%s",
+                    pid,
+                    app_name,
+                )
+            except Exception as e:
+                self.logger.warning(
+                    "Failed to terminate stale PostgreSQL backend pid=%s: %s",
+                    pid,
+                    e,
+                )
+
+    async def _index_exists(self, index_name: str) -> bool:
+        val = await self._fetchval(
+            """
+            SELECT 1
+            FROM pg_indexes
+            WHERE schemaname = $1 AND indexname = $2
+            """,
+            self._schema,
+            index_name,
+        )
+        return val is not None
+
+    async def _ensure_index(self, index_name: str, sql: str) -> None:
+        """
+        Создаёт индекс только если его ещё нет. CREATE INDEX IF NOT EXISTS
+        на горячей таблице всё равно ждёт AccessExclusive/ShareLock за живым
+        INSERT и блокирует новые записи. Таймаут или lock на старте не валят процесс.
+        """
+        try:
+            if await self._index_exists(index_name):
+                return
+            await self._execute(sql)
+        except (asyncio.TimeoutError, TimeoutError) as e:
+            self.logger.warning(
+                "Skipping missing index %s during startup after timeout: %s",
+                index_name,
+                e,
+            )
+        except Exception as e:
+            self.logger.warning(
+                "Skipping missing index %s during startup: %s",
+                index_name,
+                e,
+            )
 
     async def _create_metadata_tables(self) -> None:
         """Создание единых таблиц для историзации в указанной схеме."""
@@ -1943,7 +2519,11 @@ class HistoryTimescale(HistoryStorageInterface):
                 )
             ''')
             
-            # Таблица кэша последних значений переменных
+            # Таблица кэша последних значений переменных.
+            # Инвариант: для каждой зарегистрированной переменной здесь есть строка
+            # (см. seed_last_values) — чтение последних значений не обращается к истории.
+            # is_seed=TRUE — строка-дефолт, ещё не сверенная с историей
+            # (снимается реальной записью значения или backfill_last_values).
             await self._execute(f'''
                 CREATE TABLE IF NOT EXISTS "{self._schema}".variables_last_value (
                     variable_id BIGINT PRIMARY KEY,
@@ -1955,54 +2535,109 @@ class HistoryTimescale(HistoryStorageInterface):
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
             ''')
+            await self._execute(f'''
+                ALTER TABLE "{self._schema}".variables_last_value
+                ADD COLUMN IF NOT EXISTS is_seed BOOLEAN NOT NULL DEFAULT FALSE
+            ''')
             
-            # Создаем индексы для производительности и связей
-            # Индексы для таблиц истории (bigint поля для оптимизации)
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variables_variable_id ON "{self._schema}".variables_history(variable_id)')
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variables_timestamp ON "{self._schema}".variables_history(sourcetimestamp)')
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variables_server_timestamp ON "{self._schema}".variables_history(servertimestamp)')
-            # Уникальный индекс должен включать столбцы партиционирования TimescaleDB
-            await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS idx_variables_varid_sourcets ON "{self._schema}".variables_history(variable_id, sourcetimestamp)')
-
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_events_source_id ON "{self._schema}".events_history(source_id)')
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_events_event_type_id ON "{self._schema}".events_history(event_type_id)')
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_events_timestamp ON "{self._schema}".events_history(event_timestamp)')
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_events_data_gin ON "{self._schema}".events_history USING GIN (event_data)')
-            # Уникальный индекс должен включать столбцы партиционирования TimescaleDB
-            await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS idx_events_sourceid_eventts ON "{self._schema}".events_history(source_id, event_timestamp)')
-
-            # Индексы для таблиц метаданных (bigint поля)
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variable_metadata_variable_id ON "{self._schema}".variable_metadata(variable_id)')
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_event_sources_source_id ON "{self._schema}".event_sources(source_id)')
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_event_types_event_type_id ON "{self._schema}".event_types(event_type_id)')
-            
-            # Уникальные индексы для event_sources
-            await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS idx_event_sources_node_id ON "{self._schema}".event_sources(source_node_id)')
-            
-            # Уникальный индекс для event_types по имени типа события
-            await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS idx_event_types_name ON "{self._schema}".event_types(event_type_name)')
-            
-            # Уникальный индекс для variable_metadata по node_id
-            await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS idx_variable_metadata_node_id ON "{self._schema}".variable_metadata(node_id)')
-
-            # Дополнительные индексы для оптимизации связей (bigint поля)
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variables_history_variable_id_timestamp ON "{self._schema}".variables_history(variable_id, sourcetimestamp)')
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_events_history_source_timestamp ON "{self._schema}".events_history(source_id, event_timestamp)')
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_events_history_type_source ON "{self._schema}".events_history(event_type_id, source_id)')
-
-            # Составной индекс для оптимизации поиска по типу события и источнику
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_events_history_event_type_source ON "{self._schema}".events_history(event_type_id, source_id)')
-
-            # Индексы для каскадных операций удаления
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variable_metadata_created ON "{self._schema}".variable_metadata(created_at)')
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_event_sources_created ON "{self._schema}".event_sources(created_at)')
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_event_types_created ON "{self._schema}".event_types(created_at)')
-            
-            # Индекс для кэш-таблицы последних значений
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variables_last_value_updated ON "{self._schema}".variables_last_value(updated_at)')
-            
-            # Покрывающий индекс для fallback-запросов последнего значения (без variantbinary из-за размера)
-            await self._execute(f'CREATE INDEX IF NOT EXISTS idx_variables_history_vid_ts_desc_covering ON "{self._schema}".variables_history (variable_id, sourcetimestamp DESC) INCLUDE (statuscode, varianttype, servertimestamp)')
+            schema = self._schema
+            await self._ensure_index(
+                "idx_variables_variable_id",
+                f'CREATE INDEX idx_variables_variable_id ON "{schema}".variables_history(variable_id)',
+            )
+            await self._ensure_index(
+                "idx_variables_timestamp",
+                f'CREATE INDEX idx_variables_timestamp ON "{schema}".variables_history(sourcetimestamp)',
+            )
+            await self._ensure_index(
+                "idx_variables_server_timestamp",
+                f'CREATE INDEX idx_variables_server_timestamp ON "{schema}".variables_history(servertimestamp)',
+            )
+            await self._ensure_index(
+                "idx_variables_varid_sourcets",
+                f'CREATE UNIQUE INDEX idx_variables_varid_sourcets ON "{schema}".variables_history(variable_id, sourcetimestamp)',
+            )
+            await self._ensure_index(
+                "idx_events_source_id",
+                f'CREATE INDEX idx_events_source_id ON "{schema}".events_history(source_id)',
+            )
+            await self._ensure_index(
+                "idx_events_event_type_id",
+                f'CREATE INDEX idx_events_event_type_id ON "{schema}".events_history(event_type_id)',
+            )
+            await self._ensure_index(
+                "idx_events_timestamp",
+                f'CREATE INDEX idx_events_timestamp ON "{schema}".events_history(event_timestamp)',
+            )
+            await self._ensure_index(
+                "idx_events_data_gin",
+                f'CREATE INDEX idx_events_data_gin ON "{schema}".events_history USING GIN (event_data)',
+            )
+            await self._ensure_index(
+                "idx_events_sourceid_eventts",
+                f'CREATE UNIQUE INDEX idx_events_sourceid_eventts ON "{schema}".events_history(source_id, event_timestamp)',
+            )
+            await self._ensure_index(
+                "idx_variable_metadata_variable_id",
+                f'CREATE INDEX idx_variable_metadata_variable_id ON "{schema}".variable_metadata(variable_id)',
+            )
+            await self._ensure_index(
+                "idx_event_sources_source_id",
+                f'CREATE INDEX idx_event_sources_source_id ON "{schema}".event_sources(source_id)',
+            )
+            await self._ensure_index(
+                "idx_event_types_event_type_id",
+                f'CREATE INDEX idx_event_types_event_type_id ON "{schema}".event_types(event_type_id)',
+            )
+            await self._ensure_index(
+                "idx_event_sources_node_id",
+                f'CREATE UNIQUE INDEX idx_event_sources_node_id ON "{schema}".event_sources(source_node_id)',
+            )
+            await self._ensure_index(
+                "idx_event_types_name",
+                f'CREATE UNIQUE INDEX idx_event_types_name ON "{schema}".event_types(event_type_name)',
+            )
+            await self._ensure_index(
+                "idx_variable_metadata_node_id",
+                f'CREATE UNIQUE INDEX idx_variable_metadata_node_id ON "{schema}".variable_metadata(node_id)',
+            )
+            await self._ensure_index(
+                "idx_variables_history_variable_id_timestamp",
+                f'CREATE INDEX idx_variables_history_variable_id_timestamp ON "{schema}".variables_history(variable_id, sourcetimestamp)',
+            )
+            await self._ensure_index(
+                "idx_events_history_source_timestamp",
+                f'CREATE INDEX idx_events_history_source_timestamp ON "{schema}".events_history(source_id, event_timestamp)',
+            )
+            await self._ensure_index(
+                "idx_events_history_type_source",
+                f'CREATE INDEX idx_events_history_type_source ON "{schema}".events_history(event_type_id, source_id)',
+            )
+            await self._ensure_index(
+                "idx_events_history_event_type_source",
+                f'CREATE INDEX idx_events_history_event_type_source ON "{schema}".events_history(event_type_id, source_id)',
+            )
+            await self._ensure_index(
+                "idx_variable_metadata_created",
+                f'CREATE INDEX idx_variable_metadata_created ON "{schema}".variable_metadata(created_at)',
+            )
+            await self._ensure_index(
+                "idx_event_sources_created",
+                f'CREATE INDEX idx_event_sources_created ON "{schema}".event_sources(created_at)',
+            )
+            await self._ensure_index(
+                "idx_event_types_created",
+                f'CREATE INDEX idx_event_types_created ON "{schema}".event_types(created_at)',
+            )
+            await self._ensure_index(
+                "idx_variables_last_value_updated",
+                f'CREATE INDEX idx_variables_last_value_updated ON "{schema}".variables_last_value(updated_at)',
+            )
+            await self._ensure_index(
+                "idx_variables_history_vid_ts_desc_covering",
+                f'CREATE INDEX idx_variables_history_vid_ts_desc_covering ON "{schema}".variables_history '
+                f'(variable_id, sourcetimestamp DESC) INCLUDE (statuscode, varianttype, servertimestamp)',
+            )
             
             self.logger.info(f"Unified history tables created successfully in schema '{self._schema}'")
             
@@ -2238,75 +2873,79 @@ class HistoryTimescale(HistoryStorageInterface):
             for it in items
         ]
 
-        # Делаем до двух попыток записи батча: первая — с текущим пулом,
-        # вторая — после принудительного реконнекта при ошибке.
+        flush_timeout = self._flush_op_timeout_sec()
+        # Две попытки: первая — с текущим пулом, вторая — после реконнекта
+        # (таймаут обрабатывается так же, как ошибка SQL; батч не выбрасывается сразу).
         for attempt in (1, 2):
             await self._ensure_pool()
             failed_pool = self._pool
             try:
                 async def _op() -> None:
-                    async with failed_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
-                        async with conn.transaction():
-                            insert_started_at = time.perf_counter()
-                            await conn.executemany(
-                                f'INSERT INTO "{self._schema}".variables_history '
-                                f'(variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) '
-                                f'VALUES ($1, $2, $3, $4, $5, $6, $7) '
-                                f'ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
-                                history_params,
-                                timeout=self._db_query_timeout_sec,
-                            )
-                            self._perf_observe_ms(
-                                "variable_insert_history",
-                                (time.perf_counter() - insert_started_at) * 1000.0,
-                            )
+                    async with self._flush_on_connection(failed_pool) as conn:
+                        insert_started_at = time.perf_counter()
+                        await conn.executemany(
+                            f'INSERT INTO "{self._schema}".variables_history '
+                            f'(variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) '
+                            f'VALUES ($1, $2, $3, $4, $5, $6, $7) '
+                            f'ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
+                            history_params,
+                            timeout=flush_timeout,
+                        )
+                        self._perf_observe_ms(
+                            "variable_insert_history",
+                            (time.perf_counter() - insert_started_at) * 1000.0,
+                        )
 
-                            upsert_started_at = time.perf_counter()
-                            await conn.executemany(
-                                f'''
-                                INSERT INTO "{self._schema}".variables_last_value
-                                    (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
-                                VALUES ($1, $2, $3, $4, $5, $6)
-                                ON CONFLICT (variable_id) DO UPDATE
-                                    SET sourcetimestamp = EXCLUDED.sourcetimestamp,
-                                        servertimestamp = EXCLUDED.servertimestamp,
-                                        statuscode = EXCLUDED.statuscode,
-                                        varianttype = EXCLUDED.varianttype,
-                                        variantbinary = EXCLUDED.variantbinary,
-                                        updated_at = NOW()
-                                    WHERE "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
-                                ''',
-                                last_value_params,
-                                timeout=self._db_query_timeout_sec,
-                            )
-                            self._perf_observe_ms(
-                                "variable_upsert_last_value",
-                                (time.perf_counter() - upsert_started_at) * 1000.0,
-                            )
+                        upsert_started_at = time.perf_counter()
+                        await conn.executemany(
+                            f'''
+                            INSERT INTO "{self._schema}".variables_last_value
+                                (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
+                            VALUES ($1, $2, $3, $4, $5, $6)
+                            ON CONFLICT (variable_id) DO UPDATE
+                                SET sourcetimestamp = EXCLUDED.sourcetimestamp,
+                                    servertimestamp = EXCLUDED.servertimestamp,
+                                    statuscode = EXCLUDED.statuscode,
+                                    varianttype = EXCLUDED.varianttype,
+                                    variantbinary = EXCLUDED.variantbinary,
+                                    is_seed = FALSE,
+                                    updated_at = NOW()
+                                WHERE "{self._schema}".variables_last_value.is_seed
+                                   OR "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
+                            ''',
+                            last_value_params,
+                            timeout=flush_timeout,
+                        )
+                        self._perf_observe_ms(
+                            "variable_upsert_last_value",
+                            (time.perf_counter() - upsert_started_at) * 1000.0,
+                        )
                 flush_started_at = time.perf_counter()
-                await self._run_db_operation(_op(), "flush variable batch")
+                await self._run_db_operation(
+                    _op(),
+                    "flush variable batch",
+                    timeout=flush_timeout,
+                    layer="flush",
+                )
                 self._perf_observe_ms(
                     "variable_flush_total",
                     (time.perf_counter() - flush_started_at) * 1000.0,
                 )
 
-                # Успешная запись батча — считаем, что соединение восстановлено
                 self._log_connection_restored_if_needed()
 
-                # Обновляем in-memory кэш последних значений
                 for it in items:
                     self._update_last_values_cache(it.variable_id, it.datavalue)
                 return
             except Exception as e:
                 if attempt == 1:
-                    if isinstance(e, asyncio.TimeoutError):
-                        self.logger.error(f"Flush variable batch timed out, will reconnect without retrying: {e}")
-                        await self._force_reconnect(failed_pool)
-                        raise
-                    self.logger.error(f"Flush variable batch failed, will try to reconnect and retry: {e}")
+                    self.logger.error(
+                        "Flush variable batch failed, will reconnect and retry: %s",
+                        e,
+                    )
                     await self._force_reconnect(failed_pool)
                 else:
-                    self.logger.error(f"Flush variable batch failed after reconnect: {e}")
+                    self.logger.error("Flush variable batch failed after reconnect: %s", e)
                     raise
 
     async def _flush_event_batch(self, items: List[EventWriteItem]) -> None:
@@ -2326,30 +2965,33 @@ class HistoryTimescale(HistoryStorageInterface):
             for it in items
         ]
 
-        # Делаем до двух попыток записи батча: первая — с текущим пулом,
-        # вторая — после принудительного реконнекта при ошибке.
+        flush_timeout = self._flush_op_timeout_sec()
         for attempt in (1, 2):
             await self._ensure_pool()
             failed_pool = self._pool
             try:
                 async def _op() -> None:
-                    async with failed_pool.acquire(timeout=self._db_query_timeout_sec) as conn:
-                        async with conn.transaction():
-                            insert_started_at = time.perf_counter()
-                            await conn.executemany(
-                                f'INSERT INTO "{self._schema}".events_history '
-                                f'(source_id, event_type_id, event_timestamp, event_data) '
-                                f'VALUES ($1, $2, $3, $4) '
-                                f'ON CONFLICT (source_id, event_timestamp) DO NOTHING',
-                                params,
-                                timeout=self._db_query_timeout_sec,
-                            )
-                            self._perf_observe_ms(
-                                "event_insert_history",
-                                (time.perf_counter() - insert_started_at) * 1000.0,
-                            )
+                    async with self._flush_on_connection(failed_pool) as conn:
+                        insert_started_at = time.perf_counter()
+                        await conn.executemany(
+                            f'INSERT INTO "{self._schema}".events_history '
+                            f'(source_id, event_type_id, event_timestamp, event_data) '
+                            f'VALUES ($1, $2, $3, $4) '
+                            f'ON CONFLICT (source_id, event_timestamp) DO NOTHING',
+                            params,
+                            timeout=flush_timeout,
+                        )
+                        self._perf_observe_ms(
+                            "event_insert_history",
+                            (time.perf_counter() - insert_started_at) * 1000.0,
+                        )
                 flush_started_at = time.perf_counter()
-                await self._run_db_operation(_op(), "flush event batch")
+                await self._run_db_operation(
+                    _op(),
+                    "flush event batch",
+                    timeout=flush_timeout,
+                    layer="flush",
+                )
                 self._perf_observe_ms(
                     "event_flush_total",
                     (time.perf_counter() - flush_started_at) * 1000.0,
@@ -2357,14 +2999,13 @@ class HistoryTimescale(HistoryStorageInterface):
                 return
             except Exception as e:
                 if attempt == 1:
-                    if isinstance(e, asyncio.TimeoutError):
-                        self.logger.error(f"Flush event batch timed out, will reconnect without retrying: {e}")
-                        await self._force_reconnect(failed_pool)
-                        raise
-                    self.logger.error(f"Flush event batch failed, will try to reconnect and retry: {e}")
+                    self.logger.error(
+                        "Flush event batch failed, will reconnect and retry: %s",
+                        e,
+                    )
                     await self._force_reconnect(failed_pool)
                 else:
-                    self.logger.error(f"Flush event batch failed after reconnect: {e}")
+                    self.logger.error("Flush event batch failed after reconnect: %s", e)
                     raise
 
     async def _save_variable_metadata(self, node_id: ua.NodeId, period: Optional[timedelta], count: int) -> int:
@@ -2789,21 +3430,94 @@ class HistoryTimescale(HistoryStorageInterface):
 
         try:
             effective_period = self._get_effective_retention_period(period)
-            # Сохраняем метаданные переменной и получаем variable_id
-            variable_id = await self._save_variable_metadata(node_id, effective_period, count)
+            node_id_str = self._format_node_id(node_id)
+            # Если variable_id уже есть в кэше метаданных (прогревается из БД при init),
+            # upsert не нужен: retention применяется глобально через Timescale policy,
+            # а data_type обновляется при сохранении значения.
+            variable_id = self._variable_metadata_cache.get(node_id_str)
+            if variable_id is None:
+                variable_id = await self._save_variable_metadata(node_id, effective_period, count)
 
             # Сохраняем mapping node_id -> variable_id для быстрого доступа
             self._datachanges_period[node_id] = (effective_period, count, variable_id)
 
             if self.suppress_initial_datachange:
-                node_id_str = self._format_node_id(node_id)
                 self._pending_initial_datachange_skip[node_id_str] = True
 
             #self.logger.info(f"Variable node {node_id} registered for historization in unified table (variable_id: {variable_id})")
         except Exception as e:
             self.logger.error(f"Failed to register variable node {node_id}: {e}")
             raise
-    
+
+    async def new_historized_nodes(
+        self,
+        node_ids: List[ua.NodeId],
+        period: Optional[timedelta],
+        count: int = 0
+    ) -> None:
+        """
+        Батчевая регистрация узлов для историзации: один SQL-запрос на все узлы,
+        отсутствующие в кэше метаданных, вместо upsert-роундтрипа на каждый узел.
+
+        Семантика идентична последовательным вызовам new_historized_node()
+        с одинаковыми period/count.
+
+        Args:
+            node_ids: Список идентификаторов узлов OPC UA
+            period: Период хранения данных (None для бесконечного хранения)
+            count: Максимальное количество записей (0 для неограниченного)
+        """
+        effective_period = self._get_effective_retention_period(period)
+
+        # Дедупликация по строковому node_id с сохранением порядка
+        pairs: List[Tuple[ua.NodeId, str]] = []
+        seen: set = set()
+        for node_id in node_ids:
+            node_id_str = self._format_node_id(node_id)
+            if node_id_str in seen:
+                continue
+            seen.add(node_id_str)
+            pairs.append((node_id, node_id_str))
+
+        to_upsert = [node_id_str for _, node_id_str in pairs
+                     if node_id_str not in self._variable_metadata_cache]
+        if to_upsert:
+            # data_type при конфликте не сбрасываем в 'Unknown': реальный тип
+            # уже определён при сохранении значений и не должен теряться
+            rows = await self._fetch(f'''
+                INSERT INTO "{self._schema}".variable_metadata (node_id, data_type, retention_period, max_records)
+                SELECT t.node_id, 'Unknown', $2, $3
+                FROM unnest($1::text[]) AS t(node_id)
+                ON CONFLICT (node_id) DO UPDATE SET
+                    retention_period = EXCLUDED.retention_period,
+                    max_records = EXCLUDED.max_records,
+                    updated_at = NOW()
+                RETURNING node_id, variable_id
+            ''', to_upsert, effective_period, count)
+            for row in rows:
+                self._variable_metadata_cache[row["node_id"]] = row["variable_id"]
+
+        missing: List[ua.NodeId] = []
+        registered = 0
+        for node_id, node_id_str in pairs:
+            variable_id = self._variable_metadata_cache.get(node_id_str)
+            if variable_id is None:
+                missing.append(node_id)
+                continue
+            self._datachanges_period[node_id] = (effective_period, count, variable_id)
+            if self.suppress_initial_datachange:
+                self._pending_initial_datachange_skip[node_id_str] = True
+            registered += 1
+
+        # Фоллбэк на поштучную регистрацию (не должен срабатывать в норме)
+        for node_id in missing:
+            await self.new_historized_node(node_id, period, count)
+
+        self.logger.info(
+            "Bulk historized-node registration: %d nodes (%d upserted, %d fallback)",
+            registered + len(missing), len(to_upsert), len(missing),
+        )
+
     async def new_historized_event(
         self,
         source_id: ua.NodeId,
@@ -2962,7 +3676,7 @@ class HistoryTimescale(HistoryStorageInterface):
                 )
 
                 await self._execute(f'''
-                    INSERT INTO "{self._schema}".variables_last_value 
+                    INSERT INTO "{self._schema}".variables_last_value
                     (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
                     VALUES ($1, $2, $3, $4, $5, $6)
                     ON CONFLICT (variable_id) DO UPDATE
@@ -2971,8 +3685,10 @@ class HistoryTimescale(HistoryStorageInterface):
                             statuscode = EXCLUDED.statuscode,
                             varianttype = EXCLUDED.varianttype,
                             variantbinary = EXCLUDED.variantbinary,
+                            is_seed = FALSE,
                             updated_at = NOW()
-                        WHERE "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
+                        WHERE "{self._schema}".variables_last_value.is_seed
+                           OR "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
                 ''', variable_id, datavalue.SourceTimestamp, datavalue.ServerTimestamp,
                     datavalue.StatusCode.value, variant_type, variant_binary)
 
@@ -3520,13 +4236,28 @@ class HistoryTimescale(HistoryStorageInterface):
             self.logger.error(f"Failed to read last value for {node_id}: {e}")
             return None
 
-    async def read_last_values(self, node_ids: List[ua.NodeId]) -> dict:
+    async def read_last_values(
+        self,
+        node_ids: List[ua.NodeId],
+        history_lookback: Optional[timedelta] = None,
+        *,
+        allow_history_fallback: bool = True,
+    ) -> dict:
         """
         Быстрое получение последних сохраненных значений для списка переменных.
-        
+
         Args:
             node_ids: Список идентификаторов узлов OPC UA
-            
+            history_lookback: Ограничение фоллбэк-чтения из variables_history
+                последними history_lookback времени. Позволяет TimescaleDB
+                исключить старые чанки: без ограничения переменные, у которых
+                нет данных вообще, заставляют пробегать индексы всех чанков.
+                None — без ограничения (полная история).
+            allow_history_fallback: Если False — только memory/variables_last_value,
+                без LATERAL по hypertable. Нужен для bulk-restore при старте:
+                фоллбэк по тысячам «пустых» переменных иначе упирается в
+                db_query_timeout и рвёт пул соединений.
+
         Returns:
             Словарь {node_id: DataValue} или {node_id: None} для отсутствующих
         """
@@ -3622,40 +4353,94 @@ class HistoryTimescale(HistoryStorageInterface):
                 self._update_last_values_cache(variable_id, dv)
                 self._cache_stats["last_values_table_hits"] += 1
             
-            # Fallback для узлов, которых нет ни в памяти, ни в таблице кэша
+            # Fallback для узлов, которых нет ни в памяти, ни в таблице кэша.
+            # LATERAL top-1 на каждый variable_id: планировщик идёт по индексу
+            # (variable_id, sourcetimestamp DESC) от новых чанков к старым и
+            # останавливается на первом значении. DISTINCT ON ... ORDER BY на
+            # hypertable с большим числом чанков деградирует до слияния индексов
+            # всех чанков (секунды на вызов).
             missing_variable_ids = [vid for vid in remaining_variable_ids if vid not in cached_variable_ids]
+            if missing_variable_ids and not allow_history_fallback:
+                self._cache_stats["last_values_history_fallbacks_skipped"] = (
+                    self._cache_stats.get("last_values_history_fallbacks_skipped", 0)
+                    + len(missing_variable_ids)
+                )
+                missing_variable_ids = []
             if missing_variable_ids:
-                fallback_rows = await self._fetch(f'''
-                    SELECT DISTINCT ON (variable_id) variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype
-                    FROM "{self._schema}".variables_history
-                    WHERE variable_id = ANY($1)
-                    ORDER BY variable_id, sourcetimestamp DESC
-                ''', missing_variable_ids)
-                
+                if history_lookback is not None:
+                    since = datetime.now(timezone.utc) - history_lookback
+                    fallback_rows = await self._fetch(f'''
+                        SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
+                               h.statuscode, h.varianttype, h.variantbinary
+                        FROM unnest($1::bigint[]) AS v(variable_id)
+                        CROSS JOIN LATERAL (
+                            SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                            FROM "{self._schema}".variables_history
+                            WHERE variable_id = v.variable_id
+                              AND sourcetimestamp >= $2
+                            ORDER BY sourcetimestamp DESC
+                            LIMIT 1
+                        ) h
+                    ''', missing_variable_ids, since)
+                else:
+                    fallback_rows = await self._fetch(f'''
+                        SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
+                               h.statuscode, h.varianttype, h.variantbinary
+                        FROM unnest($1::bigint[]) AS v(variable_id)
+                        CROSS JOIN LATERAL (
+                            SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                            FROM "{self._schema}".variables_history
+                            WHERE variable_id = v.variable_id
+                            ORDER BY sourcetimestamp DESC
+                            LIMIT 1
+                        ) h
+                    ''', missing_variable_ids)
+
                 if fallback_rows:
                     self._cache_stats["last_values_history_fallbacks"] += len(fallback_rows)
+                    # Самозалечивание: найденное фоллбэком фиксируем в таблице-кэше
+                    # variables_last_value, чтобы при следующих чтениях (и рестартах)
+                    # фоллбэк по истории для этих переменных больше не требовался
+                    try:
+                        await self._execute(f'''
+                            INSERT INTO "{self._schema}".variables_last_value
+                            (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
+                            SELECT * FROM unnest(
+                                $1::bigint[], $2::timestamptz[], $3::timestamptz[],
+                                $4::integer[], $5::integer[], $6::bytea[]
+                            )
+                            ON CONFLICT (variable_id) DO UPDATE
+                                SET sourcetimestamp = EXCLUDED.sourcetimestamp,
+                                    servertimestamp = EXCLUDED.servertimestamp,
+                                    statuscode = EXCLUDED.statuscode,
+                                    varianttype = EXCLUDED.varianttype,
+                                    variantbinary = EXCLUDED.variantbinary,
+                                    is_seed = FALSE,
+                                    updated_at = NOW()
+                                WHERE "{self._schema}".variables_last_value.is_seed
+                                   OR "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
+                        ''',
+                            [r['variable_id'] for r in fallback_rows],
+                            [r['sourcetimestamp'] for r in fallback_rows],
+                            [r['servertimestamp'] for r in fallback_rows],
+                            [r['statuscode'] for r in fallback_rows],
+                            [r['varianttype'] for r in fallback_rows],
+                            [r['variantbinary'] for r in fallback_rows],
+                        )
+                    except Exception as e:
+                        self.logger.debug(f"Failed to backfill variables_last_value from fallback: {e}")
 
                 for row in fallback_rows:
                     variable_id = row['variable_id']
                     node_id = node_to_variable[variable_id]
-                    
-                    # Получаем variantbinary отдельным запросом
-                    variantbinary_row = await self._fetchrow(f'''
-                        SELECT variantbinary
-                        FROM "{self._schema}".variables_history
-                        WHERE variable_id = $1 AND sourcetimestamp = $2
-                        LIMIT 1
-                    ''', variable_id, row['sourcetimestamp'])
-                    
-                    if variantbinary_row is not None:
-                        dv = ua.DataValue(
-                            Value=variant_from_binary(Buffer(variantbinary_row['variantbinary'])),
-                            StatusCode_=ua.StatusCode(row['statuscode']),
-                            SourceTimestamp=row['sourcetimestamp'],
-                            ServerTimestamp=row['servertimestamp']
-                        )
-                        result[node_id] = dv
-                        self._update_last_values_cache(variable_id, dv)
+                    dv = ua.DataValue(
+                        Value=variant_from_binary(Buffer(row['variantbinary'])),
+                        StatusCode_=ua.StatusCode(row['statuscode']),
+                        SourceTimestamp=row['sourcetimestamp'],
+                        ServerTimestamp=row['servertimestamp']
+                    )
+                    result[node_id] = dv
+                    self._update_last_values_cache(variable_id, dv)
             
             # Заполняем None для узлов, которых вообще нет в истории
             for node_id in node_ids:
@@ -3668,6 +4453,277 @@ class HistoryTimescale(HistoryStorageInterface):
             self.logger.error(f"Failed to read last values: {e}")
             # Возвращаем None для всех узлов при ошибке
             return {node_id: None for node_id in node_ids}
+
+    def _resolve_variable_id_cached(self, node_id: ua.NodeId) -> Optional[int]:
+        """variable_id из mapping историзации или кэша метаданных, без обращения к БД."""
+        node_data = self._datachanges_period.get(node_id)
+        if node_data is not None and len(node_data) == 3:
+            return node_data[2]
+        return self._variable_metadata_cache.get(self._format_node_id(node_id))
+
+    async def seed_last_values(self, items: List[Tuple[ua.NodeId, ua.DataValue]]) -> int:
+        """
+        Гарантирует строку в variables_last_value для каждой переданной переменной:
+        вставляет значение по умолчанию с is_seed=TRUE, НЕ трогая существующие
+        строки (ON CONFLICT DO NOTHING). Вместе с backfill_last_values поддерживает
+        инвариант «у каждой зарегистрированной переменной есть строка последнего
+        значения», благодаря которому чтение последних значений никогда не
+        обращается к таблице истории.
+
+        Args:
+            items: Пары (node_id, DataValue с текущим/дефолтным значением узла)
+
+        Returns:
+            Число вставленных строк-сидов.
+        """
+        now = datetime.now(timezone.utc)
+        vids: List[int] = []
+        source_ts: List[datetime] = []
+        server_ts: List[datetime] = []
+        statuscodes: List[int] = []
+        varianttypes: List[int] = []
+        binaries: List[bytes] = []
+        seen: set = set()
+        dv_by_vid: Dict[int, ua.DataValue] = {}
+        for node_id, dv in items:
+            variable_id = self._resolve_variable_id_cached(node_id)
+            if variable_id is None or variable_id in seen:
+                continue
+            try:
+                variant = getattr(dv, 'Value', None) if dv is not None else None
+                if variant is None:
+                    variant = ua.Variant(None)
+                binary = variant_to_binary(variant)
+            except Exception as e:
+                self.logger.debug(f"seed_last_values: cannot serialize value for {node_id}: {e}")
+                continue
+            seen.add(variable_id)
+            vids.append(variable_id)
+            source_ts.append(getattr(dv, 'SourceTimestamp', None) or now)
+            server_ts.append(getattr(dv, 'ServerTimestamp', None) or now)
+            sc = getattr(dv, 'StatusCode', None)
+            statuscodes.append(sc.value if sc is not None else 0)
+            varianttypes.append(variant.VariantType.value)
+            binaries.append(binary)
+            dv_by_vid[variable_id] = dv
+
+        if not vids:
+            return 0
+
+        rows = await self._fetch(f'''
+            INSERT INTO "{self._schema}".variables_last_value
+                (variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary, is_seed)
+            SELECT u.variable_id, u.sourcetimestamp, u.servertimestamp,
+                   u.statuscode, u.varianttype, u.variantbinary, TRUE
+            FROM unnest(
+                $1::bigint[], $2::timestamptz[], $3::timestamptz[],
+                $4::integer[], $5::integer[], $6::bytea[]
+            ) AS u(variable_id, sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary)
+            ON CONFLICT (variable_id) DO NOTHING
+            RETURNING variable_id
+        ''', vids, source_ts, server_ts, statuscodes, varianttypes, binaries)
+
+        inserted = len(rows)
+        for row in rows:
+            dv = dv_by_vid.get(row['variable_id'])
+            if dv is not None:
+                self._update_last_values_cache(row['variable_id'], dv)
+        self.logger.info(
+            "seed_last_values: %d of %d rows seeded (existing preserved)",
+            inserted, len(vids),
+        )
+        return inserted
+
+    async def backfill_last_values(
+        self,
+        *,
+        chunk_size: int = 100,
+        pause_sec: float = 0.5,
+        query_timeout_sec: float = 120.0,
+        history_lookback: Optional[timedelta] = None,
+        on_chunk_restored: Optional[
+            Callable[[List[Tuple[str, ua.DataValue]]], Union[Coroutine[Any, Any, Any], Any]]
+        ] = None,
+    ) -> dict:
+        """
+        Фоновая идемпотентная сверка variables_last_value с историей:
+          - зарегистрированным переменным без строки добавляется последнее
+            значение из истории (если оно есть);
+          - строки-сиды (is_seed=TRUE) замещаются реальным последним значением
+            из истории; сиды без истории помечаются сверенными (is_seed=FALSE).
+
+        LATERAL по hypertable выполняется только для кандидатов и (при заданном
+        history_lookback) с time predicate для chunk exclusion. По умолчанию
+        мелкие чанки (100), чтобы не упираться в db_query_timeout.
+
+        Args:
+            chunk_size: размер батча variable_id
+            pause_sec: пауза между чанками (снижение нагрузки на пул)
+            query_timeout_sec: таймаут acquire/SQL на чанк
+            history_lookback: ограничить поиск в истории (None — вся история)
+            on_chunk_restored: async/sync callback со списком
+                (node_id_str, DataValue) для применения в address space
+
+        Returns:
+            Статистика: candidates, restored_from_history, confirmed_defaults,
+            errors, restored_items (list[(node_id_str, DataValue)])
+        """
+        await self._ensure_pool()
+        # Только строки-сиды: отсутствующие last_value должен создавать seed_last_values
+        # при historize. Иначе orphan metadata без истории вечно гоняет LATERAL.
+        rows = await self._fetch(f'''
+            SELECT m.variable_id, m.node_id
+            FROM "{self._schema}".variable_metadata m
+            INNER JOIN "{self._schema}".variables_last_value lv ON lv.variable_id = m.variable_id
+            WHERE lv.is_seed
+            ORDER BY m.variable_id
+        ''')
+        candidate_ids = [r['variable_id'] for r in rows]
+        node_id_by_vid = {r['variable_id']: r['node_id'] for r in rows}
+        stats = {
+            "candidates": len(candidate_ids),
+            "restored_from_history": 0,
+            "confirmed_defaults": 0,
+            "errors": 0,
+            "restored_items": [],
+        }
+        if not candidate_ids:
+            return stats
+        since = None
+        if history_lookback is not None:
+            since = datetime.now(timezone.utc) - history_lookback
+        self.logger.info(
+            "Backfill variables_last_value: %d candidates (chunk=%d, lookback=%s)",
+            len(candidate_ids),
+            max(1, int(chunk_size)),
+            history_lookback if history_lookback is not None else "full",
+        )
+
+        chunk_size = max(1, int(chunk_size))
+        for i in range(0, len(candidate_ids), chunk_size):
+            chunk = candidate_ids[i:i + chunk_size]
+            try:
+                pool = self._pool
+
+                async def _op(chunk_ids=chunk):
+                    async with pool.acquire(timeout=query_timeout_sec) as conn:
+                        if since is not None:
+                            found = await conn.fetch(f'''
+                                SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
+                                       h.statuscode, h.varianttype, h.variantbinary
+                                FROM unnest($1::bigint[]) AS v(variable_id)
+                                CROSS JOIN LATERAL (
+                                    SELECT sourcetimestamp, servertimestamp, statuscode,
+                                           varianttype, variantbinary
+                                    FROM "{self._schema}".variables_history
+                                    WHERE variable_id = v.variable_id
+                                      AND sourcetimestamp >= $2
+                                    ORDER BY sourcetimestamp DESC
+                                    LIMIT 1
+                                ) h
+                            ''', chunk_ids, since, timeout=query_timeout_sec)
+                        else:
+                            found = await conn.fetch(f'''
+                                SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
+                                       h.statuscode, h.varianttype, h.variantbinary
+                                FROM unnest($1::bigint[]) AS v(variable_id)
+                                CROSS JOIN LATERAL (
+                                    SELECT sourcetimestamp, servertimestamp, statuscode,
+                                           varianttype, variantbinary
+                                    FROM "{self._schema}".variables_history
+                                    WHERE variable_id = v.variable_id
+                                    ORDER BY sourcetimestamp DESC
+                                    LIMIT 1
+                                ) h
+                            ''', chunk_ids, timeout=query_timeout_sec)
+                        if found:
+                            await conn.execute(f'''
+                                INSERT INTO "{self._schema}".variables_last_value
+                                    (variable_id, sourcetimestamp, servertimestamp, statuscode,
+                                     varianttype, variantbinary)
+                                SELECT * FROM unnest(
+                                    $1::bigint[], $2::timestamptz[], $3::timestamptz[],
+                                    $4::integer[], $5::integer[], $6::bytea[]
+                                )
+                                ON CONFLICT (variable_id) DO UPDATE
+                                    SET sourcetimestamp = EXCLUDED.sourcetimestamp,
+                                        servertimestamp = EXCLUDED.servertimestamp,
+                                        statuscode = EXCLUDED.statuscode,
+                                        varianttype = EXCLUDED.varianttype,
+                                        variantbinary = EXCLUDED.variantbinary,
+                                        is_seed = FALSE,
+                                        updated_at = NOW()
+                                    WHERE "{self._schema}".variables_last_value.is_seed
+                                       OR "{self._schema}".variables_last_value.sourcetimestamp
+                                          <= EXCLUDED.sourcetimestamp
+                            ''',
+                                [r['variable_id'] for r in found],
+                                [r['sourcetimestamp'] for r in found],
+                                [r['servertimestamp'] for r in found],
+                                [r['statuscode'] for r in found],
+                                [r['varianttype'] for r in found],
+                                [r['variantbinary'] for r in found],
+                                timeout=query_timeout_sec,
+                            )
+                        # Сиды без истории в этом окне — считаем сверенными
+                        await conn.execute(f'''
+                            UPDATE "{self._schema}".variables_last_value
+                            SET is_seed = FALSE
+                            WHERE variable_id = ANY($1) AND is_seed
+                        ''', chunk_ids, timeout=query_timeout_sec)
+                        return found
+
+                found = await asyncio.wait_for(_op(), timeout=query_timeout_sec * 2)
+                stats["restored_from_history"] += len(found)
+                stats["confirmed_defaults"] += len(chunk) - len(found)
+
+                chunk_items: List[Tuple[str, ua.DataValue]] = []
+                for row in found:
+                    node_id_str = node_id_by_vid.get(row['variable_id'])
+                    if not node_id_str:
+                        continue
+                    try:
+                        dv = ua.DataValue(
+                            Value=variant_from_binary(Buffer(row['variantbinary'])),
+                            StatusCode_=ua.StatusCode(row['statuscode']),
+                            SourceTimestamp=row['sourcetimestamp'],
+                            ServerTimestamp=row['servertimestamp'],
+                        )
+                    except Exception as e:
+                        self.logger.debug(
+                            "Backfill: cannot decode value for %s: %s", node_id_str, e
+                        )
+                        continue
+                    self._update_last_values_cache(row['variable_id'], dv)
+                    item = (node_id_str, dv)
+                    chunk_items.append(item)
+                    # Полный список — только без callback (иначе O(N) память на десятки тысяч)
+                    if on_chunk_restored is None:
+                        stats["restored_items"].append(item)
+
+                if chunk_items and on_chunk_restored is not None:
+                    try:
+                        result = on_chunk_restored(chunk_items)
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception as e:
+                        self.logger.warning(
+                            "Backfill on_chunk_restored failed (%d items): %r",
+                            len(chunk_items), e,
+                        )
+            except Exception as e:
+                stats["errors"] += 1
+                self.logger.warning("Backfill chunk failed (%d ids): %r", len(chunk), e)
+            if pause_sec > 0:
+                await asyncio.sleep(pause_sec)
+
+        # Не засорять лог полным списком DataValue
+        log_stats = {
+            k: v for k, v in stats.items() if k != "restored_items"
+        }
+        log_stats["restored_items_count"] = len(stats["restored_items"])
+        self.logger.info("Backfill variables_last_value done: %s", log_stats)
+        return stats
 
     async def close(self) -> None:
         """Закрытие модуля историзации"""

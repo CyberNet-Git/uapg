@@ -6,6 +6,9 @@
 - Env (VibroIoT defaults в `config.py`):
   - `HISTORY_STORAGE_VERSION=v1|v2` (default `v1`)
   - `UAPG_EVENTS_STORAGE_MODE=legacy|dual|v2`
+    - `dual` — рекомендуемый режим; запись payload + индекс/typed.
+    - `v2` — тот же путь записи payload (`uapg_save_event_v2` → `events_history.event_data`); без payload HistoryRead отдаёт пустые поля.
+    - Не путать с «только events_ts без JSONB» — гидратация HistoryRead всё ещё идёт через `legacy_row_id` → `events_history`.
   - `UAPG_EVENTS_INDEXED_FIELDS` — btree-индексы typed columns (CSV)
   - `UAPG_EVENTS_SQL_FILTER_FIELDS` — whitelist SQL push-down + OPC capability node
   - `UAPG_EVENTS_FIELD_ALIASES` — `api_name:column_name` (опционально)
