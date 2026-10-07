@@ -8,7 +8,63 @@ import json
 from pathlib import Path
 from unittest.mock import Mock, patch, AsyncMock
 
+import psycopg
+
 from uapg.db_manager import DatabaseManager
+
+# conftest подменяет psycopg заглушкой, когда пакета нет (это опциональная
+# зависимость DatabaseManager). Тесты create_database опираются на настоящую
+# композицию psycopg.sql и классы ошибок, поэтому на заглушке их пропускаем.
+_REAL_PSYCOPG = type(psycopg).__name__ == "module"
+requires_psycopg = pytest.mark.skipif(
+    not _REAL_PSYCOPG, reason="нужен настоящий psycopg, а не заглушка из conftest"
+)
+
+
+class _FakeCursor:
+    """Курсор psycopg3: контекстный менеджер, пишет выполненные запросы."""
+
+    def __init__(self, errors=None):
+        self.statements = []
+        self.errors = list(errors or [])
+        self.closed_by_context = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.closed_by_context = True
+        return False
+
+    def execute(self, statement, *args):
+        self.statements.append(statement)
+        if self.errors:
+            error = self.errors.pop(0)
+            if error is not None:
+                raise error("already exists")
+
+
+class _FakeConnection:
+    """Соединение psycopg3. set_isolation_level — API psycopg2, его быть не должно."""
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.entered = False
+        self.exited = False
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def __exit__(self, *exc_info):
+        self.exited = True
+        return False
+
+    def cursor(self):
+        return self._cursor
+
+    def set_isolation_level(self, *args, **kwargs):
+        raise AssertionError("set_isolation_level — API psycopg2, в psycopg3 его нет")
 
 _CONN_CONFIG = {
     'user': 'test_user',
@@ -138,24 +194,20 @@ class TestDatabaseManager:
         info = await self.db_manager.get_database_info()
         assert info == {"error": "No database configuration found"}
     
+    @requires_psycopg
     async def test_create_database_mock(self):
-        """Тест создания базы данных с моком.
+        """Создание пользователя и БД идёт по API psycopg3.
 
-        Административные команды идут через psycopg, схема — через asyncpg.
-
-        ВНИМАНИЕ: conftest подменяет модуль psycopg на Mock, поэтому этот тест
-        не проверяет совместимость с настоящим psycopg3. В create_database
-        используется psycopg.ISOLATION_LEVEL_AUTOCOMMIT, которого в psycopg3 нет
-        (это API psycopg2), так что на живой установке вызов упадёт в собственный
-        except и вернёт False. Чинится отдельно.
+        Раньше здесь вызывался set_isolation_level(psycopg.ISOLATION_LEVEL_AUTOCOMMIT) —
+        API psycopg2, которого в psycopg3 нет: на живой установке вызов падал с
+        AttributeError в собственный except и возвращал False. В тестах это было не
+        видно, потому что conftest подменял модуль psycopg заглушкой.
         """
-        mock_cursor = Mock()
-        mock_conn = Mock()
-        mock_conn.cursor.return_value = mock_cursor
-        mock_async_conn = AsyncMock()
-        mock_async_connect = AsyncMock(return_value=mock_async_conn)
+        cursor = _FakeCursor()
+        conn = _FakeConnection(cursor)
+        mock_async_connect = AsyncMock(return_value=AsyncMock())
 
-        with patch('uapg.db_manager.psycopg.connect', return_value=mock_conn) as mock_connect, \
+        with patch('uapg.db_manager.psycopg.connect', return_value=conn) as mock_connect, \
              patch('uapg.db_manager.asyncpg.connect', new=mock_async_connect):
             success = await self.db_manager.create_database(
                 user="test_user",
@@ -163,15 +215,61 @@ class TestDatabaseManager:
                 database="test_db"
             )
 
-            assert success
-            mock_connect.assert_called_once()
-            mock_async_connect.assert_awaited()
-            # CREATE USER и CREATE DATABASE выполняются через курсор psycopg.
-            statements = " ".join(call.args[0] for call in mock_cursor.execute.call_args_list)
-            assert "CREATE USER test_user" in statements
-            assert "CREATE DATABASE test_db" in statements
-    
-    @pytest.mark.asyncio
+        assert success
+        # autocommit задаётся при подключении: CREATE DATABASE нельзя выполнить
+        # внутри транзакционного блока.
+        kwargs = mock_connect.call_args.kwargs
+        assert kwargs['autocommit'] is True
+        # Имя базы в psycopg3 — dbname; алиас database остался только в psycopg2
+        # и даёт `invalid connection option "database"`.
+        assert kwargs['dbname'] == 'postgres'
+        assert 'database' not in kwargs
+        assert conn.entered and conn.exited, "соединение должно браться контекстным менеджером"
+        assert cursor.closed_by_context
+        mock_async_connect.assert_awaited()
+
+        statements = [stmt.as_string() for stmt in cursor.statements]
+        assert 'CREATE USER "test_user" WITH PASSWORD' in statements[0]
+        assert statements[1] == 'CREATE DATABASE "test_db" OWNER "test_user"'
+
+    @requires_psycopg
+    async def test_create_database_quotes_identifiers_and_password(self):
+        """Пароль с кавычкой раньше ломал запрос: подстановка шла f-строкой."""
+        cursor = _FakeCursor()
+        conn = _FakeConnection(cursor)
+
+        with patch('uapg.db_manager.psycopg.connect', return_value=conn), \
+             patch('uapg.db_manager.asyncpg.connect', new=AsyncMock(return_value=AsyncMock())):
+            success = await self.db_manager.create_database(
+                user="o'brien",
+                password="pa'ss",
+                database="my-db"
+            )
+
+        assert success
+        create_user = cursor.statements[0].as_string()
+        assert create_user == """CREATE USER "o\'brien" WITH PASSWORD \'pa\'\'ss\'"""
+        assert cursor.statements[1].as_string() == """CREATE DATABASE "my-db" OWNER "o\'brien\""""
+
+    @requires_psycopg
+    async def test_create_database_tolerates_existing_user_and_database(self):
+        """Повторный запуск не считается ошибкой."""
+        cursor = _FakeCursor(
+            errors=[psycopg.errors.DuplicateObject, psycopg.errors.DuplicateDatabase]
+        )
+        conn = _FakeConnection(cursor)
+
+        with patch('uapg.db_manager.psycopg.connect', return_value=conn), \
+             patch('uapg.db_manager.asyncpg.connect', new=AsyncMock(return_value=AsyncMock())):
+            success = await self.db_manager.create_database(
+                user="test_user",
+                password="test_password",
+                database="test_db"
+            )
+
+        assert success
+        assert len(cursor.statements) == 2
+
     async def test_backup_database_mock(self):
         """Тест создания резервной копии с моком."""
         # Устанавливаем конфигурацию

@@ -25,7 +25,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
 import asyncpg
 import psycopg
-#from psycopg.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+from psycopg import sql as psycopg_sql
 
 
 class DatabaseManager:
@@ -187,45 +187,51 @@ class DatabaseManager:
             True если успешно создано
         """
         try:
-            # Подключение к PostgreSQL как суперпользователь
+            # Подключение к PostgreSQL как суперпользователь.
+            # Имя базы в psycopg3 — dbname: алиас database остался только в psycopg2
+            # и приводит к `invalid connection option "database"`.
+            conn_params = {
+                'host': host,
+                'port': port,
+                'user': superuser,
+                'dbname': 'postgres',
+            }
             if superuser_password:
-                conn_params = {
-                    'host': host,
-                    'port': port,
-                    'user': superuser,
-                    'password': superuser_password,
-                    'database': 'postgres'
-                }
-            else:
-                # Попытка подключения без пароля (для локальной установки)
-                conn_params = {
-                    'host': host,
-                    'port': port,
-                    'user': superuser,
-                    'database': 'postgres'
-                }
+                conn_params['password'] = superuser_password
             
-            # Создание пользователя и базы данных
-            conn = psycopg.connect(**conn_params)
-            conn.set_isolation_level(psycopg.ISOLATION_LEVEL_AUTOCOMMIT)
-            cursor = conn.cursor()
-            
-            # Создание пользователя
-            try:
-                cursor.execute(f"CREATE USER {user} WITH PASSWORD '{password}'")
-                self.logger.info(f"User {user} created successfully")
-            except psycopg.errors.DuplicateObject:
-                self.logger.info(f"User {user} already exists")
-            
-            # Создание базы данных
-            try:
-                cursor.execute(f"CREATE DATABASE {database} OWNER {user}")
-                self.logger.info(f"Database {database} created successfully")
-            except psycopg.errors.DuplicateDatabase:
-                self.logger.info(f"Database {database} already exists")
-            
-            cursor.close()
-            conn.close()
+            # Создание пользователя и базы данных.
+            #
+            # autocommit задаётся параметром connect(): psycopg3 не имеет ни
+            # set_isolation_level(), ни ISOLATION_LEVEL_AUTOCOMMIT — это API psycopg2.
+            # Без autocommit CREATE DATABASE вообще нельзя выполнить, PostgreSQL
+            # запрещает его внутри транзакционного блока.
+            #
+            # Имена и пароль собираются через psycopg.sql: идентификаторы в CREATE USER
+            # и CREATE DATABASE нельзя передать параметрами, а подстановка f-строкой
+            # ломала запрос на пароле с кавычкой и допускала инъекцию.
+            with psycopg.connect(**conn_params, autocommit=True) as conn:
+                with conn.cursor() as cursor:
+                    try:
+                        cursor.execute(
+                            psycopg_sql.SQL("CREATE USER {} WITH PASSWORD {}").format(
+                                psycopg_sql.Identifier(user),
+                                psycopg_sql.Literal(password),
+                            )
+                        )
+                        self.logger.info(f"User {user} created successfully")
+                    except psycopg.errors.DuplicateObject:
+                        self.logger.info(f"User {user} already exists")
+
+                    try:
+                        cursor.execute(
+                            psycopg_sql.SQL("CREATE DATABASE {} OWNER {}").format(
+                                psycopg_sql.Identifier(database),
+                                psycopg_sql.Identifier(user),
+                            )
+                        )
+                        self.logger.info(f"Database {database} created successfully")
+                    except psycopg.errors.DuplicateDatabase:
+                        self.logger.info(f"Database {database} already exists")
             
             # Подключение к новой базе данных для настройки
             new_conn_params = {

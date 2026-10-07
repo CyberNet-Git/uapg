@@ -1,6 +1,6 @@
 [project]
 name = "uapg"
-version = "0.2.20"
+version = "0.2.21"
 description = "OPC UA PostgreSQL History Storage Backend"
 readme = "README.md"
 authors = [
@@ -29,6 +29,10 @@ dev = [
     "black>=23.0.0",
     "isort>=5.12.0",
     "mypy>=1.0.0",
+    # Зависимости DatabaseManager: без них conftest ставит заглушку вместо psycopg,
+    # и тесты не видят несовместимостей с настоящим API.
+    "psycopg[binary]>=3.1",
+    "cryptography>=41.0.0",
 ]
 
 [project.scripts]
