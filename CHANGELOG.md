@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.18] - 2026-10-07
+## [0.2.19] - 2026-10-07
 
 Чтение истории V2 на стенде (`history.events_history` ≈ 1525 МБ, `history.events_ts` ≈ 278 МБ) выбиралось медленно: сервер строил `UNION ALL` по typed-таблицам с `techplace ILIKE '%77-12-29%'`, затем сортировал и применял `LIMIT`. Причин было две, независимых друг от друга, и для устранения нужны обе правки. Замеры ниже — на живом PostgreSQL 16, 400k строк `events_ts`, два типа событий, prepared statements, `EXPLAIN (ANALYZE, BUFFERS)`.
 
