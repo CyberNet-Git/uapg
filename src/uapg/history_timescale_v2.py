@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from asyncua import ua
 
 from .history_timescale import EventWriteItem, HistoryTimescale
+from .maintenance.online_indexes import V2_INDEX_SPECS
 from .v2.backfill_worker import EventsBackfillWorker
 from .v2.event_store import EventStoreV2
 from .v2.events_config import EventsV2Config
@@ -93,6 +94,7 @@ class HistoryTimescaleV2(HistoryTimescale):
         self._trgm_extension_available = False
         self._trgm_indexes_created = 0
         self._trgm_indexes_missing = 0
+        self._migrations_deferred: Dict[str, str] = {}
 
     @property
     def events_storage_mode(self) -> StorageMode:
@@ -110,6 +112,7 @@ class HistoryTimescaleV2(HistoryTimescale):
             self.logger,
         )
         await migrator.apply_all()
+        self._migrations_deferred = dict(migrator.deferred)
         self._v2_ready = await migrator.detect_v2_ready()
         if not self._v2_ready:
             self.logger.warning("Events V2 tables not ready; falling back to legacy semantics")
@@ -118,10 +121,8 @@ class HistoryTimescaleV2(HistoryTimescale):
         # чанкам идут и keyset-батч бэкфила, и гидрация чтений (WHERE id = ANY(...)),
         # и watermark-проба готовности. _ensure_index идемпотентен и переживает
         # таймаут/lock: недостающий индекс будет создан на следующем старте.
-        await self._ensure_index(
-            "idx_events_history_id",
-            f'CREATE INDEX idx_events_history_id ON "{self._schema}".events_history (id)',
-        )
+        for spec in V2_INDEX_SPECS:
+            await self._ensure_index(spec.name, spec.create_sql(self._schema))
         await self._ensure_pool()
         self._gateway = ProcedureGateway(self._schema, self._pool, self.logger)
         self._registry = EventSchemaRegistry(
@@ -132,6 +133,7 @@ class HistoryTimescaleV2(HistoryTimescale):
             self._fetchval,
             self.logger,
             events_config=self._events_v2_config,
+            trgm_index_enabled=self._events_trgm_index_enabled,
         )
         self._event_store = EventStoreV2(
             self._schema,
@@ -270,8 +272,23 @@ class HistoryTimescaleV2(HistoryTimescale):
         if not planned:
             self.logger.debug("Events V2 trgm indexes already in place")
             return
+        if not self._ensure_indexes_on_startup:
+            self._trgm_indexes_missing = len(planned)
+            self.logger.warning(
+                "%d trgm index(es) missing and not built on startup "
+                "(ensure_indexes_on_startup=False); build them online: uapg indexes apply, e.g.: %s",
+                len(planned),
+                planned[0]["ddl"].replace("CREATE INDEX", "CREATE INDEX CONCURRENTLY", 1),
+            )
+            return
         failed = 0
         for item in planned:
+            if item.get("invalid"):
+                # Имя занято индексом от прерванной онлайн-сборки: IF NOT EXISTS его не заменит.
+                await self._best_effort_execute(
+                    f'DROP INDEX IF EXISTS "{self._schema}"."{item["index"]}"',
+                    self._events_trgm_index_timeout_sec,
+                )
             ok = await self._best_effort_execute(
                 item["ddl"], self._events_trgm_index_timeout_sec
             )
@@ -342,6 +359,8 @@ class HistoryTimescaleV2(HistoryTimescale):
             "trgm_index_failures_total": self._performance_counters.get(
                 "events_trgm_index_failures_total", 0
             ),
+            # > 0: оптимизационная миграция не применена из-за прав (uapg migrations apply).
+            "migrations_deferred": len(self._migrations_deferred),
         }
         return metrics
 

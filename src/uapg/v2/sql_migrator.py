@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 from importlib import resources
 from pathlib import Path
-from typing import Any, Callable, Coroutine, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional
+
+import asyncpg
 
 _logger = logging.getLogger(__name__)
 
@@ -19,6 +21,25 @@ MIGRATION_ORDER = [
     "101_variables_v2_tables.sql",
     "102_variables_v2_functions.sql",
 ]
+
+# Только ускоряют чтение, не меняя сигнатур и данных: если роль приложения не
+# может их применить (объект принадлежит другой роли), старт продолжается на
+# прежней версии, а миграция остаётся неприменённой до `uapg migrations apply`.
+DEFERRABLE_MIGRATIONS = frozenset({"006_events_v2_read"})
+
+_PRIVILEGE_ERRORS = (asyncpg.exceptions.InsufficientPrivilegeError,)
+
+
+class MigrationPrivilegeError(RuntimeError):
+    """Обязательная миграция не применена: у роли нет прав на объекты схемы."""
+
+
+def privilege_hint(schema: str) -> str:
+    return (
+        f'objects in schema "{schema}" are owned by another role; apply pending migrations '
+        "as the owner role (uapg migrations apply --user <owner>) or transfer ownership "
+        "to the application role (ALTER FUNCTION/TABLE ... OWNER TO <app_role>)"
+    )
 
 
 def _migration_version(filename: str) -> str:
@@ -51,6 +72,7 @@ class SqlMigrator:
         self._fetchval = fetchval
         self._logger = logger or _logger
         self._include_variables = include_variables
+        self.deferred: Dict[str, str] = {}
 
     async def ensure_migrations_table(self) -> None:
         await self._execute(
@@ -89,8 +111,22 @@ class SqlMigrator:
             files = [f for f in files if not f.startswith("101_") and not f.startswith("102_")]
         return files
 
-    async def apply_all(self) -> List[str]:
+    async def pending(self) -> List[str]:
         await self.ensure_migrations_table()
+        return [
+            _migration_version(f)
+            for f in self._files_to_apply()
+            if not await self._is_applied(_migration_version(f))
+        ]
+
+    async def apply_all(self, *, defer_on_privilege_error: bool = True) -> List[str]:
+        """Применить неприменённые миграции по порядку.
+
+        ``defer_on_privilege_error=False`` — для ручного запуска под ролью-владельцем:
+        любая ошибка прерывает применение.
+        """
+        await self.ensure_migrations_table()
+        self.deferred = {}
         applied: List[str] = []
         for filename in self._files_to_apply():
             version = _migration_version(filename)
@@ -98,7 +134,21 @@ class SqlMigrator:
                 continue
             sql = load_migration_sql(filename, self._schema)
             self._logger.info("Applying uapg migration %s to schema %s", version, self._schema)
-            await self._execute(sql)
+            try:
+                await self._execute(sql)
+            except _PRIVILEGE_ERRORS as e:
+                if defer_on_privilege_error and version in DEFERRABLE_MIGRATIONS:
+                    self.deferred[version] = str(e)
+                    self._logger.warning(
+                        "uapg migration %s deferred: %s; %s",
+                        version,
+                        e,
+                        privilege_hint(self._schema),
+                    )
+                    continue
+                raise MigrationPrivilegeError(
+                    f"uapg migration {version} failed: {e}; {privilege_hint(self._schema)}"
+                ) from e
             await self._mark_applied(version)
             applied.append(version)
         return applied

@@ -12,6 +12,8 @@ UAPG - это модуль для хранения исторических да
 - **Режимы** — `UAPG_EVENTS_STORAGE_MODE`: `legacy` | `dual` (по умолчанию) | `v2`
 - **SQL push-down** — `FilterPlan` JSON, `uapg_read_events_v2`, typed ILIKE по колонкам registry; каждая ветка `UNION ALL` несёт свой `ORDER BY`/`LIMIT` и курсор, `events_ts` присоединяется после слияния ради `legacy_row_id`
 - **Подстрочный поиск** — для текстовых колонок из `indexed_fields` на старте создаётся GIN-индекс `pg_trgm`: btree не обслуживает `ILIKE '%...%'`. Требуется расширение `pg_trgm` (`CREATE EXTENSION pg_trgm;` под суперпользователем); без него поиск по подстроке просматривает всё окно, о чём сообщают WARNING на старте и метрика `events_v2.trgm_indexes_missing`. Отключается параметром `events_trgm_index_enabled=False`
+- **Онлайн-сборка индексов** — `uapg indexes plan|apply` (`uapg.maintenance.online_indexes`) строит недостающие индексы на работающей БД: `CREATE INDEX CONCURRENTLY` для обычных таблиц, `WITH (timescaledb.transaction_per_chunk)` для hypertable; `plan --sql` выдаёт скрипт для psql. С `ensure_indexes_on_startup=False` старт не строит индексы по непустым таблицам, а только сообщает о них (WARNING, метрика `indexes.startup_missing`)
+- **SQL-миграции на работающей БД** — `uapg migrations status|apply`. Оптимизационные миграции (`006_events_v2_read`), которые роль приложения не может применить из-за владельца объектов, не роняют старт: они откладываются (WARNING, метрика `events_v2.migrations_deferred`) и применяются вручную под ролью-владельцем
 - **Schema registry** — auto DDL при `new_historized_event`, advisory lock
 - **Backfill** — `run_events_backfill()` для миграции legacy → v2: один вызов SQL-функции `uapg_backfill_events_batch` на батч плюс перенос в typed-таблицы по курсору `uapg_backfill_state[events_typed]` (дойдя до хвоста, курсор начинает круг заново). Прогресс и узел `EventsBackfillComplete` считаются по watermark и требуют индекса `idx_events_history_id` (создаётся на старте, глубина пробы — `events_backfill_probe_rows`, время жизни оценки — `events_backfill_status_ttl_sec`)
 - **Timescale** — compression/retention на `events_ts`, optional CAGG `uapg_events_hourly`
@@ -361,6 +363,8 @@ await history.refresh_history_metrics_nodes()
 - `timeouts_total`, `reconnects_total` - показывает проблемы доступности PostgreSQL.
 - `events_v2.backfill_probe_failures_total` (HistoryTimescaleV2) - проба готовности бэкфила не получила ответа; ненулевое значение обычно означает, что индекс `idx_events_history_id` не создан, и его стоит создать вручную.
 - `events_v2.trgm_indexes_missing`, `events_v2.trgm_extension_available` (HistoryTimescaleV2) - показывает, обслуживается ли поиск по подстроке индексом. Ненулевое `trgm_indexes_missing` или `trgm_extension_available = false` означают, что `ILIKE '%...%'` идёт просмотром окна.
+- `indexes.startup_missing` - сколько индексов старт пропустил при `ensure_indexes_on_startup=False`; их строит `uapg indexes apply`.
+- `events_v2.migrations_deferred` - сколько оптимизационных SQL-миграций старт отложил из-за прав (объекты схемы принадлежат другой роли); их применяет `uapg migrations apply --user <owner>`.
 
 Per-variable и per-event retention cleanup в write path не выполняется. Для автоматического удаления старых данных используйте глобальную TimescaleDB retention policy через `global_retention_period` или отдельные административные cleanup-команды.
 

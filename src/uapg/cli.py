@@ -265,6 +265,14 @@ def create_parser() -> argparse.ArgumentParser:
 
   # Экспорт конфигурации
   python -m uapg.cli config --export config.json
+
+  # Онлайн-сборка недостающих индексов (без --master-password)
+  python -m uapg.cli indexes plan --dsn postgresql://user@host/db --schema history
+  python -m uapg.cli indexes apply --dsn postgresql://user@host/db --schema history
+
+  # SQL-миграции uapg, отложенные на старте из-за прав (под ролью-владельцем объектов)
+  python -m uapg.cli migrations status --dsn postgresql://owner@host/db --schema history
+  python -m uapg.cli migrations apply --dsn postgresql://owner@host/db --schema history
         """
     )
     
@@ -332,6 +340,16 @@ def create_parser() -> argparse.ArgumentParser:
 
 async def main() -> int:
     """Главная функция CLI."""
+    # Обслуживание индексов и SQL-миграций работает напрямую с БД и не требует DatabaseManager.
+    if len(sys.argv) > 1 and sys.argv[1] == 'indexes':
+        from .maintenance.indexes_cli import run as run_indexes
+
+        return await run_indexes(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == 'migrations':
+        from .maintenance.migrations_cli import run as run_migrations
+
+        return await run_migrations(sys.argv[2:])
+
     parser = create_parser()
     args = parser.parse_args()
     
@@ -358,6 +376,15 @@ async def main() -> int:
     else:
         print(f"✗ Неизвестная команда: {args.command}")
         return 1
+
+
+def run() -> None:
+    """Точка входа консольного скрипта `uapg`."""
+    try:
+        sys.exit(asyncio.run(main()))
+    except KeyboardInterrupt:
+        print("\nОперация прервана пользователем")
+        sys.exit(130)
 
 
 if __name__ == '__main__':

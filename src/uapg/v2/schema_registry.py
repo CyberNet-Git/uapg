@@ -56,6 +56,29 @@ MAX_IDENTIFIER_BYTES = 63
 TRGM_COLUMN_TYPES = ("text", "character varying", "character")
 
 
+# Текстовые колонки из indexed_fields во всех typed-таблицах; $1 — схема,
+# $2 — имена колонок, $3 — допустимые типы.
+TRGM_CANDIDATES_SQL = '''
+    SELECT ets.physical_table AS table_name, c.column_name
+    FROM "{schema}".event_type_storage ets
+    JOIN information_schema.columns c
+      ON c.table_schema = $1 AND c.table_name = ets.physical_table
+    WHERE c.column_name = ANY($2::text[])
+      AND c.data_type = ANY($3::text[])
+    ORDER BY ets.physical_table, c.column_name
+'''
+
+# Имена и валидность индексов схемы; $1 — схема, $2 — имена.
+INDEX_VALIDITY_SQL = '''
+    SELECT ix.indexname, i.indisvalid
+    FROM pg_indexes ix
+    JOIN pg_namespace n ON n.nspname = ix.schemaname
+    JOIN pg_class c ON c.relname = ix.indexname AND c.relnamespace = n.oid
+    JOIN pg_index i ON i.indexrelid = c.oid
+    WHERE ix.schemaname = $1 AND ix.indexname = ANY($2::text[])
+'''
+
+
 def trgm_index_name(table: str, column: str) -> str:
     name = f"idx_{table}_{column}_trgm"
     if len(name.encode("utf-8")) <= MAX_IDENTIFIER_BYTES:
@@ -109,6 +132,7 @@ class EventSchemaRegistry:
         logger: Optional[logging.Logger] = None,
         *,
         events_config: Optional[EventsV2Config] = None,
+        trgm_index_enabled: bool = True,
     ) -> None:
         self._schema = schema
         self._execute = execute
@@ -117,6 +141,7 @@ class EventSchemaRegistry:
         self._fetchval = fetchval
         self._logger = logger or _logger
         self._events_config = events_config or EventsV2Config()
+        self._trgm_index_enabled = bool(trgm_index_enabled)
         # Какие колонки typed-таблиц уже заведомо есть. Без этого
         # _ensure_physical_table (advisory lock + DDL + information_schema.columns)
         # выполнялся на каждый insert_typed_row. Пополняется только тем, что
@@ -324,15 +349,7 @@ class EventSchemaRegistry:
         if not columns:
             return []
         rows = await self._fetch(
-            f'''
-            SELECT ets.physical_table AS table_name, c.column_name
-            FROM "{self._schema}".event_type_storage ets
-            JOIN information_schema.columns c
-              ON c.table_schema = $1 AND c.table_name = ets.physical_table
-            WHERE c.column_name = ANY($2::text[])
-              AND c.data_type = ANY($3::text[])
-            ORDER BY ets.physical_table, c.column_name
-            ''',
+            TRGM_CANDIDATES_SQL.format(schema=self._schema),
             self._schema,
             sorted(columns),
             list(TRGM_COLUMN_TYPES),
@@ -344,20 +361,17 @@ class EventSchemaRegistry:
         if not candidates:
             return []
         names = sorted({trgm_index_name(t, c) for t, c in candidates})
-        existing_rows = await self._fetch(
-            '''
-            SELECT indexname
-            FROM pg_indexes
-            WHERE schemaname = $1 AND indexname = ANY($2::text[])
-            ''',
-            self._schema,
-            names,
-        )
-        existing = {str(row["indexname"]) for row in existing_rows}
-        planned: List[Dict[str, str]] = []
+        existing_rows = await self._fetch(INDEX_VALIDITY_SQL, self._schema, names)
+        # Прерванный CREATE INDEX CONCURRENTLY оставляет индекс с indisvalid = false:
+        # имя занято, но планировщик его не использует.
+        validity = {
+            str(row["indexname"]): bool(row.get("indisvalid", True))
+            for row in existing_rows
+        }
+        planned: List[Dict[str, Any]] = []
         for table, column in candidates:
             index = trgm_index_name(table, column)
-            if index in existing:
+            if validity.get(index):
                 continue
             planned.append(
                 {
@@ -365,6 +379,7 @@ class EventSchemaRegistry:
                     "column": column,
                     "index": index,
                     "ddl": trgm_index_ddl(self._schema, table, column),
+                    "invalid": index in validity,
                 }
             )
         return planned
@@ -398,7 +413,7 @@ class EventSchemaRegistry:
                 table,
             )
             existing_names = {r["column_name"] for r in existing}
-            trgm_columns = self.trgm_candidate_columns()
+            trgm_columns = self.trgm_candidate_columns() if self._trgm_index_enabled else set()
             for fld in fields:
                 name = fld["name"]
                 if name in existing_names:

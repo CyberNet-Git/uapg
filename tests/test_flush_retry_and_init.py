@@ -139,7 +139,7 @@ async def test_flush_on_connection_terminates_on_timeout():
 @pytest.mark.asyncio
 async def test_ensure_index_skips_existing():
     history = HistoryTimescale()
-    history._index_exists = AsyncMock(return_value=True)
+    history._index_state = AsyncMock(return_value=True)
     history._execute = AsyncMock()
 
     await history._ensure_index("idx_foo", "CREATE INDEX idx_foo ON t(x)")
@@ -150,10 +150,54 @@ async def test_ensure_index_skips_existing():
 @pytest.mark.asyncio
 async def test_ensure_index_timeout_does_not_fail_startup():
     history = HistoryTimescale()
-    history._index_exists = AsyncMock(return_value=False)
+    history._index_state = AsyncMock(return_value=None)
     history._execute = AsyncMock(side_effect=TimeoutError("lock wait"))
 
     await history._ensure_index("idx_foo", "CREATE INDEX idx_foo ON t(x)")
+
+
+@pytest.mark.asyncio
+async def test_ensure_index_rebuilds_invalid_index():
+    history = HistoryTimescale(schema="h")
+    history._index_state = AsyncMock(return_value=False)
+    history._execute = AsyncMock()
+
+    await history._ensure_index("idx_foo", "CREATE INDEX idx_foo ON t(x)")
+
+    executed = [call.args[0] for call in history._execute.await_args_list]
+    assert executed == ['DROP INDEX IF EXISTS "h"."idx_foo"', "CREATE INDEX idx_foo ON t(x)"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_index_disabled_skips_populated_table_and_reports_online_ddl():
+    history = HistoryTimescale(schema="h", ensure_indexes_on_startup=False)
+    history._index_state = AsyncMock(return_value=None)
+    history._table_is_empty = AsyncMock(return_value=False)
+    history._is_hypertable = AsyncMock(return_value=True)
+    history._execute = AsyncMock()
+
+    await history._ensure_index("idx_events_timestamp", "CREATE INDEX ...")
+
+    history._execute.assert_not_called()
+    history._table_is_empty.assert_awaited_once_with("events_history")
+    online = history._startup_indexes_missing["idx_events_timestamp"]
+    assert "WITH (timescaledb.transaction_per_chunk)" in online
+    metrics = history.get_performance_metrics()["indexes"]
+    assert metrics == {"ensure_on_startup": False, "startup_missing": 1}
+
+
+@pytest.mark.asyncio
+async def test_ensure_index_disabled_still_builds_on_empty_table():
+    """Свежая установка: индекс по пустой таблице дёшев и нужен (UNIQUE для ON CONFLICT)."""
+    history = HistoryTimescale(schema="h", ensure_indexes_on_startup=False)
+    history._index_state = AsyncMock(return_value=None)
+    history._table_is_empty = AsyncMock(return_value=True)
+    history._execute = AsyncMock()
+
+    await history._ensure_index("idx_variables_varid_sourcets", "CREATE UNIQUE INDEX ...")
+
+    history._execute.assert_awaited_once_with("CREATE UNIQUE INDEX ...")
+    assert history.get_performance_metrics()["indexes"]["startup_missing"] == 0
 
 
 @pytest.mark.asyncio

@@ -412,7 +412,7 @@ wheels = [
 
 [[package]]
 name = "uapg"
-version = "0.2.18"
+version = "0.2.20"
 source = { editable = "." }
 dependencies = [
     { name = "asyncpg" },

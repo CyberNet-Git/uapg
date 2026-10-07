@@ -1,6 +1,6 @@
 [project]
 name = "uapg"
-version = "0.2.19"
+version = "0.2.20"
 description = "OPC UA PostgreSQL History Storage Backend"
 readme = "README.md"
 authors = [
@@ -30,6 +30,9 @@ dev = [
     "isort>=5.12.0",
     "mypy>=1.0.0",
 ]
+
+[project.scripts]
+uapg = "uapg.cli:run"
 
 [project.urls]
 Homepage = "https://github.com/CyberNet-Git/uapg"

@@ -25,6 +25,7 @@ from asyncua.ua.ua_binary import variant_from_binary, variant_to_binary
 
 # Импорт для работы с зашифрованной конфигурацией
 from .db_manager import DatabaseManager
+from .maintenance.online_indexes import CORE_INDEX_SPECS, find_index_spec
 
 # Правильный буфер для побайтного чтения в variant_from_binary
 class Buffer:
@@ -814,6 +815,7 @@ class HistoryTimescale(HistoryStorageInterface):
         history_flush_timeout_sec: float = DEFAULT_FLUSH_TIMEOUT_SEC,
         history_worker_stall_timeout_sec: float = DEFAULT_WORKER_STALL_TIMEOUT_SEC,
         db_application_name: str = DEFAULT_DB_APPLICATION_NAME,
+        ensure_indexes_on_startup: bool = True,
         **kwargs
     ) -> None:
         """
@@ -834,6 +836,9 @@ class HistoryTimescale(HistoryStorageInterface):
             master_password: Главный пароль для расшифровки конфигурации
             global_retention_period: Глобальная максимальная глубина хранения (TimescaleDB retention policy) для таблиц *history.
                 Если None — глобальная политика не настраивается (поведение как раньше).
+            ensure_indexes_on_startup: Строить недостающие индексы на старте. При False индекс
+                по непустой таблице не строится (обычный CREATE INDEX блокирует запись), в лог идёт
+                WARNING с онлайн-DDL, а сборка выполняется заранее через uapg.maintenance / `uapg indexes`.
         """
         self.max_history_data_response_size = 1000
         self.logger = logging.getLogger('uapg.history_timescale')
@@ -878,6 +883,9 @@ class HistoryTimescale(HistoryStorageInterface):
         self._history_flush_timeout_sec = max(0.0, float(history_flush_timeout_sec))
         self._history_worker_stall_timeout_sec = max(0.0, float(history_worker_stall_timeout_sec))
         self._db_application_name = str(db_application_name or "").strip() or DEFAULT_DB_APPLICATION_NAME
+        self._ensure_indexes_on_startup = bool(ensure_indexes_on_startup)
+        # Индексы, пропущенные на старте при ensure_indexes_on_startup=False: имя -> онлайн-DDL.
+        self._startup_indexes_missing: Dict[str, str] = {}
         # Последнее время, когда мы писали агрегированное сообщение о длительной недоступности БД
         self._last_reconnect_outage_log_at = None
         self._failed_value_saves_counter = 0
@@ -1188,6 +1196,11 @@ class HistoryTimescale(HistoryStorageInterface):
             "retention": {
                 "per_variable_cleanup_enabled": False,
                 "per_event_cleanup_enabled": False,
+            },
+            "indexes": {
+                "ensure_on_startup": bool(self._ensure_indexes_on_startup),
+                # > 0: индекс не построен на старте и ждёт онлайн-сборки (uapg indexes apply).
+                "startup_missing": len(self._startup_indexes_missing),
             },
             "config": {
                 "history_write_batch_enabled": bool(self._history_write_batch_enabled),
@@ -2411,16 +2424,42 @@ class HistoryTimescale(HistoryStorageInterface):
                     e,
                 )
 
-    async def _index_exists(self, index_name: str) -> bool:
+    async def _index_state(self, index_name: str) -> Optional[bool]:
+        """None — индекса нет, True — валиден, False — остался от прерванной онлайн-сборки."""
         val = await self._fetchval(
             """
-            SELECT 1
-            FROM pg_indexes
-            WHERE schemaname = $1 AND indexname = $2
+            SELECT i.indisvalid
+            FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indexrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = $1 AND c.relname = $2
             """,
             self._schema,
             index_name,
         )
+        return None if val is None else bool(val)
+
+    async def _index_exists(self, index_name: str) -> bool:
+        return await self._index_state(index_name) is True
+
+    async def _table_is_empty(self, table: str) -> bool:
+        val = await self._fetchval(
+            f'SELECT NOT EXISTS (SELECT 1 FROM "{self._schema}"."{table}" LIMIT 1)'
+        )
+        return bool(val)
+
+    async def _is_hypertable(self, table: str) -> bool:
+        try:
+            val = await self._fetchval(
+                """
+                SELECT 1 FROM timescaledb_information.hypertables
+                WHERE hypertable_schema = $1 AND hypertable_name = $2
+                """,
+                self._schema,
+                table,
+            )
+        except Exception:
+            return False
         return val is not None
 
     async def _ensure_index(self, index_name: str, sql: str) -> None:
@@ -2428,11 +2467,36 @@ class HistoryTimescale(HistoryStorageInterface):
         Создаёт индекс только если его ещё нет. CREATE INDEX IF NOT EXISTS
         на горячей таблице всё равно ждёт AccessExclusive/ShareLock за живым
         INSERT и блокирует новые записи. Таймаут или lock на старте не валят процесс.
+
+        При ensure_indexes_on_startup=False индекс по непустой таблице не строится:
+        его собирают онлайн заранее (uapg.maintenance.online_indexes).
         """
         try:
-            if await self._index_exists(index_name):
+            state = await self._index_state(index_name)
+            if state is True:
+                self._startup_indexes_missing.pop(index_name, None)
                 return
+            spec = find_index_spec(index_name)
+            if not self._ensure_indexes_on_startup and spec is not None:
+                if not await self._table_is_empty(spec.table):
+                    online_sql = spec.create_sql(
+                        self._schema,
+                        online=True,
+                        hypertable=await self._is_hypertable(spec.table),
+                    )
+                    self._startup_indexes_missing[index_name] = online_sql
+                    self.logger.warning(
+                        "Missing index %s is not built on startup (ensure_indexes_on_startup=False); "
+                        "build it online: uapg indexes apply, or %s",
+                        index_name,
+                        online_sql,
+                    )
+                    return
+            if state is False:
+                self.logger.warning("Dropping invalid index %s before rebuild", index_name)
+                await self._execute(f'DROP INDEX IF EXISTS "{self._schema}"."{index_name}"')
             await self._execute(sql)
+            self._startup_indexes_missing.pop(index_name, None)
         except (asyncio.TimeoutError, TimeoutError) as e:
             self.logger.warning(
                 "Skipping missing index %s during startup after timeout: %s",
@@ -2541,104 +2605,10 @@ class HistoryTimescale(HistoryStorageInterface):
                 ADD COLUMN IF NOT EXISTS is_seed BOOLEAN NOT NULL DEFAULT FALSE
             ''')
             
-            schema = self._schema
-            await self._ensure_index(
-                "idx_variables_variable_id",
-                f'CREATE INDEX idx_variables_variable_id ON "{schema}".variables_history(variable_id)',
-            )
-            await self._ensure_index(
-                "idx_variables_timestamp",
-                f'CREATE INDEX idx_variables_timestamp ON "{schema}".variables_history(sourcetimestamp)',
-            )
-            await self._ensure_index(
-                "idx_variables_server_timestamp",
-                f'CREATE INDEX idx_variables_server_timestamp ON "{schema}".variables_history(servertimestamp)',
-            )
-            await self._ensure_index(
-                "idx_variables_varid_sourcets",
-                f'CREATE UNIQUE INDEX idx_variables_varid_sourcets ON "{schema}".variables_history(variable_id, sourcetimestamp)',
-            )
-            await self._ensure_index(
-                "idx_events_source_id",
-                f'CREATE INDEX idx_events_source_id ON "{schema}".events_history(source_id)',
-            )
-            await self._ensure_index(
-                "idx_events_event_type_id",
-                f'CREATE INDEX idx_events_event_type_id ON "{schema}".events_history(event_type_id)',
-            )
-            await self._ensure_index(
-                "idx_events_timestamp",
-                f'CREATE INDEX idx_events_timestamp ON "{schema}".events_history(event_timestamp)',
-            )
-            await self._ensure_index(
-                "idx_events_data_gin",
-                f'CREATE INDEX idx_events_data_gin ON "{schema}".events_history USING GIN (event_data)',
-            )
-            await self._ensure_index(
-                "idx_events_sourceid_eventts",
-                f'CREATE UNIQUE INDEX idx_events_sourceid_eventts ON "{schema}".events_history(source_id, event_timestamp)',
-            )
-            await self._ensure_index(
-                "idx_variable_metadata_variable_id",
-                f'CREATE INDEX idx_variable_metadata_variable_id ON "{schema}".variable_metadata(variable_id)',
-            )
-            await self._ensure_index(
-                "idx_event_sources_source_id",
-                f'CREATE INDEX idx_event_sources_source_id ON "{schema}".event_sources(source_id)',
-            )
-            await self._ensure_index(
-                "idx_event_types_event_type_id",
-                f'CREATE INDEX idx_event_types_event_type_id ON "{schema}".event_types(event_type_id)',
-            )
-            await self._ensure_index(
-                "idx_event_sources_node_id",
-                f'CREATE UNIQUE INDEX idx_event_sources_node_id ON "{schema}".event_sources(source_node_id)',
-            )
-            await self._ensure_index(
-                "idx_event_types_name",
-                f'CREATE UNIQUE INDEX idx_event_types_name ON "{schema}".event_types(event_type_name)',
-            )
-            await self._ensure_index(
-                "idx_variable_metadata_node_id",
-                f'CREATE UNIQUE INDEX idx_variable_metadata_node_id ON "{schema}".variable_metadata(node_id)',
-            )
-            await self._ensure_index(
-                "idx_variables_history_variable_id_timestamp",
-                f'CREATE INDEX idx_variables_history_variable_id_timestamp ON "{schema}".variables_history(variable_id, sourcetimestamp)',
-            )
-            await self._ensure_index(
-                "idx_events_history_source_timestamp",
-                f'CREATE INDEX idx_events_history_source_timestamp ON "{schema}".events_history(source_id, event_timestamp)',
-            )
-            await self._ensure_index(
-                "idx_events_history_type_source",
-                f'CREATE INDEX idx_events_history_type_source ON "{schema}".events_history(event_type_id, source_id)',
-            )
-            await self._ensure_index(
-                "idx_events_history_event_type_source",
-                f'CREATE INDEX idx_events_history_event_type_source ON "{schema}".events_history(event_type_id, source_id)',
-            )
-            await self._ensure_index(
-                "idx_variable_metadata_created",
-                f'CREATE INDEX idx_variable_metadata_created ON "{schema}".variable_metadata(created_at)',
-            )
-            await self._ensure_index(
-                "idx_event_sources_created",
-                f'CREATE INDEX idx_event_sources_created ON "{schema}".event_sources(created_at)',
-            )
-            await self._ensure_index(
-                "idx_event_types_created",
-                f'CREATE INDEX idx_event_types_created ON "{schema}".event_types(created_at)',
-            )
-            await self._ensure_index(
-                "idx_variables_last_value_updated",
-                f'CREATE INDEX idx_variables_last_value_updated ON "{schema}".variables_last_value(updated_at)',
-            )
-            await self._ensure_index(
-                "idx_variables_history_vid_ts_desc_covering",
-                f'CREATE INDEX idx_variables_history_vid_ts_desc_covering ON "{schema}".variables_history '
-                f'(variable_id, sourcetimestamp DESC) INCLUDE (statuscode, varianttype, servertimestamp)',
-            )
+            # Каталог общий с uapg.maintenance.online_indexes: старт и онлайн-сборка
+            # должны видеть одинаковые имена и определения.
+            for spec in CORE_INDEX_SPECS:
+                await self._ensure_index(spec.name, spec.create_sql(self._schema))
             
             self.logger.info(f"Unified history tables created successfully in schema '{self._schema}'")
             
