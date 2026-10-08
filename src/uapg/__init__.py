@@ -5,7 +5,7 @@ UAPG - OPC UA PostgreSQL History Storage Backend
 с поддержкой TimescaleDB для эффективной работы с временными рядами.
 """
 
-__version__ = "0.2.22"
+__version__ = "0.2.23"
 __author__ = "RTS IoT"
 __email__ = "panfilov@rts-iot.ru"
 

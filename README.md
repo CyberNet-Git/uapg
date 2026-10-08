@@ -143,7 +143,12 @@ async def main():
         history_last_values_cache_enabled=True,
         history_last_values_cache_max_size_mb=100,
         history_metadata_cache_enabled=True,
-        history_metadata_cache_init_max_rows=500000
+        history_metadata_cache_init_max_rows=500000,
+        # Параметры чтения истории: потолок одного ответа HistoryRead, остаток
+        # отдаётся клиенту по continuation point
+        history_read_max_response_rows=1000,
+        history_read_continuation_max_entries=1024,
+        history_read_continuation_ttl_sec=300.0
     )
     
     # Инициализация (создает таблицы и загружает кэши)

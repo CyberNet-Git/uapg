@@ -148,7 +148,11 @@ class EventStoreV2:
 
         matched = matched[:limit]
         cont: Optional[EventContinuation] = None
-        if not db_exhausted and last_cont is not None and len(matched) >= limit:
+        # Условие `len(matched) >= limit` здесь раньше тоже стояло, и из-за него страница,
+        # недобранная за MAX_REFILL_ITERATIONS (фильтр отбросил всё в пяти выборках подряд),
+        # уходила без курсора: клиент считал историю исчерпанной, хотя выборка не исчерпана.
+        # Признак «есть ещё» даёт только db_exhausted.
+        if not db_exhausted and last_cont is not None:
             cont = last_cont
         return matched, cont, partial
 

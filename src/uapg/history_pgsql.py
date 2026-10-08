@@ -196,7 +196,13 @@ class HistoryPgSQL(HistoryStorageInterface):
             encrypted_config: Зашифрованная конфигурация в виде строки
             master_password: Главный пароль для расшифровки конфигурации
         """
-        self.max_history_data_response_size = 1000
+        # Необъявленный kwarg уходил в _conn_params и дальше в asyncpg.create_pool, где
+        # такого параметра нет: пул не создавался вовсе, и примеры из examples/ падали на
+        # старте. Принимаем имя из asyncua, чтобы не ронять вызов. Пагинацию legacy-путь
+        # по-прежнему не соблюдает (атрибут не читается) — это сделано в HistoryTimescale.
+        self.max_history_data_response_size = max(
+            1, int(kwargs.pop("max_history_data_response_size", 1000))
+        )
         self.logger = logging.getLogger('uapg.history_pgsql')
         self._datachanges_period = {}
         self._event_fields = {}

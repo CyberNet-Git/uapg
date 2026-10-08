@@ -84,7 +84,9 @@ cd uapg/examples
 uv run python3 -c "from uapg import HistoryPgSQL; print('Constructor parameters:', HistoryPgSQL.__init__.__code__.co_varnames)"
 ```
 
-Должно показать: `('self', 'user', 'password', 'database', 'host', 'port', 'min_size', 'max_size', 'max_history_data_response_size')`
+Должно показать: `('self', 'user', 'password', 'database', 'host', 'port', 'min_size', 'max_size', 'config_file', 'encrypted_config', 'master_password', 'kwargs')`.
+
+`max_history_data_response_size` в сигнатуре не объявлен и принимается через `**kwargs`: это имя из asyncua. В `HistoryTimescale` оно работает как псевдоним параметра `history_read_max_response_rows` и действительно ограничивает размер ответа HistoryRead; в legacy-классе `HistoryPgSQL` значение сохраняется, но не используется.
 
 ## Структура проекта
 
