@@ -27,6 +27,7 @@ from asyncua.ua.ua_binary import variant_from_binary, variant_to_binary
 from .db_manager import DatabaseManager
 from .maintenance.online_indexes import CORE_INDEX_SPECS, find_index_spec
 from .read_continuation import ReadContinuation, ReadContinuationStore, ReadWindow
+from .status_code import decode_status, status_from_datavalue
 
 # Правильный буфер для побайтного чтения в variant_from_binary
 class Buffer:
@@ -62,6 +63,8 @@ class VariableWriteItem:
     node_id_str: str
     source_timestamp: datetime
     server_timestamp: datetime
+    # Уже закодированное значение для колонки (см. uapg.status_code):
+    # в буфер приходит знаковая проекция UInt32, а не сырой статус.
     status_code: int
     value_str: str
     variant_type: int
@@ -3211,7 +3214,7 @@ class HistoryTimescale(HistoryStorageInterface):
                         vid = row["variable_id"]
                         dv = ua.DataValue(
                             Value=variant_from_binary(Buffer(row["variantbinary"])),
-                            StatusCode_=ua.StatusCode(row["statuscode"]),
+                            StatusCode_=ua.StatusCode(decode_status(row["statuscode"])),
                             SourceTimestamp=row["sourcetimestamp"],
                             ServerTimestamp=row["servertimestamp"],
                         )
@@ -3665,7 +3668,7 @@ class HistoryTimescale(HistoryStorageInterface):
                     node_id_str=node_id_str,
                     source_timestamp=datavalue.SourceTimestamp,
                     server_timestamp=datavalue.ServerTimestamp,
-                    status_code=datavalue.StatusCode.value,
+                    status_code=status_from_datavalue(datavalue),
                     value_str=value_str,
                     variant_type=variant_type,
                     variant_binary=variant_binary,
@@ -3682,7 +3685,7 @@ class HistoryTimescale(HistoryStorageInterface):
                     variable_id,
                     datavalue.ServerTimestamp,
                     datavalue.SourceTimestamp,
-                    datavalue.StatusCode.value,
+                    status_from_datavalue(datavalue),
                     value_str,
                     variant_type,
                     variant_binary,
@@ -3703,7 +3706,7 @@ class HistoryTimescale(HistoryStorageInterface):
                         WHERE "{self._schema}".variables_last_value.is_seed
                            OR "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
                 ''', variable_id, datavalue.SourceTimestamp, datavalue.ServerTimestamp,
-                    datavalue.StatusCode.value, variant_type, variant_binary)
+                    status_from_datavalue(datavalue), variant_type, variant_binary)
 
             # Обновляем тип данных в метаданных на основе реального DataValue только при изменении
             if datavalue and hasattr(datavalue, 'Value') and datavalue.Value is not None:
@@ -3956,7 +3959,7 @@ class HistoryTimescale(HistoryStorageInterface):
                 #self.logger.debug(f"read_node_history: {row}")
                 datavalue = ua.DataValue(
                     Value=variant_from_binary(Buffer(row['variantbinary'])),
-                    StatusCode_=ua.StatusCode(row['statuscode']),
+                    StatusCode_=ua.StatusCode(decode_status(row['statuscode'])),
                     SourceTimestamp=row['sourcetimestamp'],
                     ServerTimestamp=row['servertimestamp']
                 )
@@ -4364,7 +4367,7 @@ class HistoryTimescale(HistoryStorageInterface):
                 # Преобразуем в DataValue
                 return ua.DataValue(
                     Value=variant_from_binary(Buffer(row['variantbinary'])),
-                    StatusCode_=ua.StatusCode(row['statuscode']),
+                    StatusCode_=ua.StatusCode(decode_status(row['statuscode'])),
                     SourceTimestamp=row['sourcetimestamp'],
                     ServerTimestamp=row['servertimestamp']
                 )
@@ -4398,7 +4401,7 @@ class HistoryTimescale(HistoryStorageInterface):
                 # Преобразуем в DataValue
                 return ua.DataValue(
                     Value=variant_from_binary(Buffer(variantbinary)),
-                    StatusCode_=ua.StatusCode(row['statuscode']),
+                    StatusCode_=ua.StatusCode(decode_status(row['statuscode'])),
                     SourceTimestamp=row['sourcetimestamp'],
                     ServerTimestamp=row['servertimestamp']
                 )
@@ -4518,7 +4521,7 @@ class HistoryTimescale(HistoryStorageInterface):
                 
                 dv = ua.DataValue(
                     Value=variant_from_binary(Buffer(row['variantbinary'])),
-                    StatusCode_=ua.StatusCode(row['statuscode']),
+                    StatusCode_=ua.StatusCode(decode_status(row['statuscode'])),
                     SourceTimestamp=row['sourcetimestamp'],
                     ServerTimestamp=row['servertimestamp']
                 )
@@ -4596,6 +4599,8 @@ class HistoryTimescale(HistoryStorageInterface):
                             [r['variable_id'] for r in fallback_rows],
                             [r['sourcetimestamp'] for r in fallback_rows],
                             [r['servertimestamp'] for r in fallback_rows],
+                            # Значение переносится из variables_history как есть: оно уже
+                            # закодировано (uapg.status_code), повторно кодировать нельзя.
                             [r['statuscode'] for r in fallback_rows],
                             [r['varianttype'] for r in fallback_rows],
                             [r['variantbinary'] for r in fallback_rows],
@@ -4608,7 +4613,7 @@ class HistoryTimescale(HistoryStorageInterface):
                     node_id = node_to_variable[variable_id]
                     dv = ua.DataValue(
                         Value=variant_from_binary(Buffer(row['variantbinary'])),
-                        StatusCode_=ua.StatusCode(row['statuscode']),
+                        StatusCode_=ua.StatusCode(decode_status(row['statuscode'])),
                         SourceTimestamp=row['sourcetimestamp'],
                         ServerTimestamp=row['servertimestamp']
                     )
@@ -4674,8 +4679,9 @@ class HistoryTimescale(HistoryStorageInterface):
             vids.append(variable_id)
             source_ts.append(getattr(dv, 'SourceTimestamp', None) or now)
             server_ts.append(getattr(dv, 'ServerTimestamp', None) or now)
-            sc = getattr(dv, 'StatusCode', None)
-            statuscodes.append(sc.value if sc is not None else 0)
+            # Статуса нет — это не Good: status_from_datavalue подставит
+            # BadWaitingForInitialData, а не фабрикует «значение достоверно».
+            statuscodes.append(status_from_datavalue(dv))
             varianttypes.append(variant.VariantType.value)
             binaries.append(binary)
             dv_by_vid[variable_id] = dv
@@ -4833,6 +4839,8 @@ class HistoryTimescale(HistoryStorageInterface):
                                 [r['variable_id'] for r in found],
                                 [r['sourcetimestamp'] for r in found],
                                 [r['servertimestamp'] for r in found],
+                                # Значение переносится из variables_history как есть: оно уже
+                                # закодировано (uapg.status_code), повторно кодировать нельзя.
                                 [r['statuscode'] for r in found],
                                 [r['varianttype'] for r in found],
                                 [r['variantbinary'] for r in found],
@@ -4858,7 +4866,7 @@ class HistoryTimescale(HistoryStorageInterface):
                     try:
                         dv = ua.DataValue(
                             Value=variant_from_binary(Buffer(row['variantbinary'])),
-                            StatusCode_=ua.StatusCode(row['statuscode']),
+                            StatusCode_=ua.StatusCode(decode_status(row['statuscode'])),
                             SourceTimestamp=row['sourcetimestamp'],
                             ServerTimestamp=row['servertimestamp'],
                         )

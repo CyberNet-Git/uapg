@@ -26,6 +26,7 @@ from asyncua import ua
 from asyncua.ua.ua_binary import variant_to_binary
 
 from uapg.history_timescale import HistoryTimescale
+from uapg.status_code import UNKNOWN_STATUS, encode_status
 
 VARIABLE_ID = 7
 
@@ -35,7 +36,12 @@ def _history() -> HistoryTimescale:
     return HistoryTimescale(schema="history")
 
 
-def _row(value: ua.Variant, source_ts: datetime, server_ts: datetime, statuscode: int = 0) -> dict:
+def _row(
+    value: ua.Variant,
+    source_ts: datetime,
+    server_ts: datetime,
+    statuscode: int | None = 0,
+) -> dict:
     """Строка в том виде, в каком её читает read_node_history — по строковым ключам."""
     return {
         "servertimestamp": server_ts,
@@ -118,6 +124,53 @@ class TestReadNodeHistory:
 
         assert len(results) == 1
         assert results[0].StatusCode.value == uncertain
+
+    @pytest.mark.asyncio
+    async def test_bad_status_stored_signed_is_decoded_back(self):
+        """Bad-коды лежат в колонке как отрицательные числа (см. uapg.status_code)."""
+        history = _history()
+        node_id = ua.NodeId("TestVariable", 1)
+        history._datachanges_period[node_id] = (timedelta(days=1), 1000, VARIABLE_ID)
+
+        source_ts = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
+        bad = int(ua.StatusCodes.BadOutOfService)
+        stored = encode_status(bad)
+        assert stored < 0, "иначе тест не проверяет то, ради чего написан"
+        history._fetch = AsyncMock(
+            return_value=[
+                _row(ua.Variant(1.0, ua.VariantType.Double), source_ts, source_ts, statuscode=stored)
+            ]
+        )
+
+        results, _ = await history.read_node_history(
+            node_id, source_ts - timedelta(hours=1), source_ts + timedelta(hours=1), 100
+        )
+
+        assert len(results) == 1
+        assert results[0].StatusCode.value == bad
+        assert results[0].StatusCode.name == "BadOutOfService"
+
+    @pytest.mark.asyncio
+    async def test_null_statuscode_does_not_break_read(self):
+        """Колонка nullable; `ua.StatusCode(None)` сломался бы при кодировании ответа."""
+        history = _history()
+        node_id = ua.NodeId("TestVariable", 1)
+        history._datachanges_period[node_id] = (timedelta(days=1), 1000, VARIABLE_ID)
+
+        source_ts = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
+        history._fetch = AsyncMock(
+            return_value=[
+                _row(ua.Variant(1.0, ua.VariantType.Double), source_ts, source_ts, statuscode=None)
+            ]
+        )
+
+        results, _ = await history.read_node_history(
+            node_id, source_ts - timedelta(hours=1), source_ts + timedelta(hours=1), 100
+        )
+
+        assert len(results) == 1
+        assert results[0].StatusCode.value == UNKNOWN_STATUS
+        assert results[0].StatusCode.name  # не бросает TypeError
 
     @pytest.mark.asyncio
     async def test_unknown_node_returns_empty_without_touching_history(self):
