@@ -25,7 +25,13 @@ from asyncua.ua.ua_binary import variant_from_binary, variant_to_binary
 
 # Импорт для работы с зашифрованной конфигурацией
 from .db_manager import DatabaseManager
-from .maintenance.online_indexes import CORE_INDEX_SPECS, find_index_spec
+from .maintenance.online_indexes import (
+    CORE_INDEX_SPECS,
+    OBSOLETE_INDEX_SPECS,
+    find_index_spec,
+)
+from .read_continuation import ReadContinuation, ReadContinuationStore, ReadWindow
+from .status_code import decode_status, status_from_datavalue
 
 # Правильный буфер для побайтного чтения в variant_from_binary
 class Buffer:
@@ -61,8 +67,9 @@ class VariableWriteItem:
     node_id_str: str
     source_timestamp: datetime
     server_timestamp: datetime
+    # Уже закодированное значение для колонки (см. uapg.status_code):
+    # в буфер приходит знаковая проекция UInt32, а не сырой статус.
     status_code: int
-    value_str: str
     variant_type: int
     variant_binary: bytes
     group_key: str
@@ -99,6 +106,10 @@ DEFAULT_WORKER_RESTART_MAX_BACKOFF_SEC = 30.0
 DEFAULT_FLUSH_TIMEOUT_SEC = 120.0
 DEFAULT_WORKER_STALL_TIMEOUT_SEC = 300.0
 DEFAULT_DB_APPLICATION_NAME = "uapg-history"
+DEFAULT_READ_MAX_RESPONSE_ROWS = 1000
+# Столько раз страница событий до-набирается, если EventFilter отбросил часть выборки.
+# То же число, что MAX_REFILL_ITERATIONS в v2/event_store.py.
+EVENT_READ_MAX_REFILL_ITERATIONS = 5
 
 
 def _observe_timing(stats: Dict[str, float], duration_ms: float) -> None:
@@ -630,7 +641,9 @@ class HistoryTimescale(HistoryStorageInterface):
     - Период хранения и max_records устанавливается для источника событий
     
     Attributes:
-        max_history_data_response_size (int): Максимальный размер ответа с историческими данными
+        max_history_data_response_size (int): Потолок числа значений в одном ответе HistoryRead.
+            Псевдоним параметра history_read_max_response_rows; в отличие от прежнего
+            одноимённого атрибута действительно соблюдается при чтении.
         logger (logging.Logger): Логгер для записи событий
         _datachanges_period (dict): Словарь периодов хранения данных по узлам
         _conn_params (dict): Параметры подключения к базе данных
@@ -816,6 +829,10 @@ class HistoryTimescale(HistoryStorageInterface):
         history_worker_stall_timeout_sec: float = DEFAULT_WORKER_STALL_TIMEOUT_SEC,
         db_application_name: str = DEFAULT_DB_APPLICATION_NAME,
         ensure_indexes_on_startup: bool = True,
+        # Параметры чтения истории
+        history_read_max_response_rows: Optional[int] = None,
+        history_read_continuation_max_entries: int = 1024,
+        history_read_continuation_ttl_sec: float = 300.0,
         **kwargs
     ) -> None:
         """
@@ -839,8 +856,34 @@ class HistoryTimescale(HistoryStorageInterface):
             ensure_indexes_on_startup: Строить недостающие индексы на старте. При False индекс
                 по непустой таблице не строится (обычный CREATE INDEX блокирует запись), в лог идёт
                 WARNING с онлайн-DDL, а сборка выполняется заранее через uapg.maintenance / `uapg indexes`.
+            history_read_max_response_rows: Потолок числа значений в одном ответе HistoryRead
+                (по умолчанию DEFAULT_READ_MAX_RESPONSE_ROWS). Принимается и под именем
+                max_history_data_response_size — так его называет asyncua, и так его передают
+                примеры; раньше такой kwarg уходил в asyncpg.create_pool и ломал создание пула.
+                Клиентский NumValuesPerNode дальше этого не пускается, остаток отдаётся
+                по continuation point. Это тот же смысл, что у max_history_data_response_size
+                в asyncua, но в отличие от прежнего одноимённого атрибута параметр
+                действительно читается.
+            history_read_continuation_max_entries: Сколько выданных continuation points помнить.
+                Нужно, потому что asyncua передаёт бэкенду только метку времени — см.
+                uapg.read_continuation. При вытеснении чтение деградирует, но не ломается.
+            history_read_continuation_ttl_sec: Время жизни записи о выданной метке.
         """
-        self.max_history_data_response_size = 1000
+        # max_history_data_response_size — имя из asyncua. Его передают примеры и внешний
+        # код, а необъявленный kwarg уходил в _conn_params и дальше в asyncpg.create_pool,
+        # где такого параметра нет: пул не создавался вовсе. Принимаем как псевдоним.
+        alias_rows = kwargs.pop("max_history_data_response_size", None)
+        if history_read_max_response_rows is None:
+            history_read_max_response_rows = (
+                DEFAULT_READ_MAX_RESPONSE_ROWS if alias_rows is None else alias_rows
+            )
+        # Публичный атрибут оставлен, чтобы не ломать внешний код, но читается приватное поле.
+        self.max_history_data_response_size = max(1, int(history_read_max_response_rows))
+        self._history_read_max_response_rows = self.max_history_data_response_size
+        self._read_continuations = ReadContinuationStore(
+            max_entries=history_read_continuation_max_entries,
+            ttl_sec=history_read_continuation_ttl_sec,
+        )
         self.logger = logging.getLogger('uapg.history_timescale')
         self._datachanges_period = {}
         self._event_fields = {}
@@ -886,6 +929,9 @@ class HistoryTimescale(HistoryStorageInterface):
         self._ensure_indexes_on_startup = bool(ensure_indexes_on_startup)
         # Индексы, пропущенные на старте при ensure_indexes_on_startup=False: имя -> онлайн-DDL.
         self._startup_indexes_missing: Dict[str, str] = {}
+        # Лишние индексы: старт их только показывает. Удаление индекса необратимо,
+        # поэтому решение за оператором — uapg indexes apply --drop-obsolete.
+        self._startup_indexes_obsolete: Dict[str, str] = {}
         # Последнее время, когда мы писали агрегированное сообщение о длительной недоступности БД
         self._last_reconnect_outage_log_at = None
         self._failed_value_saves_counter = 0
@@ -1201,8 +1247,14 @@ class HistoryTimescale(HistoryStorageInterface):
                 "ensure_on_startup": bool(self._ensure_indexes_on_startup),
                 # > 0: индекс не построен на старте и ждёт онлайн-сборки (uapg indexes apply).
                 "startup_missing": len(self._startup_indexes_missing),
+                "startup_obsolete": len(self._startup_indexes_obsolete),
             },
+            # Промахи говорят, что продолжения приходят без известного нам состояния:
+            # направление DESC-чтения тогда восстановить нельзя. Первый запрос каждого
+            # чтения промахивается законно, поэтому смотреть надо на соотношение.
+            "read_continuations": self._read_continuations.get_stats(),
             "config": {
+                "history_read_max_response_rows": int(self._history_read_max_response_rows),
                 "history_write_batch_enabled": bool(self._history_write_batch_enabled),
                 "history_write_max_batch_size": int(self._history_write_max_batch_size),
                 "history_write_max_batch_interval_sec": float(self._history_write_max_batch_interval_sec),
@@ -2510,6 +2562,49 @@ class HistoryTimescale(HistoryStorageInterface):
                 e,
             )
 
+    async def _report_obsolete_indexes(self) -> None:
+        """Сообщить об индексах, которые uapg больше не ожидает.
+
+        Старт их не удаляет: `DROP INDEX` необратим, а снаружи по этим индексам могут
+        ходить чужие запросы и дашборды, про которые код ничего не знает. Это та же
+        позиция, что и для дорогой сборки индексов, — инструмент в CLI, решение за
+        оператором.
+        """
+        self._startup_indexes_obsolete.clear()
+        # Список гипертаблиц берём одним запросом и только когда расширение есть.
+        # Иначе обращение к timescaledb_information на чистом PostgreSQL бросает внутри
+        # _fetchval, а тот вызывает _force_reconnect — и старт пересоздавал бы пул по
+        # разу на каждый индекс.
+        hypertables: set = set()
+        try:
+            if await self._timescaledb_available():
+                rows = await self._fetch(
+                    "SELECT hypertable_name FROM timescaledb_information.hypertables"
+                    " WHERE hypertable_schema = $1",
+                    self._schema,
+                )
+                hypertables = {str(r["hypertable_name"]) for r in rows}
+        except Exception as e:
+            self.logger.debug("Cannot list hypertables for obsolete index report: %r", e)
+
+        for spec in OBSOLETE_INDEX_SPECS:
+            try:
+                if await self._index_state(spec.name) is None:
+                    continue
+                self._startup_indexes_obsolete[spec.name] = spec.drop_sql(
+                    self._schema, online=True, hypertable=spec.table in hypertables
+                )
+            except Exception as e:
+                self.logger.debug("Cannot check obsolete index %s: %r", spec.name, e)
+                return
+        if self._startup_indexes_obsolete:
+            self.logger.warning(
+                "Found %d obsolete index(es) uapg no longer needs: %s. "
+                "Drop them online: uapg indexes apply --drop-obsolete",
+                len(self._startup_indexes_obsolete),
+                ", ".join(sorted(self._startup_indexes_obsolete)),
+            )
+
     async def _create_metadata_tables(self) -> None:
         """Создание единых таблиц для историзации в указанной схеме."""
         try:
@@ -2524,7 +2619,6 @@ class HistoryTimescale(HistoryStorageInterface):
                     servertimestamp TIMESTAMPTZ NOT NULL,
                     sourcetimestamp TIMESTAMPTZ NOT NULL,
                     statuscode INTEGER,
-                    value TEXT,
                     varianttype INTEGER,
                     variantbinary BYTEA,
                     created_at TIMESTAMPTZ DEFAULT NOW()
@@ -2604,11 +2698,22 @@ class HistoryTimescale(HistoryStorageInterface):
                 ALTER TABLE "{self._schema}".variables_last_value
                 ADD COLUMN IF NOT EXISTS is_seed BOOLEAN NOT NULL DEFAULT FALSE
             ''')
+
+            # Колонка value хранила str() от значения и не читалась ни одним запросом:
+            # всё восстанавливается из variantbinary. DROP COLUMN в PostgreSQL — операция
+            # над метаданными, без перезаписи таблицы, и на hypertable распространяется
+            # на чанки так же. Место в уже записанных страницах вернётся только при
+            # VACUUM FULL.
+            await self._execute(f'''
+                ALTER TABLE "{self._schema}".variables_history
+                DROP COLUMN IF EXISTS value
+            ''')
             
             # Каталог общий с uapg.maintenance.online_indexes: старт и онлайн-сборка
             # должны видеть одинаковые имена и определения.
             for spec in CORE_INDEX_SPECS:
                 await self._ensure_index(spec.name, spec.create_sql(self._schema))
+            await self._report_obsolete_indexes()
             
             self.logger.info(f"Unified history tables created successfully in schema '{self._schema}'")
             
@@ -2825,7 +2930,6 @@ class HistoryTimescale(HistoryStorageInterface):
                 it.server_timestamp,
                 it.source_timestamp,
                 it.status_code,
-                it.value_str,
                 it.variant_type,
                 it.variant_binary,
             )
@@ -2856,8 +2960,8 @@ class HistoryTimescale(HistoryStorageInterface):
                         insert_started_at = time.perf_counter()
                         await conn.executemany(
                             f'INSERT INTO "{self._schema}".variables_history '
-                            f'(variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) '
-                            f'VALUES ($1, $2, $3, $4, $5, $6, $7) '
+                            f'(variable_id, servertimestamp, sourcetimestamp, statuscode, varianttype, variantbinary) '
+                            f'VALUES ($1, $2, $3, $4, $5, $6) '
                             f'ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
                             history_params,
                             timeout=flush_timeout,
@@ -3169,7 +3273,7 @@ class HistoryTimescale(HistoryStorageInterface):
                         vid = row["variable_id"]
                         dv = ua.DataValue(
                             Value=variant_from_binary(Buffer(row["variantbinary"])),
-                            StatusCode_=ua.StatusCode(row["statuscode"]),
+                            StatusCode_=ua.StatusCode(decode_status(row["statuscode"])),
                             SourceTimestamp=row["sourcetimestamp"],
                             ServerTimestamp=row["servertimestamp"],
                         )
@@ -3607,7 +3711,6 @@ class HistoryTimescale(HistoryStorageInterface):
                 self._variable_metadata_cache[node_id_str] = variable_id
 
             # Подготовка данных для записи
-            value_str = str(datavalue.Value.Value)
             variant_type = int(datavalue.Value.VariantType)
             variant_binary = variant_to_binary(datavalue.Value)
 
@@ -3623,8 +3726,7 @@ class HistoryTimescale(HistoryStorageInterface):
                     node_id_str=node_id_str,
                     source_timestamp=datavalue.SourceTimestamp,
                     server_timestamp=datavalue.ServerTimestamp,
-                    status_code=datavalue.StatusCode.value,
-                    value_str=value_str,
+                    status_code=status_from_datavalue(datavalue),
                     variant_type=variant_type,
                     variant_binary=variant_binary,
                     group_key=group_key,
@@ -3636,12 +3738,11 @@ class HistoryTimescale(HistoryStorageInterface):
             else:
                 # Синхронная запись как раньше (без батчирования)
                 await self._execute(
-                    f'INSERT INTO "{self._schema}".variables_history (variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
+                    f'INSERT INTO "{self._schema}".variables_history (variable_id, servertimestamp, sourcetimestamp, statuscode, varianttype, variantbinary) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
                     variable_id,
                     datavalue.ServerTimestamp,
                     datavalue.SourceTimestamp,
-                    datavalue.StatusCode.value,
-                    value_str,
+                    status_from_datavalue(datavalue),
                     variant_type,
                     variant_binary,
                 )
@@ -3661,7 +3762,7 @@ class HistoryTimescale(HistoryStorageInterface):
                         WHERE "{self._schema}".variables_last_value.is_seed
                            OR "{self._schema}".variables_last_value.sourcetimestamp <= EXCLUDED.sourcetimestamp
                 ''', variable_id, datavalue.SourceTimestamp, datavalue.ServerTimestamp,
-                    datavalue.StatusCode.value, variant_type, variant_binary)
+                    status_from_datavalue(datavalue), variant_type, variant_binary)
 
             # Обновляем тип данных в метаданных на основе реального DataValue только при изменении
             if datavalue and hasattr(datavalue, 'Value') and datavalue.Value is not None:
@@ -3831,7 +3932,13 @@ class HistoryTimescale(HistoryStorageInterface):
             Кортеж (список значений, время продолжения)
         """
         #self.logger.debug(f"read_node_history: {node_id} {start} {end} {nb_values} {return_bounds}")
-        start_time, end_time, order, limit = self._get_bounds(start, end, nb_values)
+        if return_bounds:
+            # Параметра нет в HistoryStorageInterface, и значения границ мы не отдаём.
+            # Раньше он молча игнорировался — теперь об этом хотя бы видно в логе.
+            self.logger.warning("read_node_history: return_bounds не поддерживается, игнорируется")
+        key_prefix = f"var:{self._format_node_id(node_id)}"
+        window = self._resolve_read_window(key_prefix, start, end, nb_values)
+        start_time, end_time, order = window.start_time, window.end_time, window.order
 
         try:
             # Получаем variable_id
@@ -3876,32 +3983,46 @@ class HistoryTimescale(HistoryStorageInterface):
 
             # Запрос к единой таблице переменных
             select_sql = f'''
-                SELECT servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary
+                SELECT servertimestamp, sourcetimestamp, statuscode, variantbinary
                 FROM "{self._schema}".variables_history
                 WHERE variable_id = $1 AND sourcetimestamp BETWEEN $2 AND $3
                 ORDER BY sourcetimestamp {order}
                 LIMIT $4
             '''
             #self.logger.debug(f"read_node_history: {select_sql}")
-            rows = await self._fetch(select_sql, variable_id, start_time, end_time, limit)
+            # LIMIT на одну строку больше страницы: лишняя строка — это и признак
+            # «данные ещё есть», и источник корректной метки продолжения. Прежний код
+            # запрашивал ровно limit и догадывался о продолжении по len(results) == limit,
+            # поэтому исчерпанная выборка ровно в limit строк тоже отдавала метку и стоила
+            # клиенту лишнего пустого round-trip.
+            rows = await self._fetch(
+                select_sql, variable_id, start_time, end_time, window.page_limit + 1
+            )
             #self.logger.debug(f"read_node_history: {len(rows)} rows")
+            cont_ts = None
+            if len(rows) > window.page_limit:
+                # Метка первой отвергнутой строки, а не последней отданной. Контракт
+                # asyncua (history.py: «SourceTimeStamp of the last rejected DataValue»):
+                # следующий запрос приходит с start = cont, а WHERE ... BETWEEN включающий,
+                # так что метка последней отданной строки повторяла её на новой странице.
+                # Пара (variable_id, sourcetimestamp) уникальна (idx_variables_varid_sourcets
+                # + ON CONFLICT при записи), поэтому метки достаточно: ни дубликата, ни пропуска.
+                cont_ts = rows[window.page_limit]['sourcetimestamp']
+                rows = rows[: window.page_limit]
             # Преобразуем в DataValue
             results = []
             for row in rows:
                 #self.logger.debug(f"read_node_history: {row}")
                 datavalue = ua.DataValue(
                     Value=variant_from_binary(Buffer(row['variantbinary'])),
-                    StatusCode_=ua.StatusCode(row['statuscode']),
+                    StatusCode_=ua.StatusCode(decode_status(row['statuscode'])),
                     SourceTimestamp=row['sourcetimestamp'],
                     ServerTimestamp=row['servertimestamp']
                 )
                 results.append(datavalue)
                 #self.logger.debug(f"read_node_history: {datavalue}")
 
-            # Определяем время продолжения
-            cont = None
-            if len(results) == limit and len(rows) > 0:
-                cont = rows[-1]['sourcetimestamp']
+            cont = self._issue_continuation(key_prefix, window, cont_ts, len(results))
 
             #self.logger.debug(f"read_node_history: {len(results)} results")
             return results, cont
@@ -3931,7 +4052,9 @@ class HistoryTimescale(HistoryStorageInterface):
         Returns:
             Кортеж (список событий, время продолжения)
         """
-        start_time, end_time, order, limit = self._get_bounds(start, end, nb_values)
+        key_prefix = f"evt:{self._format_node_id(source_id)}"
+        window = self._resolve_read_window(key_prefix, start, end, nb_values)
+        start_time, end_time, order = window.start_time, window.end_time, window.order
         #self.logger.debug(f"read_event_history: {source_id} {start} {end} nb_values evfilter")
         try:
             # Получаем source_db_id
@@ -3973,56 +4096,106 @@ class HistoryTimescale(HistoryStorageInterface):
                     self.logger.warning(f"Unexpected data format for source {source_id}: {source_data}")
                     return [], None
 
-            # Запрос к единой таблице событий
-            select_sql = f'''
-                SELECT event_timestamp, event_type_id, event_data
+            # Курсор внутри цикла до-набора — строгий предикат по той же паре колонок,
+            # что и индекс (source_id, event_timestamp), поэтому остаётся индексным.
+            # Два отдельных запроса, а не один с `($5 IS NULL OR ...)`: такой OR мешает
+            # планировщику выбрать индекс по параметру, известному только на исполнении.
+            cursor_op = ">" if order == "ASC" else "<"
+            select_head = f'''
+                SELECT event_timestamp, event_data
                 FROM "{self._schema}".events_history
-                WHERE source_id = $1 AND event_timestamp BETWEEN $2 AND $3
+                WHERE source_id = $1 AND event_timestamp BETWEEN $2 AND $3'''
+            select_tail = f'''
                 ORDER BY event_timestamp {order}
                 LIMIT $4
             '''
+            select_sql = select_head + select_tail
+            select_sql_cursor = (
+                select_head
+                + f'''
+                  AND event_timestamp {cursor_op} $5'''
+                + select_tail
+            )
 
-            rows = await self._fetch(select_sql, source_db_id, start_time, end_time, limit)
-            #self.logger.debug(f"read_event_history: query: {select_sql}")
-            #self.logger.debug(f"read_event_history: params: source_db_id={source_db_id}, start_time={start_time}, end_time={end_time}, limit={limit}")
-            #self.logger.debug(f"read_event_history: {len(rows)} rows")
-            # Преобразуем в события
-            results = []
-            for row in rows:
-                data = row['event_data']
-                if isinstance(data, str):
-                    data = json.loads(data)
-                values = self._binary_map_to_event_values(data)
-                #payload = {"Time": row["event_timestamp"], "EventType": row["event_type_id"], **values}
-                try:
-                    #self.logger.debug(f"read_event_history: event: {values}")
-                    event = Event.from_field_dict(values)
-                    results.append(event)
-                except Exception as e:
-                    # Фоллбэк, если from_field_dict недоступен у конкретной реализации Event
-                    self.logger.debug(f"read_event_history fallback: {e}")
-                    self.logger.debug(f"read_event_history fallback: event: {values}")
-                    #results.append(Event(**values))
+            # Прежний код считал условие продолжения по числу событий ПОСЛЕ фильтра,
+            # сравнивая его с лимитом строк SQL. Стоило фильтру отбросить хотя бы одно
+            # событие — и клиенту сообщалось, что история исчерпана, хотя за границей
+            # окна оставались подходящие строки: молчаливая потеря данных. Теперь
+            # страница до-набирается, а признак «есть ещё» берётся из самой выборки.
+            results: List[Any] = []
+            cursor_ts: Optional[datetime] = None
+            cont_ts: Optional[datetime] = None
+            db_exhausted = False
 
-            # Применяем EventFilter для фильтрации событий
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(
-                    "read_event_history: applying event filter %s to %d events",
-                    "present" if evfilter else "absent",
-                    len(results),
-                )
-            results = apply_event_filter(results, evfilter)
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(
-                    "read_event_history: after filter %d events (from %d)",
-                    len(results),
-                    len(rows),
-                )
+            for _ in range(EVENT_READ_MAX_REFILL_ITERATIONS):
+                if len(results) >= window.page_limit:
+                    break
+                fetch_limit = window.page_limit - len(results)
+                if cursor_ts is None:
+                    rows = await self._fetch(
+                        select_sql, source_db_id, start_time, end_time, fetch_limit + 1
+                    )
+                else:
+                    rows = await self._fetch(
+                        select_sql_cursor,
+                        source_db_id,
+                        start_time,
+                        end_time,
+                        fetch_limit + 1,
+                        cursor_ts,
+                    )
+                if not rows:
+                    db_exhausted = True
+                    cont_ts = None
+                    break
+                if len(rows) > fetch_limit:
+                    cont_ts = rows[fetch_limit]['event_timestamp']
+                    rows = rows[:fetch_limit]
+                else:
+                    db_exhausted = True
+                    cont_ts = None
 
-            # Определяем время продолжения
-            cont = None
-            if len(results) == limit and len(rows) > 0:
-                cont = rows[-1]['event_timestamp']
+                batch: List[Any] = []
+                for row in rows:
+                    data = row['event_data']
+                    if isinstance(data, str):
+                        data = json.loads(data)
+                    values = self._binary_map_to_event_values(data)
+                    try:
+                        batch.append(Event.from_field_dict(values))
+                    except Exception as e:
+                        # Фоллбэк, если from_field_dict недоступен у конкретной реализации Event
+                        self.logger.debug(f"read_event_history fallback: {e}")
+                        self.logger.debug(f"read_event_history fallback: event: {values}")
+
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug(
+                        "read_event_history: applying event filter %s to %d events",
+                        "present" if evfilter else "absent",
+                        len(batch),
+                    )
+                matched = apply_event_filter(batch, evfilter)
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug(
+                        "read_event_history: after filter %d events (from %d)",
+                        len(matched),
+                        len(rows),
+                    )
+                results.extend(matched)
+                cursor_ts = rows[-1]['event_timestamp']
+
+                if db_exhausted:
+                    break
+
+            results = results[: window.page_limit]
+            # Метка отдаётся всегда, когда выборка не исчерпана, — даже если страница
+            # недобрана (фильтр съел всё или кончились итерации до-набора). Иначе
+            # клиент решит, что история закончилась.
+            cont = (
+                None
+                if db_exhausted
+                else self._issue_continuation(key_prefix, window, cont_ts, len(results))
+            )
 
             return results, cont
         except Exception as e:
@@ -4060,8 +4233,96 @@ class HistoryTimescale(HistoryStorageInterface):
             start_time = end
             end_time = start
         limit = nb_values if nb_values else 10000
-        
+
         return start_time, end_time, order, limit
+
+    def _resolve_read_window(
+        self,
+        key_prefix: str,
+        start: Optional[datetime],
+        end: Optional[datetime],
+        nb_values: Optional[int],
+    ) -> ReadWindow:
+        """Окно и лимит одной страницы HistoryRead, с учётом продолжения.
+
+        Три вещи, которых не делал прежний код:
+
+        * клиентский NumValuesPerNode зажимается потолком
+          `history_read_max_response_rows` — раньше он уходил в SQL LIMIT как есть,
+          и запрос на 50 000 000 значений выполнялся буквально;
+        * `nb_values == 0` трактуется как «клиент лимита не задавал» (так это и
+          описано в asyncua), а не как жёсткая 10000;
+        * если `start` — это метка, которую мы сами выдали как continuation point,
+          восстанавливаются направление, исходное окно и остаток по
+          NumValuesPerNode. Без этого продолжение DESC-чтения разворачивалось в ASC:
+          asyncua подставляет `start = cont`, оставляя `end` прежним, и условие
+          `start < end` в `_get_bounds` выбирало другое направление.
+
+        Промах по хранилищу (рестарт, вытеснение, протухание) не ошибка: читаем так,
+        как прислал клиент.
+        """
+        cap = self._history_read_max_response_rows
+        resumed = self._read_continuations.take(key_prefix, start)
+
+        if resumed is not None:
+            if resumed.order == "DESC":
+                start_time, end_time = resumed.window_start, start
+            else:
+                start_time, end_time = start, resumed.window_end
+            total_remaining = resumed.remaining
+            page_limit = cap if total_remaining is None else min(cap, total_remaining)
+            return ReadWindow(
+                order=resumed.order,
+                start_time=start_time,
+                end_time=end_time,
+                page_limit=max(1, page_limit),
+                total_remaining=total_remaining,
+                window_start=resumed.window_start,
+                window_end=resumed.window_end,
+                resumed=True,
+                cursor_event_id=resumed.event_id,
+            )
+
+        start_time, end_time, order, _ = self._get_bounds(start, end, nb_values)
+        total_remaining = int(nb_values) if nb_values else None
+        page_limit = cap if total_remaining is None else min(cap, total_remaining)
+        return ReadWindow(
+            order=order,
+            start_time=start_time,
+            end_time=end_time,
+            page_limit=max(1, page_limit),
+            total_remaining=total_remaining,
+            window_start=start_time,
+            window_end=end_time,
+        )
+
+    def _issue_continuation(
+        self,
+        key_prefix: str,
+        window: ReadWindow,
+        cont_ts: Optional[datetime],
+        returned: int,
+        *,
+        event_id: Optional[int] = None,
+    ) -> Optional[datetime]:
+        """Запомнить и вернуть метку продолжения либо None, если продолжать нечего."""
+        if cont_ts is None:
+            return None
+        if window.exhausted_by_client_limit(returned):
+            # Клиент получил ровно столько, сколько просил в NumValuesPerNode.
+            return None
+        self._read_continuations.put(
+            key_prefix,
+            cont_ts,
+            ReadContinuation(
+                order=window.order,
+                window_start=window.window_start,
+                window_end=window.window_end,
+                remaining=window.next_remaining(returned),
+                event_id=event_id,
+            ),
+        )
+        return cont_ts
 
     async def execute_sql_delete(
         self, 
@@ -4162,45 +4423,35 @@ class HistoryTimescale(HistoryStorageInterface):
                 # Преобразуем в DataValue
                 return ua.DataValue(
                     Value=variant_from_binary(Buffer(row['variantbinary'])),
-                    StatusCode_=ua.StatusCode(row['statuscode']),
+                    StatusCode_=ua.StatusCode(decode_status(row['statuscode'])),
                     SourceTimestamp=row['sourcetimestamp'],
                     ServerTimestamp=row['servertimestamp']
                 )
             
-            # Fallback: получаем из основной таблицы через покрывающий индекс
+            # Fallback: одно обращение к истории. Раньше здесь было два: первый запрос
+            # шёл index-only по покрывающему индексу, второй добирал variantbinary из
+            # heap — то есть первый был чистыми накладными расходами. Сортировку
+            # обслуживает UNIQUE-индекс (variable_id, sourcetimestamp): btree сканируется
+            # в обе стороны, в плане это Index Scan Backward. Заодно ушёл varianttype,
+            # который здесь выбирался и не использовался.
             self._cache_stats["last_values_table_misses"] += 1
             row = await self._fetchrow(f'''
-                SELECT sourcetimestamp, servertimestamp, statuscode, varianttype
+                SELECT sourcetimestamp, servertimestamp, statuscode, variantbinary
                 FROM "{self._schema}".variables_history
                 WHERE variable_id = $1
                 ORDER BY sourcetimestamp DESC
                 LIMIT 1
             ''', variable_id)
-            
+
             if row is not None:
                 self._cache_stats["last_values_history_fallbacks"] += 1
-                # Получаем variantbinary отдельным запросом
-                variantbinary_row = await self._fetchrow(f'''
-                    SELECT variantbinary
-                    FROM "{self._schema}".variables_history
-                    WHERE variable_id = $1 AND sourcetimestamp = $2
-                    LIMIT 1
-                ''', variable_id, row['sourcetimestamp'])
-                
-                if variantbinary_row is not None:
-                    variantbinary = variantbinary_row['variantbinary']
-                else:
-                    return None
-            
-            if row is not None:
-                # Преобразуем в DataValue
                 return ua.DataValue(
-                    Value=variant_from_binary(Buffer(variantbinary)),
-                    StatusCode_=ua.StatusCode(row['statuscode']),
+                    Value=variant_from_binary(Buffer(row['variantbinary'])),
+                    StatusCode_=ua.StatusCode(decode_status(row['statuscode'])),
                     SourceTimestamp=row['sourcetimestamp'],
                     ServerTimestamp=row['servertimestamp']
                 )
-            
+
             return None
             
         except Exception as e:
@@ -4316,7 +4567,7 @@ class HistoryTimescale(HistoryStorageInterface):
                 
                 dv = ua.DataValue(
                     Value=variant_from_binary(Buffer(row['variantbinary'])),
-                    StatusCode_=ua.StatusCode(row['statuscode']),
+                    StatusCode_=ua.StatusCode(decode_status(row['statuscode'])),
                     SourceTimestamp=row['sourcetimestamp'],
                     ServerTimestamp=row['servertimestamp']
                 )
@@ -4394,6 +4645,8 @@ class HistoryTimescale(HistoryStorageInterface):
                             [r['variable_id'] for r in fallback_rows],
                             [r['sourcetimestamp'] for r in fallback_rows],
                             [r['servertimestamp'] for r in fallback_rows],
+                            # Значение переносится из variables_history как есть: оно уже
+                            # закодировано (uapg.status_code), повторно кодировать нельзя.
                             [r['statuscode'] for r in fallback_rows],
                             [r['varianttype'] for r in fallback_rows],
                             [r['variantbinary'] for r in fallback_rows],
@@ -4406,7 +4659,7 @@ class HistoryTimescale(HistoryStorageInterface):
                     node_id = node_to_variable[variable_id]
                     dv = ua.DataValue(
                         Value=variant_from_binary(Buffer(row['variantbinary'])),
-                        StatusCode_=ua.StatusCode(row['statuscode']),
+                        StatusCode_=ua.StatusCode(decode_status(row['statuscode'])),
                         SourceTimestamp=row['sourcetimestamp'],
                         ServerTimestamp=row['servertimestamp']
                     )
@@ -4472,8 +4725,9 @@ class HistoryTimescale(HistoryStorageInterface):
             vids.append(variable_id)
             source_ts.append(getattr(dv, 'SourceTimestamp', None) or now)
             server_ts.append(getattr(dv, 'ServerTimestamp', None) or now)
-            sc = getattr(dv, 'StatusCode', None)
-            statuscodes.append(sc.value if sc is not None else 0)
+            # Статуса нет — это не Good: status_from_datavalue подставит
+            # BadWaitingForInitialData, а не фабрикует «значение достоверно».
+            statuscodes.append(status_from_datavalue(dv))
             varianttypes.append(variant.VariantType.value)
             binaries.append(binary)
             dv_by_vid[variable_id] = dv
@@ -4631,6 +4885,8 @@ class HistoryTimescale(HistoryStorageInterface):
                                 [r['variable_id'] for r in found],
                                 [r['sourcetimestamp'] for r in found],
                                 [r['servertimestamp'] for r in found],
+                                # Значение переносится из variables_history как есть: оно уже
+                                # закодировано (uapg.status_code), повторно кодировать нельзя.
                                 [r['statuscode'] for r in found],
                                 [r['varianttype'] for r in found],
                                 [r['variantbinary'] for r in found],
@@ -4656,7 +4912,7 @@ class HistoryTimescale(HistoryStorageInterface):
                     try:
                         dv = ua.DataValue(
                             Value=variant_from_binary(Buffer(row['variantbinary'])),
-                            StatusCode_=ua.StatusCode(row['statuscode']),
+                            StatusCode_=ua.StatusCode(decode_status(row['statuscode'])),
                             SourceTimestamp=row['sourcetimestamp'],
                             ServerTimestamp=row['servertimestamp'],
                         )

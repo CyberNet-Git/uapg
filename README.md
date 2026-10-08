@@ -143,7 +143,12 @@ async def main():
         history_last_values_cache_enabled=True,
         history_last_values_cache_max_size_mb=100,
         history_metadata_cache_enabled=True,
-        history_metadata_cache_init_max_rows=500000
+        history_metadata_cache_init_max_rows=500000,
+        # Параметры чтения истории: потолок одного ответа HistoryRead, остаток
+        # отдаётся клиенту по continuation point
+        history_read_max_response_rows=1000,
+        history_read_continuation_max_entries=1024,
+        history_read_continuation_ttl_sec=300.0
     )
     
     # Инициализация (создает таблицы и загружает кэши)
@@ -304,6 +309,43 @@ HistoryTimescale использует новую архитектуру с ед�
 - **`event_types`** - Типы событий
 - **`variables_last_value`** - Кэш последних значений переменных
 
+#### Чем занята `variables_history`
+
+Значение хранится один раз — в `variantbinary`. Колонки `value TEXT` (она держала
+`str()` от значения) с 0.2.25 нет: ни один запрос её не читал, всё восстанавливается из
+двоичного представления. На существующих базах старт выполняет
+`ALTER TABLE ... DROP COLUMN IF EXISTS value` — это операция над метаданными, без
+перезаписи таблицы. **Место в уже записанных страницах вернётся только при
+`VACUUM FULL`**; до него уменьшится лишь рост.
+
+На стенде 1.5 млн строк: таблица 180 → 145 МБ, индексы 277 → 70 МБ, запись батчем по
+2000 строк 34.4 → 24.1 мс.
+
+#### Хранение StatusCode
+
+OPC UA `StatusCode` — это **UInt32**, а колонка `statuscode` объявлена `INTEGER`, то есть
+signed int32. Любой код семейства Bad имеет установленный старший бит и в неё не влезает:
+`BadNoData` = `0x809B0000` = 2157641728 > `INT32_MAX`. Раньше такая запись падала на уровне
+asyncpg, ошибку проглатывал широкий `except`, и значение терялось — а в батчевом режиме
+вместе со всем батчем.
+
+Начиная с 0.2.24 в колонку пишется **знаковая проекция** UInt32: значения выше `INT32_MAX`
+хранятся как отрицательные числа. Это биекция без потерь, и она не требует ни `ALTER COLUMN
+TYPE BIGINT`, ни вызванной им перезаписи таблицы под `ACCESS EXCLUSIVE`. Код приложения
+работает с обычными UInt32 — преобразование скрыто в `uapg.status_code`.
+
+**Если вы читаете таблицу своим SQL**, приводите статус обратно:
+
+```sql
+SELECT sourcetimestamp,
+       CASE WHEN statuscode < 0 THEN statuscode + 4294967296 ELSE statuscode END AS statuscode
+FROM history.variables_history
+WHERE variable_id = 42;
+```
+
+Строки, записанные до 0.2.24, содержат только `Good` и коды семейства `Uncertain` — они
+неотрицательные, поэтому и выражение выше, и чтение через uapg возвращают их без изменений.
+
 ### Батчевая запись
 
 HistoryTimescale поддерживает оптимизированную батчевую запись данных:
@@ -364,6 +406,7 @@ await history.refresh_history_metrics_nodes()
 - `events_v2.backfill_probe_failures_total` (HistoryTimescaleV2) - проба готовности бэкфила не получила ответа; ненулевое значение обычно означает, что индекс `idx_events_history_id` не создан, и его стоит создать вручную.
 - `events_v2.trgm_indexes_missing`, `events_v2.trgm_extension_available` (HistoryTimescaleV2) - показывает, обслуживается ли поиск по подстроке индексом. Ненулевое `trgm_indexes_missing` или `trgm_extension_available = false` означают, что `ILIKE '%...%'` идёт просмотром окна.
 - `indexes.startup_missing` - сколько индексов старт пропустил при `ensure_indexes_on_startup=False`; их строит `uapg indexes apply`.
+- `indexes.startup_obsolete` - сколько индексов uapg больше не ожидает. Старт их **не удаляет**: `DROP INDEX` необратим, а снаружи по ним могут ходить чужие запросы. Удаляет `uapg indexes apply --drop-obsolete`; `uapg indexes plan` показывает их вместе с `idx_scan` из `pg_stat_all_indexes`.
 - `events_v2.migrations_deferred` - сколько оптимизационных SQL-миграций старт отложил из-за прав (объекты схемы принадлежат другой роли); их применяет `uapg migrations apply --user <owner>`.
 
 Per-variable и per-event retention cleanup в write path не выполняется. Для автоматического удаления старых данных используйте глобальную TimescaleDB retention policy через `global_retention_period` или отдельные административные cleanup-команды.

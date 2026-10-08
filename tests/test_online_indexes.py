@@ -8,6 +8,8 @@ import pytest
 from uapg.history_timescale_v2 import HistoryTimescaleV2
 from uapg.maintenance import indexes_cli
 from uapg.maintenance.online_indexes import (
+    OBSOLETE_INDEX_SPECS,
+    format_plan,
     CORE_INDEX_SPECS,
     SCOPE_TRGM,
     V2_INDEX_SPECS,
@@ -36,6 +38,7 @@ class FakeConn:
                 "event_types", "variables_last_value", "evt_alarm"),
         hypertables=("variables_history", "events_history"),
         indexes: Optional[Dict[str, bool]] = None,
+        index_scans: Optional[Dict[str, int]] = None,
         trgm_rows=(),
         fail_on: str = "",
         in_transaction: bool = False,
@@ -45,6 +48,7 @@ class FakeConn:
         self.tables = set(tables)
         self.hypertables = set(hypertables)
         self.indexes = dict(indexes or {})
+        self.index_scans = dict(index_scans or {})
         self.trgm_rows = list(trgm_rows)
         self.fail_on = fail_on
         self.in_transaction = in_transaction
@@ -68,7 +72,11 @@ class FakeConn:
         if "timescaledb_information.hypertables" in sql:
             return [{"hypertable_name": t} for t in self.hypertables]
         if "pg_index" in sql:
-            return [{"relname": n, "indisvalid": v} for n, v in self.indexes.items() if n in args[1]]
+            return [
+                {"relname": n, "indisvalid": v, "idx_scan": self.index_scans.get(n)}
+                for n, v in self.indexes.items()
+                if n in args[1]
+            ]
         raise AssertionError(sql)
 
     async def execute(self, sql: str, *args: Any) -> str:
@@ -92,9 +100,30 @@ def _all_present(**overrides: bool) -> Dict[str, bool]:
 def test_catalog_names_are_unique_and_lookup_works():
     names = [s.name for s in (*CORE_INDEX_SPECS, *V2_INDEX_SPECS)]
     assert len(names) == len(set(names))
-    assert len(CORE_INDEX_SPECS) == 24
+    assert len(CORE_INDEX_SPECS) == 18
     assert find_index_spec("idx_events_history_id").table == "events_history"
     assert find_index_spec("idx_nope") is None
+
+
+def test_obsolete_catalog_does_not_overlap_with_expected_indexes():
+    """Иначе старт создавал бы то, что инструмент удаляет, и наоборот."""
+    expected = {s.name for s in (*CORE_INDEX_SPECS, *V2_INDEX_SPECS)}
+    obsolete = {s.name for s in OBSOLETE_INDEX_SPECS}
+
+    assert obsolete, "каталог лишних индексов не должен быть пустым после 0.2.25"
+    assert not (expected & obsolete)
+    # find_index_spec ищет только ожидаемые: лишний индекс не должен находиться,
+    # иначе _ensure_index на старте принял бы его за свой.
+    for name in obsolete:
+        assert find_index_spec(name) is None
+
+
+def test_unique_index_backing_on_conflict_stays_in_catalog():
+    """На нём держится ON CONFLICT всех записей и однозначность continuation point."""
+    spec = find_index_spec("idx_variables_varid_sourcets")
+
+    assert spec is not None and spec.unique
+    assert spec.definition == "(variable_id, sourcetimestamp)"
 
 
 def test_create_sql_startup_plain_and_online_variants():
@@ -110,10 +139,17 @@ def test_create_sql_startup_plain_and_online_variants():
     assert spec.drop_sql("h", online=True, hypertable=True) == 'DROP INDEX IF EXISTS "h"."idx_a"'
 
 
-def test_covering_index_keeps_include_before_with_clause():
-    spec = find_index_spec("idx_variables_history_vid_ts_desc_covering")
-    sql = spec.create_sql("h", online=True, hypertable=True)
-    assert "INCLUDE (statuscode, varianttype, servertimestamp) WITH (timescaledb.transaction_per_chunk)" in sql
+def test_covering_index_is_obsolete_and_drops_without_concurrently_on_hypertable():
+    """Покрывающий индекс уехал в лишние: его единственным потребителем был фолбэк
+    read_last_value, который теперь берёт variantbinary тем же запросом."""
+    spec = next(s for s in OBSOLETE_INDEX_SPECS
+                if s.name == "idx_variables_history_vid_ts_desc_covering")
+
+    # CONCURRENTLY недопустим на hypertable — drop_sql обязан его опустить.
+    assert spec.drop_sql("h", online=True, hypertable=True) == (
+        'DROP INDEX IF EXISTS "h"."idx_variables_history_vid_ts_desc_covering"'
+    )
+    assert "CONCURRENTLY" in spec.drop_sql("h", online=True, hypertable=False)
 
 
 def test_trgm_spec_matches_startup_ddl_name_and_definition():
@@ -412,3 +448,89 @@ async def test_registry_write_path_respects_trgm_disabled():
     statements = [call.args[0] for call in execute.await_args_list]
     assert any('ADD COLUMN IF NOT EXISTS "techplace"' in s for s in statements)
     assert not any("gin_trgm_ops" in s for s in statements)
+
+
+# --------------------------------------------------------------------------
+# Лишние индексы: uapg их больше не ожидает
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_build_plan_reports_obsolete_index_with_scan_count():
+    """Раньше такой индекс не попадал в план вовсе: выборка pg_index фильтруется по
+    именам из каталога, поэтому удалённую из каталога запись никто бы не заметил."""
+    stale = "idx_variables_history_vid_ts_desc_covering"
+    conn = FakeConn(
+        indexes=_all_present(**{stale: True}),
+        index_scans={stale: 0},
+    )
+
+    plan = await build_plan(conn, "h")
+
+    item = next(i for i in plan.items if i.spec.name == stale)
+    assert item.status == "obsolete"
+    assert item.idx_scan == 0
+    assert item.obsolete and not item.pending
+    # В pending попадать не должен: это не «надо построить».
+    assert stale not in {i.spec.name for i in plan.pending}
+    assert stale in {i.spec.name for i in plan.obsolete}
+    assert plan.counts()["obsolete"] == 1
+    # На hypertable DROP идёт без CONCURRENTLY.
+    assert item.to_dict("h")["sql"] == f'DROP INDEX IF EXISTS "h"."{stale}"'
+
+
+@pytest.mark.asyncio
+async def test_build_plan_ignores_obsolete_index_that_is_already_gone():
+    conn = FakeConn(indexes=_all_present())
+
+    plan = await build_plan(conn, "h")
+
+    assert plan.obsolete == []
+    assert "obsolete" not in plan.counts()
+
+
+@pytest.mark.asyncio
+async def test_apply_plan_requires_flag_to_drop_obsolete():
+    stale = "idx_variables_server_timestamp"
+
+    conn = FakeConn(indexes=_all_present(**{stale: True}), index_scans={stale: 0})
+    plan = await build_plan(conn, "h")
+    results = await apply_plan(conn, plan)
+    assert [r.action for r in results] == ["skipped"]
+    assert not any("DROP INDEX" in sql for sql in conn.executed)
+
+    conn = FakeConn(indexes=_all_present(**{stale: True}), index_scans={stale: 0})
+    plan = await build_plan(conn, "h")
+    results = await apply_plan(conn, plan, drop_obsolete=True)
+    assert [r.action for r in results] == ["dropped"]
+    assert any(sql.startswith("DROP INDEX") and stale in sql for sql in conn.executed)
+    # Из плана запись уходит: повторный проход её уже не увидит.
+    assert plan.obsolete == []
+
+
+@pytest.mark.asyncio
+async def test_sql_script_comments_out_drop_without_flag():
+    stale = "idx_variables_variable_id"
+    conn = FakeConn(indexes=_all_present(**{stale: True}), index_scans={stale: 7})
+    plan = await build_plan(conn, "h")
+
+    script = plan.sql_script()
+    assert f'-- DROP INDEX IF EXISTS "h"."{stale}";  -- нужен --drop-obsolete' in script
+    assert "idx_scan: 7" in script
+
+    script = plan.sql_script(drop_obsolete=True)
+    assert f'DROP INDEX IF EXISTS "h"."{stale}";' in script
+    assert "нужен --drop-obsolete" not in script
+
+
+@pytest.mark.asyncio
+async def test_format_plan_shows_obsolete_count_and_hint():
+    stale = "idx_variables_variable_id"
+    conn = FakeConn(indexes=_all_present(**{stale: True}), index_scans={stale: 0})
+    plan = await build_plan(conn, "h")
+
+    text = format_plan(plan)
+
+    assert "obsolete=1" in text
+    assert "idx_scan=0" in text
+    assert "uapg indexes apply --drop-obsolete" in text

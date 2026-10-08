@@ -76,6 +76,11 @@ def build_parser(prog: str = "uapg indexes", defaults: Optional[Mapping[str, Any
         help="all или CSV из core,v2,trgm (по умолчанию all)",
     )
     common.add_argument("--fix-invalid", action="store_true", help="пересоздавать индексы INVALID от прерванной сборки")
+    common.add_argument(
+        "--drop-obsolete",
+        action="store_true",
+        help="удалять индексы, которые uapg больше не ожидает (необратимо)",
+    )
 
     parser = argparse.ArgumentParser(
         prog=prog,
@@ -122,7 +127,14 @@ async def run(
         plan = await build_plan(conn, args.schema, scopes=args.scope, events_config=_events_config(args))
         if args.action == "plan":
             if args.sql:
-                print(plan.sql_script(fix_invalid=args.fix_invalid, lock_timeout_sec=args.lock_timeout), end="")
+                print(
+                    plan.sql_script(
+                        fix_invalid=args.fix_invalid,
+                        drop_obsolete=args.drop_obsolete,
+                        lock_timeout_sec=args.lock_timeout,
+                    ),
+                    end="",
+                )
             elif args.json:
                 print(json.dumps(plan.to_dict(), ensure_ascii=False, indent=2))
             else:
@@ -134,6 +146,7 @@ async def run(
             plan,
             lock_timeout_sec=args.lock_timeout,
             fix_invalid=args.fix_invalid,
+            drop_obsolete=args.drop_obsolete,
             dry_run=args.dry_run,
             create_extension=not args.no_create_extension,
         )
@@ -145,7 +158,7 @@ async def run(
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
             if not results:
-                print("Недостающих индексов нет.")
+                print("Недостающих и лишних индексов нет.")
             for r in results:
                 suffix = f" error={r.error}" if r.error else ""
                 print(f"{r.action:<8} {r.name} {r.duration_sec:.1f}s{suffix}")

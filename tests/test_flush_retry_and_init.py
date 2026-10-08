@@ -27,7 +27,6 @@ def _sample_item() -> VariableWriteItem:
         source_timestamp=now,
         server_timestamp=now,
         status_code=0,
-        value_str="1.0",
         variant_type=11,
         variant_binary=b"\x00",
         group_key="g",
@@ -183,7 +182,11 @@ async def test_ensure_index_disabled_skips_populated_table_and_reports_online_dd
     online = history._startup_indexes_missing["idx_events_timestamp"]
     assert "WITH (timescaledb.transaction_per_chunk)" in online
     metrics = history.get_performance_metrics()["indexes"]
-    assert metrics == {"ensure_on_startup": False, "startup_missing": 1}
+    assert metrics == {
+        "ensure_on_startup": False,
+        "startup_missing": 1,
+        "startup_obsolete": 0,
+    }
 
 
 @pytest.mark.asyncio

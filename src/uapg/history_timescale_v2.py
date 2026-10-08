@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 from asyncua import ua
 
@@ -541,7 +541,8 @@ class HistoryTimescaleV2(HistoryTimescale):
         # Чтение не ждёт следующего flush: само поднимает пул и перепривязывает EventStoreV2.
         await self._ensure_pool()
 
-        start_time, end_time, order, limit = self._get_bounds(start, end, nb_values)
+        key_prefix = f"evt2:{self._format_node_id(source_id)}"
+        window = self._resolve_read_window(key_prefix, start, end, nb_values)
         source_db_id = await self._resolve_source_db_id(source_id)
         if source_db_id is None:
             return [], None
@@ -553,20 +554,36 @@ class HistoryTimescaleV2(HistoryTimescale):
             # (partial=true, если отстал любой источник) и влияет только на DEBUG-лог.
             partial = not await self._is_events_backfill_complete()
 
+        # Курсор EventStoreV2 — пара (event_timestamp, event_id): в events_ts ключ
+        # (source_id, event_timestamp, event_id), и на одну метку приходится несколько
+        # событий. Наружу asyncua пропускает только метку, поэтому event_id берётся из
+        # хранилища выданных continuation points. Раньше здесь жёстко стояло
+        # continuation=None, а event_id на выходе отбрасывался, и вся keyset-пагинация
+        # v2 была недостижима из OPC UA.
+        inbound: Optional[Tuple[datetime, int]] = None
+        if window.resumed and window.cursor_event_id is not None:
+            inbound = (start, int(window.cursor_event_id))
+
         results, cont, is_partial = await self._event_store.read_events(
             source_db_id,
-            start_time,
-            end_time,
-            limit,
-            order,
+            window.start_time,
+            window.end_time,
+            window.page_limit,
+            window.order,
             evfilter,
             self._binary_map_to_event_values,
-            continuation=None,
+            continuation=inbound,
             partial=partial,
         )
         if is_partial and self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug("read_event_history v2 partial=true (backfill incomplete)")
-        opc_cont: Optional[Union[datetime, Tuple[datetime, int]]] = cont[0] if cont else None
+
+        opc_cont: Optional[datetime] = None
+        if cont is not None:
+            cont_ts, cont_event_id = cont
+            opc_cont = self._issue_continuation(
+                key_prefix, window, cont_ts, len(results), event_id=cont_event_id
+            )
         return results, opc_cont
 
     async def run_events_backfill(self, batch_size: int = 500) -> Dict[str, int]:
