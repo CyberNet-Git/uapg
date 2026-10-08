@@ -1,6 +1,6 @@
 [project]
 name = "uapg"
-version = "0.2.21"
+version = "0.2.22"
 description = "OPC UA PostgreSQL History Storage Backend"
 readme = "README.md"
 authors = [
@@ -18,7 +18,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 dependencies = [
-    "asyncua>=1.1.8",
+    "asyncua>=1.1.8,<2",
     "asyncpg>=0.31.0",
 ]
 

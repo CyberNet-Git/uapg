@@ -136,7 +136,8 @@ class TestHistoryPgSQL:
             Value=ua.Variant(42.0, ua.VariantType.Double),
             SourceTimestamp=datetime.now(timezone.utc),
             ServerTimestamp=datetime.now(timezone.utc),
-            StatusCode=ua.StatusCode(ua.StatusCodes.Good),
+            # На целевой asyncua 1.x поле называется StatusCode_; StatusCode — только property.
+            StatusCode_=ua.StatusCode(ua.StatusCodes.Good),
         )
         
         await connected.save_node_value(node_id, datavalue)
