@@ -25,7 +25,11 @@ from asyncua.ua.ua_binary import variant_from_binary, variant_to_binary
 
 # Импорт для работы с зашифрованной конфигурацией
 from .db_manager import DatabaseManager
-from .maintenance.online_indexes import CORE_INDEX_SPECS, find_index_spec
+from .maintenance.online_indexes import (
+    CORE_INDEX_SPECS,
+    OBSOLETE_INDEX_SPECS,
+    find_index_spec,
+)
 from .read_continuation import ReadContinuation, ReadContinuationStore, ReadWindow
 from .status_code import decode_status, status_from_datavalue
 
@@ -66,7 +70,6 @@ class VariableWriteItem:
     # Уже закодированное значение для колонки (см. uapg.status_code):
     # в буфер приходит знаковая проекция UInt32, а не сырой статус.
     status_code: int
-    value_str: str
     variant_type: int
     variant_binary: bytes
     group_key: str
@@ -926,6 +929,9 @@ class HistoryTimescale(HistoryStorageInterface):
         self._ensure_indexes_on_startup = bool(ensure_indexes_on_startup)
         # Индексы, пропущенные на старте при ensure_indexes_on_startup=False: имя -> онлайн-DDL.
         self._startup_indexes_missing: Dict[str, str] = {}
+        # Лишние индексы: старт их только показывает. Удаление индекса необратимо,
+        # поэтому решение за оператором — uapg indexes apply --drop-obsolete.
+        self._startup_indexes_obsolete: Dict[str, str] = {}
         # Последнее время, когда мы писали агрегированное сообщение о длительной недоступности БД
         self._last_reconnect_outage_log_at = None
         self._failed_value_saves_counter = 0
@@ -1241,6 +1247,7 @@ class HistoryTimescale(HistoryStorageInterface):
                 "ensure_on_startup": bool(self._ensure_indexes_on_startup),
                 # > 0: индекс не построен на старте и ждёт онлайн-сборки (uapg indexes apply).
                 "startup_missing": len(self._startup_indexes_missing),
+                "startup_obsolete": len(self._startup_indexes_obsolete),
             },
             # Промахи говорят, что продолжения приходят без известного нам состояния:
             # направление DESC-чтения тогда восстановить нельзя. Первый запрос каждого
@@ -2555,6 +2562,49 @@ class HistoryTimescale(HistoryStorageInterface):
                 e,
             )
 
+    async def _report_obsolete_indexes(self) -> None:
+        """Сообщить об индексах, которые uapg больше не ожидает.
+
+        Старт их не удаляет: `DROP INDEX` необратим, а снаружи по этим индексам могут
+        ходить чужие запросы и дашборды, про которые код ничего не знает. Это та же
+        позиция, что и для дорогой сборки индексов, — инструмент в CLI, решение за
+        оператором.
+        """
+        self._startup_indexes_obsolete.clear()
+        # Список гипертаблиц берём одним запросом и только когда расширение есть.
+        # Иначе обращение к timescaledb_information на чистом PostgreSQL бросает внутри
+        # _fetchval, а тот вызывает _force_reconnect — и старт пересоздавал бы пул по
+        # разу на каждый индекс.
+        hypertables: set = set()
+        try:
+            if await self._timescaledb_available():
+                rows = await self._fetch(
+                    "SELECT hypertable_name FROM timescaledb_information.hypertables"
+                    " WHERE hypertable_schema = $1",
+                    self._schema,
+                )
+                hypertables = {str(r["hypertable_name"]) for r in rows}
+        except Exception as e:
+            self.logger.debug("Cannot list hypertables for obsolete index report: %r", e)
+
+        for spec in OBSOLETE_INDEX_SPECS:
+            try:
+                if await self._index_state(spec.name) is None:
+                    continue
+                self._startup_indexes_obsolete[spec.name] = spec.drop_sql(
+                    self._schema, online=True, hypertable=spec.table in hypertables
+                )
+            except Exception as e:
+                self.logger.debug("Cannot check obsolete index %s: %r", spec.name, e)
+                return
+        if self._startup_indexes_obsolete:
+            self.logger.warning(
+                "Found %d obsolete index(es) uapg no longer needs: %s. "
+                "Drop them online: uapg indexes apply --drop-obsolete",
+                len(self._startup_indexes_obsolete),
+                ", ".join(sorted(self._startup_indexes_obsolete)),
+            )
+
     async def _create_metadata_tables(self) -> None:
         """Создание единых таблиц для историзации в указанной схеме."""
         try:
@@ -2569,7 +2619,6 @@ class HistoryTimescale(HistoryStorageInterface):
                     servertimestamp TIMESTAMPTZ NOT NULL,
                     sourcetimestamp TIMESTAMPTZ NOT NULL,
                     statuscode INTEGER,
-                    value TEXT,
                     varianttype INTEGER,
                     variantbinary BYTEA,
                     created_at TIMESTAMPTZ DEFAULT NOW()
@@ -2649,11 +2698,22 @@ class HistoryTimescale(HistoryStorageInterface):
                 ALTER TABLE "{self._schema}".variables_last_value
                 ADD COLUMN IF NOT EXISTS is_seed BOOLEAN NOT NULL DEFAULT FALSE
             ''')
+
+            # Колонка value хранила str() от значения и не читалась ни одним запросом:
+            # всё восстанавливается из variantbinary. DROP COLUMN в PostgreSQL — операция
+            # над метаданными, без перезаписи таблицы, и на hypertable распространяется
+            # на чанки так же. Место в уже записанных страницах вернётся только при
+            # VACUUM FULL.
+            await self._execute(f'''
+                ALTER TABLE "{self._schema}".variables_history
+                DROP COLUMN IF EXISTS value
+            ''')
             
             # Каталог общий с uapg.maintenance.online_indexes: старт и онлайн-сборка
             # должны видеть одинаковые имена и определения.
             for spec in CORE_INDEX_SPECS:
                 await self._ensure_index(spec.name, spec.create_sql(self._schema))
+            await self._report_obsolete_indexes()
             
             self.logger.info(f"Unified history tables created successfully in schema '{self._schema}'")
             
@@ -2870,7 +2930,6 @@ class HistoryTimescale(HistoryStorageInterface):
                 it.server_timestamp,
                 it.source_timestamp,
                 it.status_code,
-                it.value_str,
                 it.variant_type,
                 it.variant_binary,
             )
@@ -2901,8 +2960,8 @@ class HistoryTimescale(HistoryStorageInterface):
                         insert_started_at = time.perf_counter()
                         await conn.executemany(
                             f'INSERT INTO "{self._schema}".variables_history '
-                            f'(variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) '
-                            f'VALUES ($1, $2, $3, $4, $5, $6, $7) '
+                            f'(variable_id, servertimestamp, sourcetimestamp, statuscode, varianttype, variantbinary) '
+                            f'VALUES ($1, $2, $3, $4, $5, $6) '
                             f'ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
                             history_params,
                             timeout=flush_timeout,
@@ -3652,7 +3711,6 @@ class HistoryTimescale(HistoryStorageInterface):
                 self._variable_metadata_cache[node_id_str] = variable_id
 
             # Подготовка данных для записи
-            value_str = str(datavalue.Value.Value)
             variant_type = int(datavalue.Value.VariantType)
             variant_binary = variant_to_binary(datavalue.Value)
 
@@ -3669,7 +3727,6 @@ class HistoryTimescale(HistoryStorageInterface):
                     source_timestamp=datavalue.SourceTimestamp,
                     server_timestamp=datavalue.ServerTimestamp,
                     status_code=status_from_datavalue(datavalue),
-                    value_str=value_str,
                     variant_type=variant_type,
                     variant_binary=variant_binary,
                     group_key=group_key,
@@ -3681,12 +3738,11 @@ class HistoryTimescale(HistoryStorageInterface):
             else:
                 # Синхронная запись как раньше (без батчирования)
                 await self._execute(
-                    f'INSERT INTO "{self._schema}".variables_history (variable_id, servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
+                    f'INSERT INTO "{self._schema}".variables_history (variable_id, servertimestamp, sourcetimestamp, statuscode, varianttype, variantbinary) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (variable_id, sourcetimestamp) DO NOTHING',
                     variable_id,
                     datavalue.ServerTimestamp,
                     datavalue.SourceTimestamp,
                     status_from_datavalue(datavalue),
-                    value_str,
                     variant_type,
                     variant_binary,
                 )
@@ -3927,7 +3983,7 @@ class HistoryTimescale(HistoryStorageInterface):
 
             # Запрос к единой таблице переменных
             select_sql = f'''
-                SELECT servertimestamp, sourcetimestamp, statuscode, value, varianttype, variantbinary
+                SELECT servertimestamp, sourcetimestamp, statuscode, variantbinary
                 FROM "{self._schema}".variables_history
                 WHERE variable_id = $1 AND sourcetimestamp BETWEEN $2 AND $3
                 ORDER BY sourcetimestamp {order}
@@ -4046,7 +4102,7 @@ class HistoryTimescale(HistoryStorageInterface):
             # планировщику выбрать индекс по параметру, известному только на исполнении.
             cursor_op = ">" if order == "ASC" else "<"
             select_head = f'''
-                SELECT event_timestamp, event_type_id, event_data
+                SELECT event_timestamp, event_data
                 FROM "{self._schema}".events_history
                 WHERE source_id = $1 AND event_timestamp BETWEEN $2 AND $3'''
             select_tail = f'''
@@ -4372,40 +4428,30 @@ class HistoryTimescale(HistoryStorageInterface):
                     ServerTimestamp=row['servertimestamp']
                 )
             
-            # Fallback: получаем из основной таблицы через покрывающий индекс
+            # Fallback: одно обращение к истории. Раньше здесь было два: первый запрос
+            # шёл index-only по покрывающему индексу, второй добирал variantbinary из
+            # heap — то есть первый был чистыми накладными расходами. Сортировку
+            # обслуживает UNIQUE-индекс (variable_id, sourcetimestamp): btree сканируется
+            # в обе стороны, в плане это Index Scan Backward. Заодно ушёл varianttype,
+            # который здесь выбирался и не использовался.
             self._cache_stats["last_values_table_misses"] += 1
             row = await self._fetchrow(f'''
-                SELECT sourcetimestamp, servertimestamp, statuscode, varianttype
+                SELECT sourcetimestamp, servertimestamp, statuscode, variantbinary
                 FROM "{self._schema}".variables_history
                 WHERE variable_id = $1
                 ORDER BY sourcetimestamp DESC
                 LIMIT 1
             ''', variable_id)
-            
+
             if row is not None:
                 self._cache_stats["last_values_history_fallbacks"] += 1
-                # Получаем variantbinary отдельным запросом
-                variantbinary_row = await self._fetchrow(f'''
-                    SELECT variantbinary
-                    FROM "{self._schema}".variables_history
-                    WHERE variable_id = $1 AND sourcetimestamp = $2
-                    LIMIT 1
-                ''', variable_id, row['sourcetimestamp'])
-                
-                if variantbinary_row is not None:
-                    variantbinary = variantbinary_row['variantbinary']
-                else:
-                    return None
-            
-            if row is not None:
-                # Преобразуем в DataValue
                 return ua.DataValue(
-                    Value=variant_from_binary(Buffer(variantbinary)),
+                    Value=variant_from_binary(Buffer(row['variantbinary'])),
                     StatusCode_=ua.StatusCode(decode_status(row['statuscode'])),
                     SourceTimestamp=row['sourcetimestamp'],
                     ServerTimestamp=row['servertimestamp']
                 )
-            
+
             return None
             
         except Exception as e:

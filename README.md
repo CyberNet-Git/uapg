@@ -309,6 +309,18 @@ HistoryTimescale использует новую архитектуру с ед�
 - **`event_types`** - Типы событий
 - **`variables_last_value`** - Кэш последних значений переменных
 
+#### Чем занята `variables_history`
+
+Значение хранится один раз — в `variantbinary`. Колонки `value TEXT` (она держала
+`str()` от значения) с 0.2.25 нет: ни один запрос её не читал, всё восстанавливается из
+двоичного представления. На существующих базах старт выполняет
+`ALTER TABLE ... DROP COLUMN IF EXISTS value` — это операция над метаданными, без
+перезаписи таблицы. **Место в уже записанных страницах вернётся только при
+`VACUUM FULL`**; до него уменьшится лишь рост.
+
+На стенде 1.5 млн строк: таблица 180 → 145 МБ, индексы 277 → 70 МБ, запись батчем по
+2000 строк 34.4 → 24.1 мс.
+
 #### Хранение StatusCode
 
 OPC UA `StatusCode` — это **UInt32**, а колонка `statuscode` объявлена `INTEGER`, то есть
@@ -394,6 +406,7 @@ await history.refresh_history_metrics_nodes()
 - `events_v2.backfill_probe_failures_total` (HistoryTimescaleV2) - проба готовности бэкфила не получила ответа; ненулевое значение обычно означает, что индекс `idx_events_history_id` не создан, и его стоит создать вручную.
 - `events_v2.trgm_indexes_missing`, `events_v2.trgm_extension_available` (HistoryTimescaleV2) - показывает, обслуживается ли поиск по подстроке индексом. Ненулевое `trgm_indexes_missing` или `trgm_extension_available = false` означают, что `ILIKE '%...%'` идёт просмотром окна.
 - `indexes.startup_missing` - сколько индексов старт пропустил при `ensure_indexes_on_startup=False`; их строит `uapg indexes apply`.
+- `indexes.startup_obsolete` - сколько индексов uapg больше не ожидает. Старт их **не удаляет**: `DROP INDEX` необратим, а снаружи по ним могут ходить чужие запросы. Удаляет `uapg indexes apply --drop-obsolete`; `uapg indexes plan` показывает их вместе с `idx_scan` из `pg_stat_all_indexes`.
 - `events_v2.migrations_deferred` - сколько оптимизационных SQL-миграций старт отложил из-за прав (объекты схемы принадлежат другой роли); их применяет `uapg migrations apply --user <owner>`.
 
 Per-variable и per-event retention cleanup в write path не выполняется. Для автоматического удаления старых данных используйте глобальную TimescaleDB retention policy через `global_retention_period` или отдельные административные cleanup-команды.

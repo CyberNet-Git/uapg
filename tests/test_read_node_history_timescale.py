@@ -203,3 +203,65 @@ def test_asyncua_datavalue_uses_statuscode_underscore_field():
     )
 
     assert datavalue.StatusCode.value == 0
+
+
+class TestFetchIsNarrow:
+    """Колонки, которых не читает потребитель, не должны уезжать по сети.
+
+    `value` (TEXT, `str()` от значения) и `varianttype` выбирались и не использовались:
+    тип восстанавливает `variant_from_binary` из самого блоба. Измерено на 1.5 млн строк:
+    1.30 мс из 14.58 мс выборки 10000 точек.
+    """
+
+    @pytest.mark.asyncio
+    async def test_read_node_history_selects_only_what_it_uses(self):
+        history = _history()
+        node_id = ua.NodeId("TestVariable", 1)
+        history._datachanges_period[node_id] = (timedelta(days=1), 1000, VARIABLE_ID)
+        source_ts = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
+        history._fetch = AsyncMock(
+            return_value=[_row(ua.Variant(1.0, ua.VariantType.Double), source_ts, source_ts)]
+        )
+
+        results, _ = await history.read_node_history(
+            node_id, source_ts - timedelta(hours=1), source_ts + timedelta(hours=1), 100
+        )
+
+        sql = history._fetch.await_args.args[0]
+        projection = sql.split("FROM")[0]
+        assert "variantbinary" in projection and "statuscode" in projection
+        assert " value" not in projection, "колонка value не читается ни одним потребителем"
+        assert "varianttype" not in projection
+        # И результат при этом прежний.
+        assert len(results) == 1 and results[0].Value.Value == 1.0
+
+    @pytest.mark.asyncio
+    async def test_read_last_value_history_fallback_makes_one_round_trip(self):
+        """Раньше их было два: index-only запрос, а затем добор variantbinary из heap."""
+        history = _history()
+        node_id = ua.NodeId("TestVariable", 1)
+        history._datachanges_period[node_id] = (timedelta(days=1), 1000, VARIABLE_ID)
+        source_ts = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
+        row = {
+            "sourcetimestamp": source_ts,
+            "servertimestamp": source_ts,
+            "statuscode": 0,
+            "variantbinary": variant_to_binary(ua.Variant(7.5, ua.VariantType.Double)),
+        }
+
+        calls = []
+
+        async def _fetchrow(sql, *args):
+            calls.append(sql)
+            # Первый запрос идёт в таблицу-кэш последних значений — там промах.
+            return None if "variables_last_value" in sql else row
+
+        history._fetchrow = _fetchrow  # type: ignore[assignment]
+
+        datavalue = await history.read_last_value(node_id)
+
+        assert datavalue is not None
+        assert datavalue.Value.Value == 7.5
+        history_queries = [s for s in calls if "variables_history" in s]
+        assert len(history_queries) == 1, "фолбэк по истории обязан укладываться в один запрос"
+        assert "variantbinary" in history_queries[0]

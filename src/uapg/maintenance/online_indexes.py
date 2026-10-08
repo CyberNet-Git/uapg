@@ -38,6 +38,8 @@ STATUS_PRESENT = "present"
 STATUS_MISSING = "missing"
 STATUS_INVALID = "invalid"
 STATUS_NO_TABLE = "no_table"
+# Индекс есть в БД, но uapg его больше не ожидает: удалять только по явному флагу.
+STATUS_OBSOLETE = "obsolete"
 
 
 @dataclass(frozen=True)
@@ -73,9 +75,7 @@ def _core(name: str, table: str, definition: str, *, unique: bool = False) -> In
 
 # Индексы единых таблиц HistoryTimescale; старт и инструмент берут их отсюда.
 CORE_INDEX_SPECS: Tuple[IndexSpec, ...] = (
-    _core("idx_variables_variable_id", "variables_history", "(variable_id)"),
     _core("idx_variables_timestamp", "variables_history", "(sourcetimestamp)"),
-    _core("idx_variables_server_timestamp", "variables_history", "(servertimestamp)"),
     _core("idx_variables_varid_sourcets", "variables_history", "(variable_id, sourcetimestamp)", unique=True),
     _core("idx_events_source_id", "events_history", "(source_id)"),
     _core("idx_events_event_type_id", "events_history", "(event_type_id)"),
@@ -88,23 +88,41 @@ CORE_INDEX_SPECS: Tuple[IndexSpec, ...] = (
     _core("idx_event_sources_node_id", "event_sources", "(source_node_id)", unique=True),
     _core("idx_event_types_name", "event_types", "(event_type_name)", unique=True),
     _core("idx_variable_metadata_node_id", "variable_metadata", "(node_id)", unique=True),
+    _core("idx_events_history_type_source", "events_history", "(event_type_id, source_id)"),
+    _core("idx_variable_metadata_created", "variable_metadata", "(created_at)"),
+    _core("idx_event_sources_created", "event_sources", "(created_at)"),
+    _core("idx_event_types_created", "event_types", "(created_at)"),
+    _core("idx_variables_last_value_updated", "variables_last_value", "(updated_at)"),
+)
+
+# Индексы, которые uapg создавал раньше и больше не ожидает. Каталог нужен потому, что
+# удаление записи из CORE_INDEX_SPECS только перестаёт её создавать: build_plan фильтрует
+# pg_index по именам из каталога, поэтому индекс, которого в каталоге нет, не попадает в
+# выборку вовсе и остаётся в базе навсегда. Определение здесь — документация: drop_sql
+# работает по имени.
+OBSOLETE_INDEX_SPECS: Tuple[IndexSpec, ...] = (
+    # Строгий префикс UNIQUE-индекса (variable_id, sourcetimestamp).
+    _core("idx_variables_variable_id", "variables_history", "(variable_id)"),
+    # Копия того же UNIQUE-индекса минус уникальность.
     _core(
         "idx_variables_history_variable_id_timestamp",
         "variables_history",
         "(variable_id, sourcetimestamp)",
     ),
-    _core("idx_events_history_source_timestamp", "events_history", "(source_id, event_timestamp)"),
-    _core("idx_events_history_type_source", "events_history", "(event_type_id, source_id)"),
-    _core("idx_events_history_event_type_source", "events_history", "(event_type_id, source_id)"),
-    _core("idx_variable_metadata_created", "variable_metadata", "(created_at)"),
-    _core("idx_event_sources_created", "event_sources", "(created_at)"),
-    _core("idx_event_types_created", "event_types", "(created_at)"),
-    _core("idx_variables_last_value_updated", "variables_last_value", "(updated_at)"),
+    # Ни один запрос не фильтрует и не сортирует по servertimestamp.
+    _core("idx_variables_server_timestamp", "variables_history", "(servertimestamp)"),
+    # Покрывающий индекс обслуживал только фолбэк read_last_value, который теперь берёт
+    # variantbinary тем же запросом; все массовые LATERAL-запросы тянут variantbinary и
+    # index-only быть не могут в принципе. На стенде 130 МБ при idx_scan = 0.
     _core(
         "idx_variables_history_vid_ts_desc_covering",
         "variables_history",
         "(variable_id, sourcetimestamp DESC) INCLUDE (statuscode, varianttype, servertimestamp)",
     ),
+    # Копия UNIQUE-индекса (source_id, event_timestamp) минус уникальность.
+    _core("idx_events_history_source_timestamp", "events_history", "(source_id, event_timestamp)"),
+    # Байт-в-байт то же, что idx_events_history_type_source: два имени, одно определение.
+    _core("idx_events_history_event_type_source", "events_history", "(event_type_id, source_id)"),
 )
 
 # Индексы, которые добавляет HistoryTimescaleV2 поверх единых таблиц.
@@ -134,13 +152,26 @@ class IndexPlanItem:
     spec: IndexSpec
     status: str
     hypertable: bool = False
+    # Сколько раз планировщик воспользовался индексом (pg_stat_all_indexes.idx_scan).
+    # None — статистики нет (индекса нет в БД). Для лишних индексов это главный довод
+    # за или против удаления, и именно его мне не хватало, когда я принял покрывающий
+    # индекс за мёртвый по idx_scan = 0 на синтетическом стенде.
+    idx_scan: Optional[int] = None
 
     @property
     def pending(self) -> bool:
+        """Надо построить. Лишние индексы сюда не входят: у них своя ветка."""
         return self.status in (STATUS_MISSING, STATUS_INVALID)
+
+    @property
+    def obsolete(self) -> bool:
+        return self.status == STATUS_OBSOLETE
 
     def online_sql(self, schema: str) -> str:
         return self.spec.create_sql(schema, online=True, hypertable=self.hypertable)
+
+    def drop_online_sql(self, schema: str) -> str:
+        return self.spec.drop_sql(schema, online=True, hypertable=self.hypertable)
 
     def to_dict(self, schema: str) -> Dict[str, Any]:
         return {
@@ -149,7 +180,8 @@ class IndexPlanItem:
             "scope": self.spec.scope,
             "status": self.status,
             "hypertable": self.hypertable,
-            "sql": self.online_sql(schema),
+            "idx_scan": self.idx_scan,
+            "sql": self.drop_online_sql(schema) if self.obsolete else self.online_sql(schema),
         }
 
 
@@ -163,6 +195,11 @@ class IndexPlan:
     @property
     def pending(self) -> List[IndexPlanItem]:
         return [item for item in self.items if item.pending]
+
+    @property
+    def obsolete(self) -> List[IndexPlanItem]:
+        """Индексы, которые есть в БД и больше не нужны. Удаляются только по флагу."""
+        return [item for item in self.items if item.obsolete]
 
     def counts(self) -> Dict[str, int]:
         result: Dict[str, int] = {}
@@ -179,7 +216,13 @@ class IndexPlan:
             "items": [item.to_dict(self.schema) for item in self.items],
         }
 
-    def sql_script(self, *, fix_invalid: bool = False, lock_timeout_sec: float = 10.0) -> str:
+    def sql_script(
+        self,
+        *,
+        fix_invalid: bool = False,
+        drop_obsolete: bool = False,
+        lock_timeout_sec: float = 10.0,
+    ) -> str:
         """SQL для ручного запуска в psql (autocommit, без --single-transaction)."""
         lines = [
             f"-- uapg: онлайн-сборка индексов схемы {self.schema}",
@@ -188,8 +231,20 @@ class IndexPlan:
             "SET statement_timeout = 0;",
             f"SET lock_timeout = '{_lock_timeout_ms(lock_timeout_sec)}ms';",
         ]
+        obsolete = self.obsolete
+        if obsolete:
+            lines.append("")
+            lines.append("-- Лишние индексы: uapg их больше не ожидает.")
+            for item in obsolete:
+                scans = "неизвестно" if item.idx_scan is None else str(item.idx_scan)
+                lines.append(f"-- {item.spec.name} (использований idx_scan: {scans})")
+                drop = item.drop_online_sql(self.schema)
+                lines.append(
+                    f"{drop};" if drop_obsolete else f"-- {drop};  -- нужен --drop-obsolete"
+                )
         pending = self.pending
         if not pending:
+            lines.append("")
             lines.append("-- Недостающих индексов нет.")
             return "\n".join(lines) + "\n"
         if any(i.spec.scope == SCOPE_TRGM for i in pending) and not self.trgm_extension_available:
@@ -210,7 +265,7 @@ class IndexPlan:
 @dataclass
 class IndexApplyResult:
     name: str
-    action: str  # created | rebuilt | skipped | failed | dry_run
+    action: str  # created | rebuilt | dropped | skipped | failed | dry_run
     sql: str
     duration_sec: float = 0.0
     error: str = ""
@@ -309,18 +364,38 @@ async def build_plan(
         )
         hypertables = {str(r["hypertable_name"]) for r in ht_rows}
 
+    # Лишние индексы проверяются только в core-проходе: они относятся к единым таблицам.
+    obsolete_specs: List[IndexSpec] = list(OBSOLETE_INDEX_SPECS) if SCOPE_CORE in selected else []
+
     index_rows = await conn.fetch(
         """
-        SELECT c.relname, i.indisvalid
+        SELECT c.relname, i.indisvalid, s.idx_scan
         FROM pg_index i
         JOIN pg_class c ON c.oid = i.indexrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pg_stat_all_indexes s ON s.indexrelid = i.indexrelid
         WHERE n.nspname = $1 AND c.relname = ANY($2::text[])
         """,
         schema,
-        sorted({s.name for s in specs}),
+        sorted({sp.name for sp in (*specs, *obsolete_specs)}),
     )
     index_valid = {str(r["relname"]): bool(r["indisvalid"]) for r in index_rows}
+    index_scans = {
+        str(r["relname"]): (None if r["idx_scan"] is None else int(r["idx_scan"]))
+        for r in index_rows
+    }
+
+    for spec in obsolete_specs:
+        if spec.name not in index_valid:
+            continue  # уже удалён или никогда не создавался — докладывать не о чем
+        plan.items.append(
+            IndexPlanItem(
+                spec=spec,
+                status=STATUS_OBSOLETE,
+                hypertable=spec.table in hypertables,
+                idx_scan=index_scans.get(spec.name),
+            )
+        )
 
     for spec in specs:
         if spec.table not in existing_tables:
@@ -331,7 +406,14 @@ async def build_plan(
             status = STATUS_INVALID
         else:
             status = STATUS_PRESENT
-        plan.items.append(IndexPlanItem(spec=spec, status=status, hypertable=spec.table in hypertables))
+        plan.items.append(
+            IndexPlanItem(
+                spec=spec,
+                status=status,
+                hypertable=spec.table in hypertables,
+                idx_scan=index_scans.get(spec.name),
+            )
+        )
     return plan
 
 
@@ -341,6 +423,7 @@ async def apply_plan(
     *,
     lock_timeout_sec: float = 10.0,
     fix_invalid: bool = False,
+    drop_obsolete: bool = False,
     dry_run: bool = False,
     create_extension: bool = True,
     logger: Optional[logging.Logger] = None,
@@ -354,7 +437,8 @@ async def apply_plan(
     schema = plan.schema
     results: List[IndexApplyResult] = []
     pending = plan.pending
-    if not pending:
+    obsolete = plan.obsolete
+    if not pending and not obsolete:
         return results
     if not dry_run:
         in_tx = getattr(conn, "is_in_transaction", None)
@@ -362,6 +446,39 @@ async def apply_plan(
             raise RuntimeError("Online index build requires a connection outside of a transaction")
         await conn.execute("SET statement_timeout = 0")
         await conn.execute(f"SET lock_timeout = '{_lock_timeout_ms(lock_timeout_sec)}ms'")
+
+    # Лишние индексы удаляются первыми: дальше недостающие строятся на уже
+    # облегчённой таблице. Без явного флага только докладываем — удаление индекса
+    # необратимо, и решение за оператором.
+    for item in obsolete:
+        drop_sql = item.drop_online_sql(schema)
+        if not drop_obsolete:
+            results.append(
+                IndexApplyResult(
+                    item.spec.name, "skipped", drop_sql, error="obsolete index; use drop_obsolete"
+                )
+            )
+            continue
+        if dry_run:
+            results.append(IndexApplyResult(item.spec.name, "dry_run", drop_sql))
+            continue
+        started = time.monotonic()
+        try:
+            log.info("Dropping obsolete index: %s", drop_sql)
+            await conn.execute(drop_sql)
+        except Exception as e:
+            results.append(
+                IndexApplyResult(
+                    item.spec.name, "failed", drop_sql, time.monotonic() - started, error=repr(e)
+                )
+            )
+            log.warning("Obsolete index %s was not dropped: %r", item.spec.name, e)
+            continue
+        plan.items.remove(item)
+        results.append(IndexApplyResult(item.spec.name, "dropped", drop_sql, time.monotonic() - started))
+
+    if not pending:
+        return results
 
     trgm_ok = plan.trgm_extension_available
     if not trgm_ok and create_extension and not dry_run and any(i.spec.scope == SCOPE_TRGM for i in pending):
@@ -445,15 +562,24 @@ def format_plan(plan: IndexPlan) -> str:
     ]
     for item in rows:
         kind = "hypertable" if item.hypertable else "table"
-        lines.append(f"  {item.status:<8} {item.spec.scope:<4} {item.spec.name} ({kind} {item.spec.table})")
+        # Для лишних индексов показываем idx_scan: это главный довод за удаление.
+        scans = "" if item.idx_scan is None or not item.obsolete else f" idx_scan={item.idx_scan}"
+        lines.append(
+            f"  {item.status:<8} {item.spec.scope:<4} {item.spec.name} "
+            f"({kind} {item.spec.table}){scans}"
+        )
     counts = plan.counts()
     lines.append(
-        "total={total} present={present} missing={missing} invalid={invalid} no_table={no_table}".format(
+        "total={total} present={present} missing={missing} invalid={invalid} "
+        "no_table={no_table} obsolete={obsolete}".format(
             total=len(rows),
             present=counts.get(STATUS_PRESENT, 0),
             missing=counts.get(STATUS_MISSING, 0),
             invalid=counts.get(STATUS_INVALID, 0),
             no_table=counts.get(STATUS_NO_TABLE, 0),
+            obsolete=counts.get(STATUS_OBSOLETE, 0),
         )
     )
+    if counts.get(STATUS_OBSOLETE):
+        lines.append("Лишние индексы удаляются: uapg indexes apply --drop-obsolete")
     return "\n".join(lines)
