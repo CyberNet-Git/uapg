@@ -33,6 +33,16 @@ from .maintenance.online_indexes import (
 from .read_continuation import ReadContinuation, ReadContinuationStore, ReadWindow
 from .status_code import decode_status, status_from_datavalue
 
+# Окно поиска последнего значения в истории по умолчанию. Это единственный рычаг,
+# который реально сокращает работу на hypertable: предикат по времени отсекает чанки,
+# а равенство по variable_id внутри LATERAL — нет (замер на стенде: 5340 проб индекса
+# на переменную без истории, с окном 7 суток — 256; см. doc/last-values-startup-timeout.md).
+DEFAULT_LAST_VALUES_LOOKBACK = timedelta(days=7)
+
+# Метка «аргумент не передан»: явный history_lookback=None означает «вся история»
+# и должен отличаться от умолчания конструктора.
+_LOOKBACK_UNSET: Any = object()
+
 # Правильный буфер для побайтного чтения в variant_from_binary
 class Buffer:
     def __init__(self, data: bytes) -> None:
@@ -653,6 +663,15 @@ class HistoryTimescale(HistoryStorageInterface):
         _max_size (int): Максимальное количество соединений в пуле
         _initialized (bool): Флаг инициализации таблиц
         _schema (str): Имя схемы для размещения таблиц истории
+        _history_last_values_lookback (Optional[timedelta]): Окно фоллбэка по истории для
+            последних значений (параметр history_last_values_lookback; None — вся история)
+        _history_last_values_fallback_chunk_size (int): Размер пачки фоллбэка read_last_values
+        _history_last_values_fallback_batch_timeout_sec (float): Таймаут одной пачки фоллбэка
+        _history_last_values_fallback_budget_sec (float): Общий бюджет времени фоллбэка за вызов
+
+    Инвариант variables_last_value: у каждой зарегистрированной переменной есть строка
+    (регистрация и старт её создают, см. seed_last_values), поэтому чтение последних
+    значений не обращается к hypertable variables_history.
     """
 
     def _build_group_key_from_node_id(self, node_id_str: str) -> str:
@@ -814,6 +833,10 @@ class HistoryTimescale(HistoryStorageInterface):
         history_last_values_cache_enabled: bool = True,
         history_last_values_cache_max_size_mb: int = 100,
         history_last_values_init_batch_size: int = 1000,
+        history_last_values_lookback: Optional[timedelta] = DEFAULT_LAST_VALUES_LOOKBACK,
+        history_last_values_fallback_chunk_size: int = 100,
+        history_last_values_fallback_batch_timeout_sec: float = 30.0,
+        history_last_values_fallback_budget_sec: float = 60.0,
         history_metadata_cache_enabled: bool = True,
         history_metadata_cache_init_max_rows: int = 500000,
         db_query_timeout_sec: Optional[float] = 30.0,
@@ -856,6 +879,20 @@ class HistoryTimescale(HistoryStorageInterface):
             ensure_indexes_on_startup: Строить недостающие индексы на старте. При False индекс
                 по непустой таблице не строится (обычный CREATE INDEX блокирует запись), в лог идёт
                 WARNING с онлайн-DDL, а сборка выполняется заранее через uapg.maintenance / `uapg indexes`.
+            history_last_values_lookback: Окно поиска последнего значения в variables_history
+                для read_last_values (фоллбэк) и backfill_last_values, когда вызов не задаёт
+                history_lookback сам. По умолчанию 7 суток (DEFAULT_LAST_VALUES_LOOKBACK):
+                предикат по времени отсекает чанки hypertable, а без него переменная без
+                истории заставляет пройти индексы всех чанков. None — вся история. Явный
+                history_lookback вызова (в том числе None) главнее. Нижняя граница — 1 минута.
+            history_last_values_fallback_chunk_size: Сколько переменных read_last_values
+                отправляет в историю одним запросом при фоллбэке (минимум 1).
+            history_last_values_fallback_batch_timeout_sec: Таймаут одной пачки фоллбэка.
+                Запрос идёт мимо _run_db_operation, поэтому его таймаут не вызывает
+                _force_reconnect и не рвёт пул (минимум 1 с).
+            history_last_values_fallback_budget_sec: Общий бюджет времени фоллбэка за один
+                вызов read_last_values. По исчерпании отдаётся собранное, остальные узлы
+                получают None, в лог идёт один WARNING (минимум 1 с).
             history_read_max_response_rows: Потолок числа значений в одном ответе HistoryRead
                 (по умолчанию DEFAULT_READ_MAX_RESPONSE_ROWS). Принимается и под именем
                 max_history_data_response_size — так его называет asyncua, и так его передают
@@ -960,6 +997,18 @@ class HistoryTimescale(HistoryStorageInterface):
         self._history_last_values_cache_enabled = history_last_values_cache_enabled
         self._history_last_values_cache_max_size_mb = int(history_last_values_cache_max_size_mb)
         self._history_last_values_init_batch_size = int(history_last_values_init_batch_size)
+        self._history_last_values_lookback = (
+            None
+            if history_last_values_lookback is None
+            else max(timedelta(minutes=1), history_last_values_lookback)
+        )
+        self._history_last_values_fallback_chunk_size = max(1, int(history_last_values_fallback_chunk_size))
+        self._history_last_values_fallback_batch_timeout_sec = max(
+            1.0, float(history_last_values_fallback_batch_timeout_sec)
+        )
+        self._history_last_values_fallback_budget_sec = max(
+            1.0, float(history_last_values_fallback_budget_sec)
+        )
         # variable_id -> DataValue
         self._last_values_cache: Dict[int, ua.DataValue] = {}
 
@@ -984,6 +1033,12 @@ class HistoryTimescale(HistoryStorageInterface):
             "last_values_table_misses": 0,
             # Fallback к основной таблице истории (variables_history)
             "last_values_history_fallbacks": 0,
+            "last_values_history_fallbacks_skipped": 0,
+            # Пачки фоллбэка, остановленные таймаутом, и узлы, до которых он не дошёл
+            "last_values_fallback_timeouts": 0,
+            "last_values_fallback_unprocessed": 0,
+            # Строки-сиды, созданные регистрацией, ремонтом на старте и фоллбэком
+            "last_values_seeded": 0,
             # Кэш метаданных переменных (node_id -> variable_id)
             "variable_metadata_hits": 0,
             "variable_metadata_misses": 0,
@@ -1239,6 +1294,18 @@ class HistoryTimescale(HistoryStorageInterface):
                 "reconnects_skipped_total": self._performance_counters["db_reconnect_skipped_total"],
                 "pool_wait_timeouts_total": self._performance_counters["db_pool_wait_timeouts_total"],
             },
+            # Диагностика пути последних значений: рост fallbacks/fallback_timeouts означает,
+            # что инвариант «у переменной есть строка в variables_last_value» нарушен.
+            "last_values": {
+                "memory_hits": self._cache_stats["last_values_memory_hits"],
+                "memory_misses": self._cache_stats["last_values_memory_misses"],
+                "table_hits": self._cache_stats["last_values_table_hits"],
+                "history_fallbacks": self._cache_stats["last_values_history_fallbacks"],
+                "history_fallbacks_skipped": self._cache_stats["last_values_history_fallbacks_skipped"],
+                "fallback_timeouts": self._cache_stats["last_values_fallback_timeouts"],
+                "fallback_unprocessed": self._cache_stats["last_values_fallback_unprocessed"],
+                "seeded": self._cache_stats["last_values_seeded"],
+            },
             "retention": {
                 "per_variable_cleanup_enabled": False,
                 "per_event_cleanup_enabled": False,
@@ -1262,6 +1329,14 @@ class HistoryTimescale(HistoryStorageInterface):
                 "history_write_durability_mode": str(self._history_write_durability_mode),
                 "history_write_read_consistency_mode": str(self._history_write_read_consistency_mode),
                 "db_query_timeout_sec": self._db_query_timeout_sec,
+                "history_last_values_lookback_sec": (
+                    None
+                    if self._history_last_values_lookback is None
+                    else self._history_last_values_lookback.total_seconds()
+                ),
+                "history_last_values_fallback_chunk_size": self._history_last_values_fallback_chunk_size,
+                "history_last_values_fallback_batch_timeout_sec": self._history_last_values_fallback_batch_timeout_sec,
+                "history_last_values_fallback_budget_sec": self._history_last_values_fallback_budget_sec,
                 "db_pool_create_timeout_sec": float(self._db_pool_create_timeout_sec),
                 "db_lock_wait_timeout_sec": float(self._db_lock_wait_timeout_sec),
                 "db_command_timeout_sec": self._db_command_timeout_sec,
@@ -2605,6 +2680,69 @@ class HistoryTimescale(HistoryStorageInterface):
                 ", ".join(sorted(self._startup_indexes_obsolete)),
             )
 
+    @staticmethod
+    def _default_seed_row() -> Tuple[int, int, bytes]:
+        """(statuscode, varianttype, variantbinary) строки-сида без значения: Null-вариант
+        со статусом BadWaitingForInitialData. Единственный источник для сидов."""
+        variant = ua.Variant(None)
+        return status_from_datavalue(None), variant.VariantType.value, variant_to_binary(variant)
+
+    def _default_seed_datavalue(self) -> ua.DataValue:
+        """DataValue, который read_last_values отдаёт для переменной без значения."""
+        statuscode, _, binary = self._default_seed_row()
+        now = datetime.now(timezone.utc)
+        return ua.DataValue(
+            Value=variant_from_binary(Buffer(binary)),
+            StatusCode_=ua.StatusCode(decode_status(statuscode)),
+            SourceTimestamp=now,
+            ServerTimestamp=now,
+        )
+
+    async def _repair_last_value_rows(self) -> int:
+        """
+        Досоздаёт строки-сиды для зарегистрированных переменных без строки в
+        variables_last_value. Один set-based запрос по двум обычным таблицам, к
+        hypertable не обращается. Идемпотентен: готовые строки не трогает
+        (ON CONFLICT DO NOTHING), на втором запуске вставляет 0.
+
+        Returns:
+            Число вставленных строк.
+        """
+        statuscode, varianttype, binary = self._default_seed_row()
+        seeded = await self._fetchval(f'''
+            WITH ins AS (
+                INSERT INTO "{self._schema}".variables_last_value
+                    (variable_id, sourcetimestamp, servertimestamp, statuscode,
+                     varianttype, variantbinary, is_seed)
+                SELECT m.variable_id, NOW(), NOW(), $1, $2, $3, TRUE
+                FROM "{self._schema}".variable_metadata m
+                LEFT JOIN "{self._schema}".variables_last_value lv ON lv.variable_id = m.variable_id
+                WHERE lv.variable_id IS NULL
+                ON CONFLICT (variable_id) DO NOTHING
+                RETURNING 1
+            )
+            SELECT count(*) FROM ins
+        ''', statuscode, varianttype, binary)
+        seeded = int(seeded or 0)
+        if seeded:
+            self._cache_stats["last_values_seeded"] += seeded
+            self.logger.info(
+                "variables_last_value: %d registered variables had no row, seeded "
+                "(is_seed=TRUE; backfill_last_values will refine them from history)",
+                seeded,
+            )
+        return seeded
+
+    async def _seed_registered(self, node_ids: List[ua.NodeId]) -> None:
+        """Создаёт строку последнего значения для только что зарегистрированных узлов.
+        Сбой не отменяет регистрацию: следующий старт досоздаст строки ремонтом."""
+        for i in range(0, len(node_ids), 5000):
+            part = node_ids[i:i + 5000]
+            try:
+                await self.seed_last_values([(n, None) for n in part])
+            except Exception as e:
+                self.logger.warning("Cannot seed variables_last_value for %d new nodes: %r", len(part), e)
+
     async def _create_metadata_tables(self) -> None:
         """Создание единых таблиц для историзации в указанной схеме."""
         try:
@@ -2698,6 +2836,10 @@ class HistoryTimescale(HistoryStorageInterface):
                 ALTER TABLE "{self._schema}".variables_last_value
                 ADD COLUMN IF NOT EXISTS is_seed BOOLEAN NOT NULL DEFAULT FALSE
             ''')
+
+            # Инвариант «у каждой зарегистрированной переменной есть строка» до этой версии
+            # нигде не исполнялся, поэтому в существующих базах он нарушен.
+            await self._repair_last_value_rows()
 
             # Колонка value хранила str() от значения и не читалась ни одним запросом:
             # всё восстанавливается из variantbinary. DROP COLUMN в PostgreSQL — операция
@@ -3510,11 +3652,17 @@ class HistoryTimescale(HistoryStorageInterface):
             # upsert не нужен: retention применяется глобально через Timescale policy,
             # а data_type обновляется при сохранении значения.
             variable_id = self._variable_metadata_cache.get(node_id_str)
-            if variable_id is None:
+            is_new = variable_id is None
+            if is_new:
                 variable_id = await self._save_variable_metadata(node_id, effective_period, count)
 
             # Сохраняем mapping node_id -> variable_id для быстрого доступа
             self._datachanges_period[node_id] = (effective_period, count, variable_id)
+
+            # Инвариант: у каждой зарегистрированной переменной есть строка последнего
+            # значения. Известные из кэша получили её при старте (_repair_last_value_rows).
+            if is_new:
+                await self._seed_registered([node_id])
 
             if self.suppress_initial_datachange:
                 self._pending_initial_datachange_skip[node_id_str] = True
@@ -3571,6 +3719,14 @@ class HistoryTimescale(HistoryStorageInterface):
             ''', to_upsert, effective_period, count)
             for row in rows:
                 self._variable_metadata_cache[row["node_id"]] = row["variable_id"]
+
+        # Инвариант «у переменной есть строка в variables_last_value»: сеем одним батчем
+        # всё, что было записано в variable_metadata этим вызовом. Идемпотентно.
+        upserted = set(to_upsert)
+        await self._seed_registered(
+            [n for n, node_id_str in pairs
+             if node_id_str in upserted and node_id_str in self._variable_metadata_cache]
+        )
 
         missing: List[ua.NodeId] = []
         registered = 0
@@ -4458,10 +4614,111 @@ class HistoryTimescale(HistoryStorageInterface):
             self.logger.error(f"Failed to read last value for {node_id}: {e}")
             return None
 
+    def _effective_lookback(self, history_lookback: Any) -> Optional[timedelta]:
+        """Явный аргумент вызова (включая None) главнее умолчания конструктора."""
+        if history_lookback is _LOOKBACK_UNSET:
+            return self._history_last_values_lookback
+        return history_lookback
+
+    async def _fetch_last_from_history(
+        self,
+        conn: Any,
+        variable_ids: List[int],
+        since: Optional[datetime],
+        timeout: float,
+    ) -> list:
+        """
+        Последняя строка истории для каждой из variable_ids (LATERAL top-1). Идёт по
+        переданному соединению с собственным timeout, мимо _run_db_operation: таймаут
+        не вызывает _force_reconnect. Два текста запроса, а не `$2 IS NULL OR ...`:
+        так предикат по времени остаётся простым и TimescaleDB отсекает чанки.
+        """
+        if since is not None:
+            return await conn.fetch(f'''
+                SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
+                       h.statuscode, h.varianttype, h.variantbinary
+                FROM unnest($1::bigint[]) AS v(variable_id)
+                CROSS JOIN LATERAL (
+                    SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                    FROM "{self._schema}".variables_history
+                    WHERE variable_id = v.variable_id
+                      AND sourcetimestamp >= $2
+                    ORDER BY sourcetimestamp DESC
+                    LIMIT 1
+                ) h
+            ''', variable_ids, since, timeout=timeout)
+        return await conn.fetch(f'''
+            SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
+                   h.statuscode, h.varianttype, h.variantbinary
+            FROM unnest($1::bigint[]) AS v(variable_id)
+            CROSS JOIN LATERAL (
+                SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
+                FROM "{self._schema}".variables_history
+                WHERE variable_id = v.variable_id
+                ORDER BY sourcetimestamp DESC
+                LIMIT 1
+            ) h
+        ''', variable_ids, timeout=timeout)
+
+    async def _bounded_history_fallback(
+        self,
+        variable_ids: List[int],
+        lookback: Optional[timedelta],
+    ) -> Tuple[list, set]:
+        """
+        Фоллбэк read_last_values по истории, ограниченный по размеру пачки, времени пачки
+        и общему бюджету. Первая же пачка, упёршаяся в таймаут, останавливает фоллбэк:
+        следующие упрутся так же и сожгут бюджет.
+
+        Returns:
+            (найденные строки, множество просмотренных variable_id). Просмотренные и не
+            найденные — те, у кого в окне истории нет; остальные не просмотрены.
+        """
+        await self._ensure_pool()
+        since = None if lookback is None else datetime.now(timezone.utc) - lookback
+        chunk_size = self._history_last_values_fallback_chunk_size
+        deadline = time.monotonic() + self._history_last_values_fallback_budget_sec
+        rows: list = []
+        searched: set = set()
+        stop_reason = None
+        for i in range(0, len(variable_ids), chunk_size):
+            batch = variable_ids[i:i + chunk_size]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stop_reason = "budget exhausted"
+                break
+            timeout = min(self._history_last_values_fallback_batch_timeout_sec, remaining)
+            try:
+                async with self._pool.acquire(timeout=timeout) as conn:
+                    found = await self._fetch_last_from_history(conn, batch, since, timeout)
+            except (asyncio.TimeoutError, asyncpg.exceptions.QueryCanceledError):
+                self._cache_stats["last_values_fallback_timeouts"] += 1
+                stop_reason = f"batch timed out after {timeout:.1f}s"
+                break
+            except Exception as e:
+                stop_reason = f"batch failed: {e!r}"
+                break
+            rows.extend(found)
+            searched.update(batch)
+
+        unprocessed = len(variable_ids) - len(searched)
+        if unprocessed:
+            self._cache_stats["last_values_fallback_unprocessed"] += unprocessed
+            self.logger.warning(
+                "read_last_values: history fallback stopped (%s) after %d of %d variables "
+                "(lookback=%s); the rest return None. Variables without a "
+                "variables_last_value row should not exist: restart repairs them, "
+                "backfill_last_values refines seeds; pass allow_history_fallback=False "
+                "at bulk start",
+                stop_reason, len(searched), len(variable_ids),
+                lookback if lookback is not None else "full",
+            )
+        return rows, searched
+
     async def read_last_values(
         self,
         node_ids: List[ua.NodeId],
-        history_lookback: Optional[timedelta] = None,
+        history_lookback: Optional[timedelta] = _LOOKBACK_UNSET,
         *,
         allow_history_fallback: bool = True,
     ) -> dict:
@@ -4474,11 +4731,18 @@ class HistoryTimescale(HistoryStorageInterface):
                 последними history_lookback времени. Позволяет TimescaleDB
                 исключить старые чанки: без ограничения переменные, у которых
                 нет данных вообще, заставляют пробегать индексы всех чанков.
-                None — без ограничения (полная история).
+                Не передан — history_last_values_lookback конструктора (7 суток);
+                явный None — без ограничения (полная история).
             allow_history_fallback: Если False — только memory/variables_last_value,
                 без LATERAL по hypertable. Нужен для bulk-restore при старте:
                 фоллбэк по тысячам «пустых» переменных иначе упирается в
                 db_query_timeout и рвёт пул соединений.
+
+        Фоллбэк ограничен: пачки по history_last_values_fallback_chunk_size, таймаут на
+        пачку и общий бюджет. При их исчерпании отдаётся собранное, а не просмотренные
+        узлы получают None (счётчики last_values_fallback_timeouts/_unprocessed).
+        Просмотренные, но не найденные в окне переменные получают строку-сид и
+        отдаются как Null со статусом BadWaitingForInitialData.
 
         Returns:
             Словарь {node_id: DataValue} или {node_id: None} для отсутствующих
@@ -4588,35 +4852,12 @@ class HistoryTimescale(HistoryStorageInterface):
                     + len(missing_variable_ids)
                 )
                 missing_variable_ids = []
+            searched_ids: set = set()
+            fallback_rows: list = []
             if missing_variable_ids:
-                if history_lookback is not None:
-                    since = datetime.now(timezone.utc) - history_lookback
-                    fallback_rows = await self._fetch(f'''
-                        SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
-                               h.statuscode, h.varianttype, h.variantbinary
-                        FROM unnest($1::bigint[]) AS v(variable_id)
-                        CROSS JOIN LATERAL (
-                            SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
-                            FROM "{self._schema}".variables_history
-                            WHERE variable_id = v.variable_id
-                              AND sourcetimestamp >= $2
-                            ORDER BY sourcetimestamp DESC
-                            LIMIT 1
-                        ) h
-                    ''', missing_variable_ids, since)
-                else:
-                    fallback_rows = await self._fetch(f'''
-                        SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
-                               h.statuscode, h.varianttype, h.variantbinary
-                        FROM unnest($1::bigint[]) AS v(variable_id)
-                        CROSS JOIN LATERAL (
-                            SELECT sourcetimestamp, servertimestamp, statuscode, varianttype, variantbinary
-                            FROM "{self._schema}".variables_history
-                            WHERE variable_id = v.variable_id
-                            ORDER BY sourcetimestamp DESC
-                            LIMIT 1
-                        ) h
-                    ''', missing_variable_ids)
+                fallback_rows, searched_ids = await self._bounded_history_fallback(
+                    missing_variable_ids, self._effective_lookback(history_lookback)
+                )
 
                 if fallback_rows:
                     self._cache_stats["last_values_history_fallbacks"] += len(fallback_rows)
@@ -4666,7 +4907,17 @@ class HistoryTimescale(HistoryStorageInterface):
                     result[node_id] = dv
                     self._update_last_values_cache(variable_id, dv)
             
-            # Заполняем None для узлов, которых вообще нет в истории
+            # Просмотренные и не найденные в окне: закрываем дорогой путь строкой-сидом,
+            # иначе следующий старт заплатит за них снова. Не просмотренные (таймаут,
+            # бюджет) не трогаем: у них может быть история.
+            found_ids = {r['variable_id'] for r in fallback_rows}
+            unfound_ids = [vid for vid in searched_ids if vid not in found_ids]
+            if unfound_ids:
+                await self._seed_registered([node_to_variable[vid] for vid in unfound_ids])
+                for vid in unfound_ids:
+                    result[node_to_variable[vid]] = self._default_seed_datavalue()
+
+            # Заполняем None для узлов, которых не удалось определить
             for node_id in node_ids:
                 if node_id not in result:
                     result[node_id] = None
@@ -4749,6 +5000,7 @@ class HistoryTimescale(HistoryStorageInterface):
         ''', vids, source_ts, server_ts, statuscodes, varianttypes, binaries)
 
         inserted = len(rows)
+        self._cache_stats["last_values_seeded"] += inserted
         for row in rows:
             dv = dv_by_vid.get(row['variable_id'])
             if dv is not None:
@@ -4765,7 +5017,7 @@ class HistoryTimescale(HistoryStorageInterface):
         chunk_size: int = 100,
         pause_sec: float = 0.5,
         query_timeout_sec: float = 120.0,
-        history_lookback: Optional[timedelta] = None,
+        history_lookback: Optional[timedelta] = _LOOKBACK_UNSET,
         on_chunk_restored: Optional[
             Callable[[List[Tuple[str, ua.DataValue]]], Union[Coroutine[Any, Any, Any], Any]]
         ] = None,
@@ -4775,7 +5027,10 @@ class HistoryTimescale(HistoryStorageInterface):
           - зарегистрированным переменным без строки добавляется последнее
             значение из истории (если оно есть);
           - строки-сиды (is_seed=TRUE) замещаются реальным последним значением
-            из истории; сиды без истории помечаются сверенными (is_seed=FALSE).
+            из истории; сиды без истории помечаются сверенными (is_seed=FALSE) —
+            но только если поиск шёл по всей истории. При ограниченном окне
+            «нет в окне» не значит «нет в истории», такие сиды остаются сидами
+            (stats["unresolved_in_window"]) и проверяются следующим запуском.
 
         LATERAL по hypertable выполняется только для кандидатов и (при заданном
         history_lookback) с time predicate для chunk exclusion. По умолчанию
@@ -4785,13 +5040,16 @@ class HistoryTimescale(HistoryStorageInterface):
             chunk_size: размер батча variable_id
             pause_sec: пауза между чанками (снижение нагрузки на пул)
             query_timeout_sec: таймаут acquire/SQL на чанк
-            history_lookback: ограничить поиск в истории (None — вся история)
+            history_lookback: ограничить поиск в истории. Не передан —
+                history_last_values_lookback конструктора (7 суток); явный None —
+                вся история (дорого: каждая переменная без истории проходит индексы
+                всех чанков hypertable)
             on_chunk_restored: async/sync callback со списком
                 (node_id_str, DataValue) для применения в address space
 
         Returns:
             Статистика: candidates, restored_from_history, confirmed_defaults,
-            errors, restored_items (list[(node_id_str, DataValue)])
+            unresolved_in_window, errors, restored_items (list[(node_id_str, DataValue)])
         """
         await self._ensure_pool()
         # Только строки-сиды: отсутствующие last_value должен создавать seed_last_values
@@ -4809,11 +5067,13 @@ class HistoryTimescale(HistoryStorageInterface):
             "candidates": len(candidate_ids),
             "restored_from_history": 0,
             "confirmed_defaults": 0,
+            "unresolved_in_window": 0,
             "errors": 0,
             "restored_items": [],
         }
         if not candidate_ids:
             return stats
+        history_lookback = self._effective_lookback(history_lookback)
         since = None
         if history_lookback is not None:
             since = datetime.now(timezone.utc) - history_lookback
@@ -4832,35 +5092,9 @@ class HistoryTimescale(HistoryStorageInterface):
 
                 async def _op(chunk_ids=chunk):
                     async with pool.acquire(timeout=query_timeout_sec) as conn:
-                        if since is not None:
-                            found = await conn.fetch(f'''
-                                SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
-                                       h.statuscode, h.varianttype, h.variantbinary
-                                FROM unnest($1::bigint[]) AS v(variable_id)
-                                CROSS JOIN LATERAL (
-                                    SELECT sourcetimestamp, servertimestamp, statuscode,
-                                           varianttype, variantbinary
-                                    FROM "{self._schema}".variables_history
-                                    WHERE variable_id = v.variable_id
-                                      AND sourcetimestamp >= $2
-                                    ORDER BY sourcetimestamp DESC
-                                    LIMIT 1
-                                ) h
-                            ''', chunk_ids, since, timeout=query_timeout_sec)
-                        else:
-                            found = await conn.fetch(f'''
-                                SELECT v.variable_id, h.sourcetimestamp, h.servertimestamp,
-                                       h.statuscode, h.varianttype, h.variantbinary
-                                FROM unnest($1::bigint[]) AS v(variable_id)
-                                CROSS JOIN LATERAL (
-                                    SELECT sourcetimestamp, servertimestamp, statuscode,
-                                           varianttype, variantbinary
-                                    FROM "{self._schema}".variables_history
-                                    WHERE variable_id = v.variable_id
-                                    ORDER BY sourcetimestamp DESC
-                                    LIMIT 1
-                                ) h
-                            ''', chunk_ids, timeout=query_timeout_sec)
+                        found = await self._fetch_last_from_history(
+                            conn, chunk_ids, since, query_timeout_sec
+                        )
                         if found:
                             await conn.execute(f'''
                                 INSERT INTO "{self._schema}".variables_last_value
@@ -4892,17 +5126,22 @@ class HistoryTimescale(HistoryStorageInterface):
                                 [r['variantbinary'] for r in found],
                                 timeout=query_timeout_sec,
                             )
-                        # Сиды без истории в этом окне — считаем сверенными
-                        await conn.execute(f'''
-                            UPDATE "{self._schema}".variables_last_value
-                            SET is_seed = FALSE
-                            WHERE variable_id = ANY($1) AND is_seed
-                        ''', chunk_ids, timeout=query_timeout_sec)
+                        # Сверенными считаем только сиды, для которых просмотрена вся
+                        # история. Найденные в окне уже сняты upsert-ом выше.
+                        if since is None:
+                            await conn.execute(f'''
+                                UPDATE "{self._schema}".variables_last_value
+                                SET is_seed = FALSE
+                                WHERE variable_id = ANY($1) AND is_seed
+                            ''', chunk_ids, timeout=query_timeout_sec)
                         return found
 
                 found = await asyncio.wait_for(_op(), timeout=query_timeout_sec * 2)
                 stats["restored_from_history"] += len(found)
-                stats["confirmed_defaults"] += len(chunk) - len(found)
+                if since is None:
+                    stats["confirmed_defaults"] += len(chunk) - len(found)
+                else:
+                    stats["unresolved_in_window"] += len(chunk) - len(found)
 
                 chunk_items: List[Tuple[str, ua.DataValue]] = []
                 for row in found:

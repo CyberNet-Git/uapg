@@ -52,6 +52,10 @@ docker compose exec -e PGPASSWORD vibroiot-server python /service/src/tools/hist
   чанков, 9692 без строки кэша) это упирается в `db_query_timeout_sec` и рвёт пул.
 - На старте вызывать с `allow_history_fallback=False`, а догонять в фоне через
   `backfill_last_values(..., history_lookback=...)` с колбэком `on_chunk_restored`.
+- С 0.2.26 регистрация и старт сеют недостающие строки, фоллбэк ограничен (пачки, таймаут,
+  бюджет, окно 7 суток по умолчанию), а переменные без значения приходят как
+  `DataValue` с Null и `BadWaitingForInitialData`, не как `None`: код восстановления
+  адресного пространства должен принимать такой статус.
 - Разбор причины, цифры со стенда, разбор инструментов TimescaleDB для last-point и план
   правок в uapg — `doc/last-values-startup-timeout.md`.
 

@@ -403,6 +403,7 @@ await history.refresh_history_metrics_nodes()
 - `last_batch_size`, `avg_flush_duration_ms`, `max_flush_duration_ms` - показывает фактическую эффективность batch flush.
 - `insert_history_*`, `upsert_last_value_*` - помогает отделить запись истории от обновления последних значений.
 - `timeouts_total`, `reconnects_total` - показывает проблемы доступности PostgreSQL.
+- `last_values.history_fallbacks`, `last_values.fallback_timeouts`, `last_values.fallback_unprocessed` - рост означает, что у зарегистрированных переменных нет строки в `variables_last_value` (инвариант нарушен); `last_values.seeded` - сколько строк-сидов создано регистрацией, ремонтом на старте и фоллбэком.
 - `events_v2.backfill_probe_failures_total` (HistoryTimescaleV2) - проба готовности бэкфила не получила ответа; ненулевое значение обычно означает, что индекс `idx_events_history_id` не создан, и его стоит создать вручную.
 - `events_v2.trgm_indexes_missing`, `events_v2.trgm_extension_available` (HistoryTimescaleV2) - показывает, обслуживается ли поиск по подстроке индексом. Ненулевое `trgm_indexes_missing` или `trgm_extension_available = false` означают, что `ILIKE '%...%'` идёт просмотром окна.
 - `indexes.startup_missing` - сколько индексов старт пропустил при `ensure_indexes_on_startup=False`; их строит `uapg indexes apply`.
@@ -423,6 +424,22 @@ history = HistoryTimescale(
     history_last_values_init_batch_size=1000     # Размер батча при инициализации
 )
 ```
+
+Таблица `variables_last_value` хранит по строке на каждую зарегистрированную переменную: регистрация (`new_historized_node(s)`) и старт досоздают недостающие строки-сиды (Null, `BadWaitingForInitialData`, `is_seed = TRUE`), а `backfill_last_values` заменяет сиды реальными значениями из истории. Поэтому `read_last_values` обычно не обращается к hypertable `variables_history`. Фоллбэк по истории остаётся для повреждённой БД и ограничен:
+
+```python
+history = HistoryTimescale(
+    history_last_values_lookback=timedelta(days=7),            # окно поиска в истории; None — вся история
+    history_last_values_fallback_chunk_size=100,               # переменных в одном запросе фоллбэка
+    history_last_values_fallback_batch_timeout_sec=30.0,       # таймаут пачки (пул при этом не пересоздаётся)
+    history_last_values_fallback_budget_sec=60.0,              # общий бюджет фоллбэка за вызов read_last_values
+)
+```
+
+- `history_last_values_lookback` — значение `history_lookback` по умолчанию для `read_last_values` и `backfill_last_values`. Предикат по времени — единственное, что отсекает чанки hypertable (равенство по `variable_id` внутри LATERAL чанки не отсекает). Явный аргумент вызова, включая `None` (вся история), главнее. Минимум — 1 минута.
+- По исчерпании таймаута пачки или бюджета `read_last_values` отдаёт собранное, не просмотренные узлы получают `None`, в лог идёт WARNING; счётчики — `last_values.fallback_timeouts` и `last_values.fallback_unprocessed` в `get_performance_metrics()`.
+- Переменные, просмотренные и не найденные в окне, получают строку-сид и отдаются как Null со статусом `BadWaitingForInitialData`.
+- `backfill_last_values` с ограниченным окном не подтверждает сиды без значения (`stats["unresolved_in_window"]`): «нет в окне» не значит «нет в истории». Подтверждает только поиск по всей истории (`history_lookback=None`).
 
 #### 2. Кэш метаданных переменных
 ```python
