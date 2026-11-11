@@ -44,6 +44,17 @@ docker compose exec -e PGPASSWORD vibroiot-server python /service/src/tools/hist
 - Без product-specific хардкода: indexed/filterable fields задаёт потребитель через `EventsV2Config`.
 - См. `src/uapg/v2/events_config.py`.
 
+### Восстановление последних значений на старте
+
+- `read_last_values(nodes)` **без аргументов опасен на большой БД**: переменные без строки
+  в `variables_last_value` уходят в фоллбэк по `variables_history`, а это top-1 по каждому
+  чанку гипертаблицы на каждую такую переменную. На стенде (169 тыс. переменных, 5340
+  чанков, 9692 без строки кэша) это упирается в `db_query_timeout_sec` и рвёт пул.
+- На старте вызывать с `allow_history_fallback=False`, а догонять в фоне через
+  `backfill_last_values(..., history_lookback=...)` с колбэком `on_chunk_restored`.
+- Разбор причины, цифры со стенда, разбор инструментов TimescaleDB для last-point и план
+  правок в uapg — `doc/last-values-startup-timeout.md`.
+
 ## opc-vibro-iot-client (ovic) — следующий этап
 
 - `discover_history_capabilities()` — read capability nodes.
